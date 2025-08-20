@@ -481,31 +481,52 @@ def cav_needed_vs_pike(troops: Dict[str, int], hits: int) -> str:
     Deny Pike bonus (25% rule):
       Defender gets anti-Cav bonus if Pike >= 25% of your Cav.
       To deny it, send Cav > 4 * defender_pike.
-    Always returns a message (so the field never disappears).
+    Shows: their Pike, your Cav (total), Cav needed, and per-hit.
     """
-    if not troops:
+    if not troops or not isinstance(troops, dict):
         return "No troop counts found in the last report."
 
-    # find pike count
+    # Cavalry types (case-insensitive, includes some common variants)
+    cav_types = ["light cavalry", "heavy cavalry", "knight", "knights", "lc", "hc"]
+    total_cav = 0
+    for k, v in troops.items():
+        key = k.strip().lower()
+        if any(ct in key for ct in cav_types):
+            try:
+                total_cav += int(v)
+            except Exception:
+                pass
+
+    # Pike types
+    pike_types = ["pikemen", "pikeman", "pike"]
     pike = 0
     for k, v in troops.items():
-        name = (k or "").strip().lower()
-        if name.startswith("pikemen") or name == "pikeman" or name == "pike":
+        key = k.strip().lower()
+        if any(pt in key for pt in pike_types):
             try:
-                pike = int(float(v))
+                pike += int(v)
             except Exception:
-                pike = 0
-            break
+                pass
+
+    msg = []
+    msg.append(f"Their Pike: **{human(pike)}**")
+    msg.append(f"Your Cavalry: **{human(total_cav)}**")
 
     if pike <= 0:
-        return "No Pike in the last report; nothing to deny."
+        msg.append("No Pike in the last report; nothing to deny.")
+        return "\n".join(msg)
 
-    total_cav = 4 * pike + 1
-    per_hit = ceil(total_cav / max(1, hits))
-    return (
-        f"Their Pike: {human(pike)} → send **{human(total_cav)}** Cavalry "
-        f"(LC/HC/Knights) to deny the Pike bonus (≈{human(per_hit)}/hit)."
+    needed_cav = 4 * pike + 1
+    per_hit = ceil(needed_cav / max(1, hits))
+
+    msg.append(
+        f"To deny Pike bonus, send **{human(needed_cav)}** Cavalry (≈{human(per_hit)}/hit)."
     )
+    if total_cav >= needed_cav:
+        msg.append("✅ You have enough cav to deny the Pike bonus!")
+    else:
+        msg.append("❌ You do NOT have enough cav to deny the Pike bonus.")
+    return "\n".join(msg)
 
 # ---------- Embeds ----------
 def fmt_embed_from_row(row: sqlite3.Row) -> discord.Embed:
