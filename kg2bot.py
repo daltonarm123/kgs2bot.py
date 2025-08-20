@@ -43,6 +43,46 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 conn = sqlite3.connect(DB_PATH)
 conn.execute("PRAGMA journal_mode=WAL;")  # optional but recommended
 
+# ---------- Database (tables & indexes) ----------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS spy_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kingdom TEXT NOT NULL,
+  alliance TEXT,
+  honour REAL,
+  ranking INTEGER,
+  networth INTEGER,
+  spies_sent INTEGER,
+  spies_lost INTEGER,
+  result_level TEXT,
+  castles INTEGER,
+  resources_json TEXT,
+  troops_json TEXT,
+  movements_json TEXT,
+  markets_json TEXT,
+  tech_json TEXT,
+  defense_power INTEGER,
+  captured_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  author_id TEXT,
+  raw TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_spy_kingdom_captured
+  ON spy_reports(kingdom, captured_at DESC);
+
+CREATE TABLE IF NOT EXISTS channel_settings (
+  guild_id TEXT,
+  channel_id TEXT,
+  autocapture INTEGER DEFAULT 0,
+  default_kingdom TEXT,
+  PRIMARY KEY (guild_id, channel_id)
+);
+"""
+
+# Create/upgrade DB
+conn.executescript(SCHEMA)
+conn.commit()
+
 
 # ---------- Discord Client ----------
 intents = discord.Intents.default()
