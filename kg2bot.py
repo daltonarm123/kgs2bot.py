@@ -19,6 +19,9 @@
 # 4) Run: py .\kg2bot.py
 
 import os
+DB_PATH = os.getenv("DB_PATH", "kg2_reports.sqlite3")  # default for local dev
+...
+conn = sqlite3.connect(DB_PATH)
 import re
 import json
 import io
