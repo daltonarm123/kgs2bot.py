@@ -19,9 +19,6 @@
 # 4) Run: py .\kg2bot.py
 
 import os
-DB_PATH = os.getenv("DB_PATH", "kg2_reports.sqlite3")  # default for local dev
-...
-conn = sqlite3.connect(DB_PATH)
 import re
 import json
 import io
@@ -35,8 +32,17 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# Load .env for local dev
 load_dotenv()
+
+# Paths & tokens
+DB_PATH = os.getenv("DB_PATH", "kg2_reports.sqlite3")  # default local file
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Connect to SQLite
+conn = sqlite3.connect(DB_PATH)
+conn.execute("PRAGMA journal_mode=WAL;")  # optional but recommended
+
 
 # ---------- Discord Client ----------
 intents = discord.Intents.default()
