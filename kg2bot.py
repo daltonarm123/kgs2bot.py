@@ -788,6 +788,10 @@ async def ap(ctx: commands.Context, *, args: str):
             if troops:
                 break
 
+    # Always include Cav vs Pike tip
+    tip = cav_needed_vs_pike(troops, hits)
+    embed.add_field(name="🐎 Cav vs Pike", value=tip, inline=False)
+
     try:
         ts = datetime.fromisoformat(row["captured_at"]).strftime("%Y-%m-%d %H:%M")
     except Exception:
