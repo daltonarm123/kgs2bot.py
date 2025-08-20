@@ -14,7 +14,7 @@
 # ------------------------------------------------------------------
 # Setup:
 # 1) pip install -U discord.py python-dotenv
-# 2) Create .env file with: DISCORD_TOKEN=your_bot_token
+# 2) Create .env file with: DISCORD_TOKEN=your_bot_token 
 # 3) In Discord Dev Portal, enable MESSAGE CONTENT INTENT
 # 4) Run: py .\kg2bot.py
 
