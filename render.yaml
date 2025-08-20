@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: kg2recon
+    env: python
+    startCommand: python kg2bot.py
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN   # set the value in Render dashboard (do NOT commit it)
+        sync: false
+      - key: DB_PATH         # keeps your spy history on a persistent disk
+        value: /var/data/kg2_reports.sqlite3
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
