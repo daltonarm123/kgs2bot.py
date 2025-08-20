@@ -273,7 +273,16 @@ def extract_section(block: str, header: str) -> Optional[str]:
     sub = block[i:]
     ends = [
         sub.lower().find(h.lower())
-        for h in [MARKET_HDR, TECH_HDR, TROOPS_HDR, RES_HDR, "Target:", "KG2Bot", "The following information"]
+        for h in [
+            MARKET_HDR,
+            TECH_HDR,
+            TROOPS_HDR,
+            RES_HDR,
+            MOVEMENT_HDR,
+            "Target:",
+            "KG2Bot",
+            "The following information",
+        ]
         if sub.lower().find(h.lower()) != -1
     ]
     end = min(ends) if ends else len(sub)
@@ -764,8 +773,20 @@ async def ap(ctx: commands.Context, *, args: str):
         troops = json.loads(row["troops_json"]) if row["troops_json"] else {}
     except Exception:
         troops = {}
-    tip = cav_needed_vs_pike(troops, hits)
-    embed.add_field(name="🐎 Cav vs Pike", value=tip, inline=False)
+    def load_troops(r: sqlite3.Row) -> Dict[str, int]:
+        try:
+            t = json.loads(r["troops_json"]) if r["troops_json"] else {}
+            return t if isinstance(t, dict) else {}
+        except Exception:
+            return {}
+
+    troops = load_troops(row)
+    if not troops:
+        # fallback to an earlier report that has troop data
+        for older in fetch_last_n(kingdom, 5)[1:]:
+            troops = load_troops(older)
+            if troops:
+                break
 
     try:
         ts = datetime.fromisoformat(row["captured_at"]).strftime("%Y-%m-%d %H:%M")
