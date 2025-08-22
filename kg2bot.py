@@ -1,5 +1,7 @@
 # KG2 Recon Bot (discord.py v2)
-# Sleek embeds • Auto-capture • History • AP Planner (per-hit) • Castle bonus • Cav-vs-Pike tip • Export • Help menu
+# Sleek embeds • Auto-capture • History • AP Planner (per-hit) • Castle bonus
+# Cav-vs-Pike tip • Export • Help menu • Auto Attack-Report DP estimate
+#
 # Commands:
 #   !kg2help  (alias: !commands)
 #   !watchhere on/off [DefaultKingdom]
@@ -7,13 +9,13 @@
 #   !savereport [message link]
 #   !addspy <Kingdom>                      (admin guided paste)
 #   !spy <Kingdom>
-#   !ap <Kingdom> [hits]
+#   !ap <Kingdom> [hits]                   (hits defaults to 0)
 #   !spyhistory <Kingdom> [N]
 #   !spyid <Kingdom> <ID>
 #   !exportspy <Kingdom> [N]               (admin)
-#   !rescanlast <Kingdom>                  (admin)  ← re-parse latest raw row to fill troops/DP
-#   !rescanrange <Kingdom> [N=5]           (admin)  ← re-parse last N rows
-#   !checklast <Kingdom>                   ← quick sanity check for troop keys
+#   !rescanlast <Kingdom>                  (admin)  re-parse latest raw row
+#   !rescanrange <Kingdom> [N=5]           (admin)  re-parse last N rows
+#   !checklast <Kingdom>                   quick sanity check for troop keys
 # ------------------------------------------------------------------
 # Setup:
 # 1) pip install -U discord.py python-dotenv
@@ -489,18 +491,14 @@ def castle_bonus_percent(castles: int) -> float:
 
 def cav_needed_vs_pike(troops: Dict[str, int], hits: int) -> str:
     """
-    Deny Pike bonus (25% rule):
-      Defender anti-Cav bonus triggers if Pike >= 25% of your Cav.
-      To deny it, send Cav > 4 * defender_pike.
-    Shows: their Pike, Cav needed, and per-hit.
+    Deny Pike bonus (25% rule): send Cav > 4 * defender_pike.
+    Shows: their Pike; omits attacker cav (unknown).
     """
     if not troops or not isinstance(troops, dict):
         return "No troop counts found in the last report."
-
-    # normalize keys
     norm = {(k or "").strip().lower(): v for k, v in troops.items() if k is not None}
-
     pike_aliases = ["pikemen", "pikeman", "pike", "pikes"]
+
     pike = 0
     for name, val in norm.items():
         if any(alias in name for alias in pike_aliases):
@@ -510,19 +508,120 @@ def cav_needed_vs_pike(troops: Dict[str, int], hits: int) -> str:
                 pass
 
     msg = [f"Their Pike: **{human(pike)}**"]
-
     if pike <= 0:
         msg.append("No Pike in the last report; nothing to deny.")
         return "\n".join(msg)
 
     needed_cav = 4 * pike + 1
-    per_hit = ceil(needed_cav / max(1, hits))
-
-    msg.append(
-        f"To deny Pike bonus, send **{human(needed_cav)}** Cavalry (≈{human(per_hit)}/hit)."
-    )
+    if hits > 0:
+        per_hit = ceil(needed_cav / hits)
+        msg.append(f"To deny Pike bonus, send **{human(needed_cav)}** Cavalry (≈{human(per_hit)}/hit).")
+    else:
+        msg.append(f"To deny Pike bonus, send **{human(needed_cav)}** Cavalry.")
     return "\n".join(msg)
 
+# ---------- Attack report parsing & DP estimate ----------
+ATTACK_HDR_PAT = re.compile(r"^Attack Report:\s*(?P<kingdom>.+?)\s*\(NW:\s*[+\-]?\s*[\d,]+\)\s*$", re.I | re.M)
+# Accept: Stalemate | Minor Victory | Victory | Major Victory | Overwhelming Victory | Overwhelming
+ATTACK_RESULT_PAT = re.compile(
+    r"^Attack Result:\s*(?P<result>Stalemate|Minor Victory|Victory|Major Victory|Overwhelming(?:\s+Victory)?)\s*$",
+    re.I | re.M
+)
+ATTACK_LOOT_LAND_PAT = re.compile(r"gained.*?\b(?P<land>\d[\d,]*)\s+Land\b", re.I)
+ATTACK_CASUALTY_PAT = re.compile(r"casualties.*?:\s*(?P<lost>\d[\d,]*)\s*/\s*(?P<sent>\d[\d,]*)\s+(?P<unit>[A-Za-z ]+)", re.I)
+
+def looks_like_attack_report(text: str) -> bool:
+    t = text.strip()
+    if len(t) < 40:
+        return False
+    return ("Attack Report:" in t and "Attack Result:" in t)
+
+def parse_attack_report(raw: str) -> Optional[Dict[str, Any]]:
+    m_k = ATTACK_HDR_PAT.search(raw)
+    m_r = ATTACK_RESULT_PAT.search(raw)
+    if not (m_k and m_r):
+        return None
+    kingdom = m_k.group("kingdom").strip()
+    result_raw = m_r.group("result").strip().lower()
+    # Normalize result tiers
+    if result_raw.startswith("stalemate"):
+        result = "Stalemate"
+    elif result_raw.startswith("minor victory"):
+        result = "Minor Victory"
+    elif result_raw == "victory":
+        result = "Victory"
+    elif result_raw.startswith("major victory"):
+        result = "Major Victory"
+    elif result_raw.startswith("overwhelming"):
+        result = "Overwhelming Victory"
+    else:
+        result = "Victory"  # sensible default
+
+    land = 0
+    m_land = ATTACK_LOOT_LAND_PAT.search(raw)
+    if m_land:
+        try:
+            land = int(m_land.group("land").replace(",", ""))
+        except Exception:
+            land = 0
+    lost = sent = None
+    unit = None
+    m_cas = ATTACK_CASUALTY_PAT.search(raw)
+    if m_cas:
+        try:
+            lost = int(m_cas.group("lost").replace(",", ""))
+            sent = int(m_cas.group("sent").replace(",", ""))
+        except Exception:
+            lost = sent = None
+        unit = m_cas.group("unit").strip().title()
+    return {"kingdom": kingdom, "result": result, "land": land, "att_lost": lost, "att_sent": sent, "att_unit": unit}
+
+# Base defender loss % per tier (tune to your meta)
+DEFENDER_LOSS_BASE = {
+    "Stalemate":            0.02,  # smallest
+    "Minor Victory":        0.04,
+    "Victory":              0.08,
+    "Major Victory":        0.13,
+    "Overwhelming Victory": 0.22,  # largest
+}
+# Heuristic modifiers (casualties & land taken)
+ALPHA_CASUALTY = 0.30      # scales with (att_lost / att_sent)
+BETA_LAND      = 0.10      # scales with (land / 1000), capped to 1
+
+def estimate_loss_pct(result_tier: str, att_lost: Optional[int], att_sent: Optional[int], land_gained: int) -> float:
+    base = DEFENDER_LOSS_BASE.get(result_tier, 0.08)
+    cas_ratio = 0.0
+    if att_lost is not None and att_sent and att_sent > 0:
+        cas_ratio = max(0.0, min(1.0, att_lost / att_sent))
+    land_factor = max(0.0, min(1.0, land_gained / 1000.0))
+    loss = base + ALPHA_CASUALTY * cas_ratio + BETA_LAND * land_factor
+    return max(0.01, min(loss, 0.45))  # clamp to sane range
+
+def estimate_dp_after_one_hit(base_dp: int, result_tier: str, att_lost: Optional[int], att_sent: Optional[int], land_gained: int) -> int:
+    pct = estimate_loss_pct(result_tier, att_lost, att_sent, land_gained)
+    return max(0, ceil(base_dp * (1.0 - pct)))
+
+def build_dp_after_hit_embed(kingdom: str, base_dp: int, castles: Optional[int], result: str, land_gained: int, att_lost: Optional[int], att_sent: Optional[int]) -> discord.Embed:
+    c_bonus = castle_bonus_percent(castles or 0)
+    dp_with_castles = ceil(base_dp * (1.0 + c_bonus))
+    dp_after = estimate_dp_after_one_hit(base_dp, result, att_lost, att_sent, land_gained)
+    dp_after_with_castles = ceil(dp_after * (1.0 + c_bonus))
+    est_pct = int(round((1 - dp_after / base_dp) * 100)) if base_dp > 0 else 0
+
+    e = discord.Embed(title=f"AP Update • {kingdom}", color=THEME_COLOR, description="Estimated defender DP after 1 hit")
+    e.add_field(name="🧮 Previous Base DP", value=human(base_dp), inline=True)
+    e.add_field(name="🏰 Previous With Castles", value=human(dp_with_castles), inline=True)
+    e.add_field(name="⚔️ Result Tier", value=result, inline=True)
+
+    e.add_field(name="🧮 Est. Base DP (after 1 hit)", value=f"{human(dp_after)} (−{est_pct}%)", inline=True)
+    e.add_field(name="🏰 Est. With Castles", value=f"{human(dp_after_with_castles)} (+{round(c_bonus*100):.0f}% castles)", inline=True)
+    e.add_field(name="🗺️ Land Gained (attacker)", value=human(land_gained), inline=True)
+
+    if att_lost is not None and att_sent:
+        e.add_field(name="🪖 Attacker Casualties", value=f"{human(att_lost)}/{human(att_sent)}", inline=True)
+
+    e.set_footer(text="Heuristic estimate using tier, attacker casualties, and land gained. Actual losses vary.")
+    return e
 
 # ---------- Embeds ----------
 def fmt_embed_from_row(row: sqlite3.Row) -> discord.Embed:
@@ -717,9 +816,10 @@ async def ap(ctx: commands.Context, *, args: str = ""):
     """
     Usage: !ap <kingdom> [hits]
     If run with no args, will try this channel's default_kingdom.
+    Hits default to 0 (no attacks posted yet).
     """
     parts = args.split()
-    hits = 1
+    hits = 0  # default 0
 
     if not parts:
         on, dk = get_watch(ctx.guild.id, ctx.channel.id)
@@ -729,7 +829,7 @@ async def ap(ctx: commands.Context, *, args: str = ""):
         kingdom = dk
     else:
         if parts[-1].isdigit():
-            hits = max(1, min(10, int(parts[-1])))
+            hits = max(0, min(10, int(parts[-1])))
             kingdom = " ".join(parts[:-1]) or parts[0]
         else:
             kingdom = " ".join(parts)
@@ -759,7 +859,7 @@ async def ap(ctx: commands.Context, *, args: str = ""):
     embed.add_field(name="🔢 Hits", value=str(hits), inline=True)
 
     def fmt(ap_total: int) -> str:
-        if hits == 1:
+        if hits <= 1:
             return f"Total={human(ap_total)}"
         per = ceil(ap_total / hits)
         return f"Total={human(ap_total)} | Per-hit≈{human(per)}"
@@ -978,7 +1078,7 @@ async def on_message(message: discord.Message):
         else:
             pending_add.pop(key, None)
 
-    # auto-capture
+    # auto-capture spy reports
     watch_on, default_kingdom = get_watch(message.guild.id, message.channel.id)
     if watch_on and looks_like_spy_report(message.content):
         raw = message.content
@@ -989,6 +1089,28 @@ async def on_message(message: discord.Message):
         if report_id:
             row = fetch_latest(parsed_kingdom or (default_kingdom or ""))
             await message.channel.send("Auto-saved spy report for this channel.", embed=fmt_embed_from_row(row))
+
+    # auto-reply to Attack Reports with an estimated defender DP-after-1-hit
+    if looks_like_attack_report(message.content):
+        ar = parse_attack_report(message.content)
+        if ar:
+            row = fetch_latest(ar["kingdom"])
+            if row and row["defense_power"] is not None:
+                base_dp = int(row["defense_power"])
+                castles = row["castles"] if "castles" in row.keys() else None
+                embed = build_dp_after_hit_embed(
+                    kingdom=ar["kingdom"],
+                    base_dp=base_dp,
+                    castles=castles,
+                    result=ar["result"],
+                    land_gained=ar["land"] or 0,
+                    att_lost=ar["att_lost"],
+                    att_sent=ar["att_sent"]
+                )
+                try:
+                    await message.channel.send(embed=embed)
+                except Exception:
+                    pass
 
 # ---------- Lightweight Tests ----------
 def _test_parse_examples():
