@@ -587,6 +587,59 @@ async def show_commands(ctx: commands.Context):
     await ctx.send(embed=_build_help_embed())
 
 # ---------- Commands ----------
+@bot.command(name="rescanlast")
+@commands.has_permissions(manage_messages=True)
+async def rescanlast(ctx: commands.Context, *, kingdom: str):
+    """Re-parse the latest saved report for this kingdom and update troops/DP in DB."""
+    row = fetch_latest(kingdom)
+    if not row:
+        await ctx.send(f"No spy reports found for **{kingdom}**.")
+        return
+    raw = row["raw"]
+    if not raw:
+        await ctx.send("Latest row has no raw text stored; try saving a fresh report.")
+        return
+
+    # Re-parse with the current (fixed) parser
+    parsed = parse_spy_report(raw)
+    troops = parsed.get("troops") or {}
+    dp = parsed.get("defense_power")
+
+    if not troops and not dp:
+        await ctx.send("Re-parse found no troop/DP data. Paste a fresh report and `!savereport`.")
+        return
+
+    # Update the row
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE spy_reports SET troops_json=?, defense_power=? WHERE id=?",
+        (json.dumps(troops), dp if dp is not None else row["defense_power"], row["id"]),
+    )
+    conn.commit()
+
+    # Show a quick summary so you can verify
+    pike = 0
+    for k, v in (troops or {}).items():
+        if any(pt in (k or "").strip().lower() for pt in ["pikemen", "pikeman", "pike", "pikes"]):
+            try: pike += int(v)
+            except: pass
+    await ctx.send(f"Rescanned ID {row['id']} for **{kingdom}**. "
+                   f"Troops keys: {len(troops)} • Pike: {pike} • DP: {parsed.get('defense_power') or row['defense_power']}")
+
+@bot.command(name="checklast")
+async def checklast(ctx: commands.Context, *, kingdom: str):
+    row = fetch_latest(kingdom)
+    if not row:
+        await ctx.send(f"No spy reports found for **{kingdom}**.")
+        return
+    try:
+        troops = json.loads(row["troops_json"]) if row["troops_json"] else {}
+    except Exception:
+        troops = {}
+    keys = list(troops.keys())[:12]
+    await ctx.send(f"Latest ID {row['id']} • Troop keys: {keys or 'NONE'} • DP: {row['defense_power'] or '-'}")
+
+
 @bot.command(name="watchhere")
 @commands.has_permissions(manage_guild=True)
 async def watchhere(ctx: commands.Context, state: str, *, default_kingdom: Optional[str] = None):
