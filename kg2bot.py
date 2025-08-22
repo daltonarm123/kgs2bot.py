@@ -11,6 +11,9 @@
 #   !spyhistory <Kingdom> [N]
 #   !spyid <Kingdom> <ID>
 #   !exportspy <Kingdom> [N]               (admin)
+#   !rescanlast <Kingdom>                  (admin)  ← re-parse latest raw row to fill troops/DP
+#   !rescanrange <Kingdom> [N=5]           (admin)  ← re-parse last N rows
+#   !checklast <Kingdom>                   ← quick sanity check for troop keys
 # ------------------------------------------------------------------
 # Setup:
 # 1) pip install -U discord.py python-dotenv
@@ -25,7 +28,7 @@ import io
 import asyncio
 import sqlite3
 from math import ceil
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple, List
 
 import discord
@@ -180,7 +183,7 @@ RESOURCE_KEYS = {
     "Stone": "stone", "Blue Gems": "blue_gems", "Green Gems": "green_gems", "Wood": "wood",
 }
 
-# allow 1,234 style counts
+# allow "UnitName: 1,234" counts
 TROOP_LINE_PAT = re.compile(r"^(?P<name>[A-Za-z ]+):\s*(?P<count>[-+]?\d[\d,]*)$", re.I)
 
 CAPTURED_PAT = re.compile(r"(Spy\s*Report|SpyReport)\s+was\s+captured\s+on[:：\u2022\-\s]*([^\n]+)", re.I)
@@ -266,11 +269,10 @@ def parse_troops(section: str) -> Tuple[Dict[str, int], Optional[int]]:
         s = line.strip()
         m = TROOP_LINE_PAT.match(s)
         if m:
-    name = m.group("name").strip().title()
-    count_txt = m.group("count").replace(",", "")
-    count = int(float(count_txt))
-    troops[name] = count
-
+            name = m.group("name").strip().title()
+            count_txt = m.group("count").replace(",", "")
+            count = int(float(count_txt))
+            troops[name] = count
         if "Approximate defensive power" in s:
             nums = re.findall(r"\d+", s.replace(",", ""))
             if nums:
@@ -278,6 +280,7 @@ def parse_troops(section: str) -> Tuple[Dict[str, int], Optional[int]]:
     return troops, defense_power
 
 def parse_troops_globally(raw: str) -> Dict[str, int]:
+    """Fallback: scan whole raw text for 'Unit: NNN' lines (skip Population)."""
     troops: Dict[str, int] = {}
     for line in raw.splitlines():
         s = line.strip()
@@ -286,14 +289,13 @@ def parse_troops_globally(raw: str) -> Dict[str, int]:
             continue
         name = m.group("name").strip().title()
         if name.lower().startswith("population"):
-            continue  # skip the "Population: 34,149 / 58,570" line
+            continue
         count_txt = m.group("count").replace(",", "")
         try:
             troops[name] = int(float(count_txt))
         except Exception:
             pass
     return troops
-
 
 def parse_bullets(section: str) -> list:
     out = []
@@ -373,8 +375,6 @@ def parse_spy_report(raw: str) -> Dict[str, Any]:
     if trp_s:
         troops, dp = parse_troops(trp_s)
         data["troops"] = troops
-        if not data["troops"]:
-            data["troops"] = parse_troops_globally(raw)
         if dp and not data["defense_power"]:
             data["defense_power"] = dp
     if mov_s:
@@ -391,6 +391,10 @@ def parse_spy_report(raw: str) -> Dict[str, Any]:
                 techs.append(line)
         data["tech"] = techs
 
+    # Fallback if troops were missed by section parsing
+    if not data["troops"]:
+        data["troops"] = parse_troops_globally(raw)
+
     # Captured time
     m = CAPTURED_PAT.search(raw)
     if m:
@@ -402,7 +406,7 @@ def parse_spy_report(raw: str) -> Dict[str, Any]:
             ts = parse_datetime_fuzzy(m2.group(1))
             data["captured_at"] = ts
     if not data["captured_at"]:
-        data["captured_at"] = datetime.utcnow().isoformat()
+        data["captured_at"] = datetime.now(timezone.utc).isoformat()
 
     # Fallback kingdom detection ("Kingdom: X")
     if not data["kingdom"]:
@@ -582,9 +586,10 @@ def _build_help_embed() -> discord.Embed:
         name="Save + Watch",
         value=(
             "`!watchhere on [Kingdom]` — auto-capture this channel\n"
+            "`!watchhere off` — disable in this channel\n"
             "`!watchall on [Kingdom]` — server-wide auto-capture (admin)\n"
-            "`!savereport [link]` — save the last (or linked) report\n"
-            "`!addspy <Kingdom>` — guided save (admin)"
+            "`!watchall off` — disable server-wide (admin)\n"
+            "`!savereport [link]` — manual save if needed"
         ),
         inline=False,
     )
@@ -595,6 +600,15 @@ def _build_help_embed() -> discord.Embed:
             "`!ap <Kingdom> [hits]` — AP totals (castle bonus) + Cav-vs-Pike tip\n"
             "`!spyhistory <Kingdom> [N]` — last N reports\n"
             "`!spyid <Kingdom> <ID>` — open specific report"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="Repair & Debug",
+        value=(
+            "`!rescanlast <Kingdom>` — re-parse latest raw row (fix missing troops)\n"
+            "`!rescanrange <Kingdom> [N]` — re-parse last N rows\n"
+            "`!checklast <Kingdom>` — show troop keys/pike/DP seen by !ap"
         ),
         inline=False,
     )
@@ -610,59 +624,6 @@ async def show_commands(ctx: commands.Context):
     await ctx.send(embed=_build_help_embed())
 
 # ---------- Commands ----------
-@bot.command(name="rescanlast")
-@commands.has_permissions(manage_messages=True)
-async def rescanlast(ctx: commands.Context, *, kingdom: str):
-    """Re-parse the latest saved report for this kingdom and update troops/DP in DB."""
-    row = fetch_latest(kingdom)
-    if not row:
-        await ctx.send(f"No spy reports found for **{kingdom}**.")
-        return
-    raw = row["raw"]
-    if not raw:
-        await ctx.send("Latest row has no raw text stored; try saving a fresh report.")
-        return
-
-    # Re-parse with the current (fixed) parser
-    parsed = parse_spy_report(raw)
-    troops = parsed.get("troops") or {}
-    dp = parsed.get("defense_power")
-
-    if not troops and not dp:
-        await ctx.send("Re-parse found no troop/DP data. Paste a fresh report and `!savereport`.")
-        return
-
-    # Update the row
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE spy_reports SET troops_json=?, defense_power=? WHERE id=?",
-        (json.dumps(troops), dp if dp is not None else row["defense_power"], row["id"]),
-    )
-    conn.commit()
-
-    # Show a quick summary so you can verify
-    pike = 0
-    for k, v in (troops or {}).items():
-        if any(pt in (k or "").strip().lower() for pt in ["pikemen", "pikeman", "pike", "pikes"]):
-            try: pike += int(v)
-            except: pass
-    await ctx.send(f"Rescanned ID {row['id']} for **{kingdom}**. "
-                   f"Troops keys: {len(troops)} • Pike: {pike} • DP: {parsed.get('defense_power') or row['defense_power']}")
-
-@bot.command(name="checklast")
-async def checklast(ctx: commands.Context, *, kingdom: str):
-    row = fetch_latest(kingdom)
-    if not row:
-        await ctx.send(f"No spy reports found for **{kingdom}**.")
-        return
-    try:
-        troops = json.loads(row["troops_json"]) if row["troops_json"] else {}
-    except Exception:
-        troops = {}
-    keys = list(troops.keys())[:12]
-    await ctx.send(f"Latest ID {row['id']} • Troop keys: {keys or 'NONE'} • DP: {row['defense_power'] or '-'}")
-
-
 @bot.command(name="watchhere")
 @commands.has_permissions(manage_guild=True)
 async def watchhere(ctx: commands.Context, state: str, *, default_kingdom: Optional[str] = None):
@@ -761,21 +722,26 @@ async def spy(ctx: commands.Context, *, kingdom: str):
     await ctx.send(embed=fmt_embed_from_row(row))
 
 @bot.command(name="ap")
-async def ap(ctx: commands.Context, *, args: str):
+async def ap(ctx: commands.Context, *, args: str = ""):
     """
     Usage: !ap <kingdom> [hits]
-    Shows AP totals using DP with castle bonus, plus a Cav-vs-Pike tip (always shown).
+    If run with no args, will try this channel's default_kingdom.
     """
     parts = args.split()
     hits = 1
-    if parts and parts[-1].isdigit():
-        try:
+
+    if not parts:
+        on, dk = get_watch(ctx.guild.id, ctx.channel.id)
+        if not dk:
+            await ctx.send("Usage: `!ap <kingdom> [hits]` (or set a default with `!watchhere on <Kingdom>`)")
+            return
+        kingdom = dk
+    else:
+        if parts[-1].isdigit():
             hits = max(1, min(10, int(parts[-1])))
             kingdom = " ".join(parts[:-1]) or parts[0]
-        except Exception:
-            kingdom = args; hits = 1
-    else:
-        kingdom = args
+        else:
+            kingdom = " ".join(parts)
 
     row = fetch_latest(kingdom)
     if not row:
@@ -895,6 +861,83 @@ async def exportspy(ctx: commands.Context, kingdom: str, n: int = 0):
     filename = f"{kingdom}_spy_archive_{len(payload)}.json"
     await ctx.send(file=discord.File(buf, filename))
 
+# ---------- Repair / Debug Helpers ----------
+@bot.command(name="rescanlast")
+@commands.has_permissions(manage_messages=True)
+async def rescanlast(ctx: commands.Context, *, kingdom: str):
+    """Re-parse the latest saved report for this kingdom and update troops/DP in DB."""
+    row = fetch_latest(kingdom)
+    if not row:
+        await ctx.send(f"No spy reports found for **{kingdom}**.")
+        return
+    raw = row["raw"]
+    if not raw:
+        await ctx.send("Latest row has no raw text stored; try saving a fresh report.")
+        return
+
+    parsed = parse_spy_report(raw)
+    troops = parsed.get("troops") or {}
+    dp = parsed.get("defense_power")
+
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE spy_reports SET troops_json=?, defense_power=? WHERE id=?",
+        (json.dumps(troops), dp if dp is not None else row["defense_power"], row["id"]),
+    )
+    conn.commit()
+
+    pike = 0
+    for k, v in (troops or {}).items():
+        if any(pt in (k or "").strip().lower() for pt in ["pikemen", "pikeman", "pike", "pikes"]):
+            try:
+                pike += int(v)
+            except Exception:
+                pass
+    await ctx.send(
+        f"Rescanned ID {row['id']} for **{kingdom}**. "
+        f"Troops keys: {len(troops)} • Pike: {pike} • DP: {parsed.get('defense_power') or row['defense_power']}"
+    )
+
+@bot.command(name="rescanrange")
+@commands.has_permissions(manage_messages=True)
+async def rescanrange(ctx: commands.Context, kingdom: str, n: int = 5):
+    """Re-parse the last N reports for this kingdom and update troops/DP."""
+    rows = fetch_last_n(kingdom, max(1, min(n, 50)))
+    if not rows:
+        await ctx.send(f"No spy reports found for **{kingdom}**.")
+        return
+    updated = 0
+    for r in rows:
+        raw = r["raw"]
+        if not raw:
+            continue
+        parsed = parse_spy_report(raw)
+        troops = parsed.get("troops") or {}
+        dp = parsed.get("defense_power")
+        if troops or dp:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE spy_reports SET troops_json=?, defense_power=? WHERE id=?",
+                (json.dumps(troops), dp if dp is not None else r["defense_power"], r["id"]),
+            )
+            updated += 1
+    conn.commit()
+    await ctx.send(f"Rescanned {len(rows)}; updated {updated} for **{kingdom}**.")
+
+@bot.command(name="checklast")
+async def checklast(ctx: commands.Context, *, kingdom: str):
+    row = fetch_latest(kingdom)
+    if not row:
+        await ctx.send(f"No spy reports found for **{kingdom}**.")
+        return
+    try:
+        troops = json.loads(row["troops_json"]) if row["troops_json"] else {}
+    except Exception:
+        troops = {}
+    keys = list(troops.keys())[:12]
+    pike = sum(int(v) for k, v in troops.items() if any(pt in k.lower() for pt in ["pikemen","pikeman","pike","pikes"]))
+    await ctx.send(f"Latest ID {row['id']} • Troop keys: {keys or 'NONE'} • Pike: {pike or 0} • DP: {row['defense_power'] or '-'}")
+
 # ---------- Events ----------
 @bot.event
 async def on_ready():
@@ -909,17 +952,15 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
-        return
+        return  # silently ignore unknown commands
     raise error
-
-def _is_same_chan(guild_id: int, channel_id: int, message: discord.Message) -> bool:
-    return message.guild and message.guild.id == guild_id and message.channel.id == channel_id
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     await bot.process_commands(message)
+
     if not message.guild:
         return
 
@@ -972,7 +1013,7 @@ def _test_parse_examples():
         "Number of Castles: 10\n\n"
         "Our spies also found the following information about the kingdom's troops:\n"
         "Population: 34149 / 58570\n"
-        "Heavy Cavalry: 2000\n"
+        "Heavy Cavalry: 2,000\n"
         "Archers: 313\n"
         "Pikemen: 167\n"
         "Peasants: 31041\n"
