@@ -14,7 +14,7 @@
 # ------------------------------------------------------------------
 # Setup:
 # 1) pip install -U discord.py python-dotenv
-# 2) Create .env file with: DISCORD_TOKEN=your_bot_token 
+# 2) Create .env file with: DISCORD_TOKEN=your_bot_token
 # 3) In Discord Dev Portal, enable MESSAGE CONTENT INTENT
 # 4) Run: py .\kg2bot.py
 
@@ -78,17 +78,13 @@ CREATE TABLE IF NOT EXISTS channel_settings (
   PRIMARY KEY (guild_id, channel_id)
 );
 """
-
-# Create/upgrade DB
 conn.executescript(SCHEMA)
 conn.commit()
-
 
 # ---------- Discord Client ----------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.members = False
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- Theme / Emojis ----------
@@ -98,14 +94,12 @@ E = {
     "networth": "💰", "castles": "🏰", "dp": "🧮", "resources": "📦",
     "troops": "⚔️", "movement": "🚩", "market": "📈", "tech": "🔧",
 }
-
 RES_E = {
     "land": "🗺️", "gold": "🪙", "food": "🍞", "horses": "🐎",
     "stone": "🧱", "blue_gems": "💎", "green_gems": "🟢💎", "wood": "🪵",
 }
 
 # ---------- Helpers ----------
-
 def human(n: Optional[float]) -> str:
     if n is None:
         return "-"
@@ -136,49 +130,7 @@ def table_from_dict(d: Dict[str, int], emoji_map: Dict[str, str]) -> str:
         out = out[:990] + "\n…"
     return code_block(out)
 
-# ---------- Database ----------
-DB_PATH = "kg2_reports.sqlite3"
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS spy_reports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kingdom TEXT NOT NULL,
-  alliance TEXT,
-  honour REAL,
-  ranking INTEGER,
-  networth INTEGER,
-  spies_sent INTEGER,
-  spies_lost INTEGER,
-  result_level TEXT,
-  castles INTEGER,
-  resources_json TEXT,
-  troops_json TEXT,
-  movements_json TEXT,
-  markets_json TEXT,
-  tech_json TEXT,
-  defense_power INTEGER,
-  captured_at TEXT,
-  created_at TEXT DEFAULT (datetime('now')),
-  author_id TEXT,
-  raw TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_spy_kingdom_captured ON spy_reports(kingdom, captured_at DESC);
-
-CREATE TABLE IF NOT EXISTS channel_settings (
-  guild_id TEXT,
-  channel_id TEXT,
-  autocapture INTEGER DEFAULT 0,
-  default_kingdom TEXT,
-  PRIMARY KEY (guild_id, channel_id)
-);
-"""
-
-conn = sqlite3.connect(DB_PATH)
-conn.execute("PRAGMA journal_mode=WAL;")
-conn.executescript(SCHEMA)
-conn.commit()
-
-# ---- Channel settings helpers ----
+# ---------- Channel settings ----------
 def set_watch(guild_id: int, channel_id: int, on: bool, default_kingdom: Optional[str] = None):
     conn.execute(
         """
@@ -212,11 +164,8 @@ def looks_like_spy_report(text: str) -> bool:
     if len(text) < 50:
         return False
     signals = [
-        "target:",
-        "spyreport was captured on",
-        "spy report was captured on",
-        "our spies also found",
-        "approximate defensive power",
+        "target:", "spyreport was captured on", "spy report was captured on",
+        "our spies also found", "approximate defensive power"
     ]
     return sum(1 for s in signals if s in t) >= 2
 
@@ -236,57 +185,65 @@ TROOP_LINE_PAT = re.compile(r"^(?P<name>[A-Za-z ]+):\s*(?P<count>[-+]?\d+)$", re
 CAPTURED_PAT = re.compile(r"(Spy\s*Report|SpyReport)\s+was\s+captured\s+on[:：\u2022\-\s]*([^\n]+)", re.I)
 CAPTURED_PAT_ALT = re.compile(r"^Received[:：\-\s]*([^\n]+)$", re.I | re.M)
 
-MOVEMENT_HDR = "The following information was found regarding troop movements"
-MARKET_HDR   = "The following recent market transactions were also discovered"
-TECH_HDR     = "The following technology information was also discovered"
-RES_HDR      = "Our spies also found the following information about the kingdom's resources"
-TROOPS_HDR   = "Our spies also found the following information about the kingdom's troops"
+# ---- Robust multi-header matching (handles straight/curly quotes and short forms)
+HEADERS = {
+    "resources": [
+        "Our spies also found the following information about the kingdom's resources",
+        "Our spies also found the following information about the kingdom’s resources",
+        "The following information was found regarding the kingdom's resources",
+    ],
+    "troops": [
+        "Our spies also found the following information about the kingdom's troops",
+        "Our spies also found the following information about the kingdom’s troops",
+        "The following information was found regarding the kingdom's troops",
+        "Troops discovered",
+    ],
+    "movements": [
+        "The following information was found regarding troop movements",
+        "The following information was found regarding the enemy's troop movements",
+    ],
+    "markets": [
+        "The following recent market transactions were also discovered",
+        "Recent market transactions",
+    ],
+    "tech": [
+        "The following technology information was also discovered",
+        "Technology information discovered",
+    ],
+}
 
-def parse_datetime_fuzzy(s: str) -> Optional[str]:
-    s = s.strip()
-    fmts = [
-        "%m/%d/%Y %I:%M %p",
-        "%m/%d/%Y %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%d/%m/%Y %H:%M",
-        "%Y/%m/%d %H:%M:%S",
-        "%b %d, %Y, %I:%M:%S %p",
-        "%b %d, %Y %I:%M:%S %p",
-        "%b %d, %Y, %I:%M %p",
-        "%b %d, %Y %I:%M %p",
-    ]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f).isoformat()
-        except Exception:
-            pass
-    try:
-        return datetime.fromisoformat(s.replace("[mytime]", "").replace("[/mytime]", "").strip()).isoformat()
-    except Exception:
-        return None
+def _find_any(haystack_lc: str, needles: List[str]) -> int:
+    best = -1
+    for n in needles:
+        i = haystack_lc.find(n.lower())
+        if i != -1 and (best == -1 or i < best):
+            best = i
+    return best
 
-def extract_section(block: str, header: str) -> Optional[str]:
-    i = block.lower().find(header.lower())
-    if i == -1:
+def extract_section(block: str, section_key: str) -> Optional[str]:
+    hay = block
+    hay_lc = hay.lower()
+    starts = _find_any(hay_lc, HEADERS[section_key])
+    if starts == -1:
         return None
-    sub = block[i:]
-    ends = [
-        sub.lower().find(h.lower())
-        for h in [
-            MARKET_HDR,
-            TECH_HDR,
-            TROOPS_HDR,
-            RES_HDR,
-            MOVEMENT_HDR,
-            "Target:",
-            "KG2Bot",
-            "The following information",
-        ]
-        if sub.lower().find(h.lower()) != -1
-    ]
-    end = min(ends) if ends else len(sub)
-    return sub[:end]
+    tail = hay[starts:]
+    tail_lc = tail.lower()
+
+    other_headers: List[str] = []
+    for k, arr in HEADERS.items():
+        if k != section_key:
+            other_headers.extend(arr)
+    other_headers.extend([
+        "Target:", "KG2Bot", "The following information", "SpyReport was captured on",
+        "Spy Report was captured on", "Received:", "Approximate defensive power"
+    ])
+
+    end_pos = len(tail)
+    for h in other_headers:
+        j = tail_lc.find(h.lower())
+        if j != -1 and 0 < j < end_pos:
+            end_pos = j
+    return tail[:end_pos]
 
 def parse_resources(section: str) -> Dict[str, int]:
     out: Dict[str, int] = {}
@@ -327,6 +284,25 @@ def parse_bullets(section: str) -> list:
             out.append(line)
     return out
 
+def parse_datetime_fuzzy(s: str) -> Optional[str]:
+    s = s.strip()
+    fmts = [
+        "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M", "%Y/%m/%d %H:%M:%S",
+        "%b %d, %Y, %I:%M:%S %p", "%b %d, %Y %I:%M:%S %p",
+        "%b %d, %Y, %I:%M %p", "%b %d, %Y %I:%M %p",
+    ]
+    for f in fmts:
+        try:
+            return datetime.strptime(s, f).isoformat()
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s.replace("[mytime]", "").replace("[/mytime]", "").strip()).isoformat()
+    except Exception:
+        return None
+
 def parse_spy_report(raw: str) -> Dict[str, Any]:
     data: Dict[str, Any] = {
         "kingdom": None, "alliance": None, "honour": None, "ranking": None,
@@ -334,7 +310,6 @@ def parse_spy_report(raw: str) -> Dict[str, Any]:
         "castles": None, "resources": {}, "troops": {}, "movements": [], "markets": [],
         "tech": [], "defense_power": None, "captured_at": None
     }
-
     # Key: value lines
     for line in raw.splitlines():
         m = FIELD_PAT.match(line.strip())
@@ -365,12 +340,12 @@ def parse_spy_report(raw: str) -> Dict[str, Any]:
         elif k.startswith("approximate defensive power"):
             data["defense_power"] = int(float(nums[0])) if nums else None
 
-    # Sections
-    res_s  = extract_section(raw, RES_HDR)
-    trp_s  = extract_section(raw, TROOPS_HDR)
-    mov_s  = extract_section(raw, MOVEMENT_HDR)
-    mkt_s  = extract_section(raw, MARKET_HDR)
-    tech_s = extract_section(raw, TECH_HDR)
+    # Sections (robust)
+    res_s  = extract_section(raw, "resources")
+    trp_s  = extract_section(raw, "troops")
+    mov_s  = extract_section(raw, "movements")
+    mkt_s  = extract_section(raw, "markets")
+    tech_s = extract_section(raw, "tech")
 
     if res_s:
         data["resources"] = parse_resources(res_s)
@@ -488,38 +463,36 @@ def castle_bonus_percent(castles: int) -> float:
 def cav_needed_vs_pike(troops: Dict[str, int], hits: int) -> str:
     """
     Deny Pike bonus (25% rule):
-      Defender gets anti-Cav bonus if Pike >= 25% of your Cav.
+      Defender anti-Cav bonus triggers if Pike >= 25% of your Cav.
       To deny it, send Cav > 4 * defender_pike.
-    Shows: their Pike, your Cav (total), Cav needed, and per-hit.
+    Output includes their Pike, your Cav, total Cav needed, and per-hit.
     """
     if not troops or not isinstance(troops, dict):
         return "No troop counts found in the last report."
 
-    # Cavalry types (case-insensitive, includes some common variants)
-    cav_types = ["light cavalry", "heavy cavalry", "knight", "knights", "lc", "hc"]
-    total_cav = 0
-    for k, v in troops.items():
-        key = k.strip().lower()
-        if any(ct in key for ct in cav_types):
-            try:
-                total_cav += int(v)
-            except Exception:
-                pass
+    # normalize keys once
+    norm = {(k or "").strip().lower(): v for k, v in troops.items() if k is not None}
 
-    # Pike types
-    pike_types = ["pikemen", "pikeman", "pike"]
-    pike = 0
-    for k, v in troops.items():
-        key = k.strip().lower()
-        if any(pt in key for pt in pike_types):
-            try:
-                pike += int(v)
-            except Exception:
-                pass
+    cav_aliases = [
+        "light cavalry", "heavy cavalry", "cavalry", "knight", "knights",
+        "lc", "hc", "mounted", "horsemen", "horseman"
+    ]
+    pike_aliases = ["pikemen", "pikeman", "pike", "pikes"]
 
-    msg = []
-    msg.append(f"Their Pike: **{human(pike)}**")
-    msg.append(f"Your Cavalry: **{human(total_cav)}**")
+    def total_match(keys: List[str]) -> int:
+        s = 0
+        for name, val in norm.items():
+            if any(alias in name for alias in keys):
+                try:
+                    s += int(val)
+                except Exception:
+                    pass
+        return s
+
+    total_cav = total_match(cav_aliases)
+    pike = total_match(pike_aliases)
+
+    msg = [f"Their Pike: **{human(pike)}**", f"Your Cavalry: **{human(total_cav)}**"]
 
     if pike <= 0:
         msg.append("No Pike in the last report; nothing to deny.")
@@ -528,13 +501,9 @@ def cav_needed_vs_pike(troops: Dict[str, int], hits: int) -> str:
     needed_cav = 4 * pike + 1
     per_hit = ceil(needed_cav / max(1, hits))
 
-    msg.append(
-        f"To deny Pike bonus, send **{human(needed_cav)}** Cavalry (≈{human(per_hit)}/hit)."
-    )
-    if total_cav >= needed_cav:
-        msg.append("✅ You have enough cav to deny the Pike bonus!")
-    else:
-        msg.append("❌ You do NOT have enough cav to deny the Pike bonus.")
+    msg.append(f"To deny Pike bonus, send **{human(needed_cav)}** Cavalry (≈{human(per_hit)}/hit).")
+    msg.append("✅ You have enough cav to deny the Pike bonus!" if total_cav >= needed_cav
+               else "❌ You do NOT have enough cav to deny the Pike bonus.")
     return "\n".join(msg)
 
 # ---------- Embeds ----------
@@ -767,29 +736,23 @@ async def ap(ctx: commands.Context, *, args: str):
     embed.add_field(name="🟨 Major Victory", value=fmt(br["Major Victory"]), inline=False)
     embed.add_field(name="🟥 Overwhelming",  value=fmt(br["Overwhelming"]),  inline=False)
 
-    # Cav vs Pike tip — ALWAYS SHOW
-    troops = {}
-    try:
-        troops = json.loads(row["troops_json"]) if row["troops_json"] else {}
-    except Exception:
-        troops = {}
+    # Cav vs Pike tip — ALWAYS SHOW (robust + length safety)
     def load_troops(r: sqlite3.Row) -> Dict[str, int]:
         try:
             t = json.loads(r["troops_json"]) if r["troops_json"] else {}
             return t if isinstance(t, dict) else {}
         except Exception:
             return {}
-
     troops = load_troops(row)
     if not troops:
-        # fallback to an earlier report that has troop data
         for older in fetch_last_n(kingdom, 5)[1:]:
             troops = load_troops(older)
             if troops:
                 break
 
-    # Always include Cav vs Pike tip
     tip = cav_needed_vs_pike(troops, hits)
+    if len(tip) > 1000:
+        tip = tip[:1000] + "…"
     embed.add_field(name="🐎 Cav vs Pike", value=tip, inline=False)
 
     try:
@@ -870,15 +833,17 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
-        return  # silently ignore unknown commands
+        return
     raise error
+
+def _is_same_chan(guild_id: int, channel_id: int, message: discord.Message) -> bool:
+    return message.guild and message.guild.id == guild_id and message.channel.id == channel_id
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     await bot.process_commands(message)
-
     if not message.guild:
         return
 
@@ -919,35 +884,28 @@ async def on_message(message: discord.Message):
 
 # ---------- Lightweight Tests ----------
 def _test_parse_examples():
-    example1 = (
-        "Target: MrDaGrover\n"
-        "Alliance: Order of the Phoenix\n"
-        "Honour: 7.97\n"
-        "Ranking: 33\n"
-        "Networth: 13459\n"
-        "Spies Sent: 4150\n"
-        "Spies Lost: 386\n"
+    example = (
+        "Target: Bazic\n"
+        "Alliance: NWO-1\n"
+        "Honour: 63.74\n"
+        "Ranking: 73\n"
+        "Networth: 10986\n"
+        "Spies Sent: 700\n"
+        "Spies Lost: 49\n"
         "Result Level: Complete Infiltration\n"
-        "Number of Castles: 2\n\n"
-        f"{TROOPS_HDR}:\n"
-        "Footmen: 1\nCrossbowmen: 1\nLight Cavalry: 1\nPikemen: 1\nArchers: 1\n"
-        "Approximate defensive power*: 20\n\n"
-        "SpyReport was captured on: 4/18/2019 6:16 PM\n"
-    )
-    d1 = parse_spy_report(example1)
-    assert d1["kingdom"] == "MrDaGrover" and d1["defense_power"] == 20 and d1["castles"] == 2
-
-    example2 = (
-        "Target: TestKing\n"
-        "Networth: 55518\n"
-        f"{TROOPS_HDR}:\n"
-        "Archers: 3490\nLight Cavalry: 3769\nPikemen: 293\nPeasants: 19169\n"
-        "Approximate defensive power*: 42860\n"
+        "Number of Castles: 10\n\n"
+        "Our spies also found the following information about the kingdom's troops:\n"
+        "Population: 34149 / 58570\n"
+        "Heavy Cavalry: 2000\n"
+        "Archers: 313\n"
+        "Pikemen: 167\n"
+        "Peasants: 31041\n"
+        "Approximate defensive power*: 11586\n"
+        "*(without skill/prayer modifiers)\n"
         "SpyReport was captured on: 2019-04-18 13:49:54\n"
     )
-    d2 = parse_spy_report(example2)
-    assert d2["kingdom"] == "TestKing" and d2["defense_power"] == 42860
-
+    d = parse_spy_report(example)
+    assert d["kingdom"] == "Bazic" and d["defense_power"] == 11586 and d["troops"].get("Pikemen") == 167
     br = ap_breakdown(100)
     assert br["Minor Victory"] == 120 and br["Victory"] == 155 and br["Major Victory"] == 220 and br["Overwhelming"] == 800
     print("Parser/AP tests: OK")
