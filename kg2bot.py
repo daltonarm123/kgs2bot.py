@@ -180,7 +180,8 @@ RESOURCE_KEYS = {
     "Stone": "stone", "Blue Gems": "blue_gems", "Green Gems": "green_gems", "Wood": "wood",
 }
 
-TROOP_LINE_PAT = re.compile(r"^(?P<name>[A-Za-z ]+):\s*(?P<count>[-+]?\d+)$", re.I)
+# allow 1,234 style counts
+TROOP_LINE_PAT = re.compile(r"^(?P<name>[A-Za-z ]+):\s*(?P<count>[-+]?\d[\d,]*)$", re.I)
 
 CAPTURED_PAT = re.compile(r"(Spy\s*Report|SpyReport)\s+was\s+captured\s+on[:：\u2022\-\s]*([^\n]+)", re.I)
 CAPTURED_PAT_ALT = re.compile(r"^Received[:：\-\s]*([^\n]+)$", re.I | re.M)
@@ -265,14 +266,34 @@ def parse_troops(section: str) -> Tuple[Dict[str, int], Optional[int]]:
         s = line.strip()
         m = TROOP_LINE_PAT.match(s)
         if m:
-            name = m.group("name").strip().title()
-            count = int(float(m.group("count")))
-            troops[name] = count
+    name = m.group("name").strip().title()
+    count_txt = m.group("count").replace(",", "")
+    count = int(float(count_txt))
+    troops[name] = count
+
         if "Approximate defensive power" in s:
             nums = re.findall(r"\d+", s.replace(",", ""))
             if nums:
                 defense_power = int(nums[0])
     return troops, defense_power
+
+def parse_troops_globally(raw: str) -> Dict[str, int]:
+    troops: Dict[str, int] = {}
+    for line in raw.splitlines():
+        s = line.strip()
+        m = TROOP_LINE_PAT.match(s)
+        if not m:
+            continue
+        name = m.group("name").strip().title()
+        if name.lower().startswith("population"):
+            continue  # skip the "Population: 34,149 / 58,570" line
+        count_txt = m.group("count").replace(",", "")
+        try:
+            troops[name] = int(float(count_txt))
+        except Exception:
+            pass
+    return troops
+
 
 def parse_bullets(section: str) -> list:
     out = []
@@ -352,6 +373,8 @@ def parse_spy_report(raw: str) -> Dict[str, Any]:
     if trp_s:
         troops, dp = parse_troops(trp_s)
         data["troops"] = troops
+        if not data["troops"]:
+            data["troops"] = parse_troops_globally(raw)
         if dp and not data["defense_power"]:
             data["defense_power"] = dp
     if mov_s:
