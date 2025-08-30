@@ -1,6 +1,7 @@
 # KG2 Recon Bot (discord.py v2)
 # Sleek embeds • Auto-capture • History • AP Planner (per-hit) • Castle bonus
 # Cav-vs-Pike tip • Export • Help menu • Auto Attack-Report DP estimate
+# Chained DP sessions across multiple hits (fixes "after 1 hit" issue)
 #
 # Commands:
 #   !kg2help  (alias: !commands)
@@ -30,7 +31,7 @@ import io
 import asyncio
 import sqlite3
 from math import ceil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List
 
 import discord
@@ -46,7 +47,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Connect to SQLite
 conn = sqlite3.connect(DB_PATH)
-conn.execute("PRAGMA journal_mode=WAL;")  # optional but recommended
+conn.execute("PRAGMA journal_mode=WAL;")
+conn.execute("PRAGMA foreign_keys=ON;")
 
 # ---------- Database (tables & indexes) ----------
 SCHEMA = """
@@ -81,6 +83,34 @@ CREATE TABLE IF NOT EXISTS channel_settings (
   autocapture INTEGER DEFAULT 0,
   default_kingdom TEXT,
   PRIMARY KEY (guild_id, channel_id)
+);
+
+-- NEW: DP chaining support
+CREATE TABLE IF NOT EXISTS dp_sessions (
+  id INTEGER PRIMARY KEY,
+  target TEXT NOT NULL,
+  spy_report_id INTEGER,
+  captured_at TEXT NOT NULL,
+  base_dp_start INTEGER NOT NULL,
+  castles INTEGER NOT NULL,
+  current_base_dp INTEGER NOT NULL,
+  current_with_castles INTEGER NOT NULL,
+  hits_applied INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (spy_report_id) REFERENCES spy_reports(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dp_sessions_target_time
+  ON dp_sessions(target, captured_at DESC);
+
+CREATE TABLE IF NOT EXISTS dp_hits (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL,
+  hit_at TEXT NOT NULL,
+  tier TEXT NOT NULL,
+  attacker_casualties INTEGER,
+  attacker_army_size INTEGER,
+  land_gained INTEGER,
+  FOREIGN KEY(session_id) REFERENCES dp_sessions(id) ON DELETE CASCADE
 );
 """
 conn.executescript(SCHEMA)
@@ -442,7 +472,25 @@ def save_report(author_id: int, raw: str) -> Tuple[Optional[int], Optional[str]]
         ),
     )
     conn.commit()
-    return cur.lastrowid, data.get("kingdom")
+    rid = cur.lastrowid
+    kingdom = data.get("kingdom")
+
+    # Start a fresh DP session for this spy (used for chaining hits)
+    if kingdom and data.get("defense_power"):
+        base_dp = int(data["defense_power"])
+        castles = int(data.get("castles") or 0)
+        c_bonus = castle_bonus_percent(castles)
+        with_castles = ceil(base_dp * (1.0 + c_bonus))
+        upsert_dp_session(
+            target=kingdom,
+            spy_report_id=rid,
+            captured_at=data.get("captured_at") or datetime.now(timezone.utc).isoformat(),
+            base_dp=base_dp,
+            castles=castles,
+            with_castles=with_castles
+        )
+
+    return rid, kingdom
 
 def fetch_latest(kingdom: str) -> Optional[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
@@ -522,13 +570,13 @@ def cav_needed_vs_pike(troops: Dict[str, int], hits: int) -> str:
 
 # ---------- Attack report parsing & DP estimate ----------
 ATTACK_HDR_PAT = re.compile(r"^Attack Report:\s*(?P<kingdom>.+?)\s*\(NW:\s*[+\-]?\s*[\d,]+\)\s*$", re.I | re.M)
-# Accept: Stalemate | Minor Victory | Victory | Major Victory | Overwhelming Victory | Overwhelming
 ATTACK_RESULT_PAT = re.compile(
     r"^Attack Result:\s*(?P<result>Stalemate|Minor Victory|Victory|Major Victory|Overwhelming(?:\s+Victory)?)\s*$",
     re.I | re.M
 )
 ATTACK_LOOT_LAND_PAT = re.compile(r"gained.*?\b(?P<land>\d[\d,]*)\s+Land\b", re.I)
 ATTACK_CASUALTY_PAT = re.compile(r"casualties.*?:\s*(?P<lost>\d[\d,]*)\s*/\s*(?P<sent>\d[\d,]*)\s+(?P<unit>[A-Za-z ]+)", re.I)
+ATTACK_RECEIVED_PAT = re.compile(r"^Received[:：\-\s]*([^\n]+)$", re.I | re.M)
 
 def looks_like_attack_report(text: str) -> bool:
     t = text.strip()
@@ -543,7 +591,6 @@ def parse_attack_report(raw: str) -> Optional[Dict[str, Any]]:
         return None
     kingdom = m_k.group("kingdom").strip()
     result_raw = m_r.group("result").strip().lower()
-    # Normalize result tiers
     if result_raw.startswith("stalemate"):
         result = "Stalemate"
     elif result_raw.startswith("minor victory"):
@@ -555,7 +602,7 @@ def parse_attack_report(raw: str) -> Optional[Dict[str, Any]]:
     elif result_raw.startswith("overwhelming"):
         result = "Overwhelming Victory"
     else:
-        result = "Victory"  # sensible default
+        result = "Victory"
 
     land = 0
     m_land = ATTACK_LOOT_LAND_PAT.search(raw)
@@ -574,15 +621,32 @@ def parse_attack_report(raw: str) -> Optional[Dict[str, Any]]:
         except Exception:
             lost = sent = None
         unit = m_cas.group("unit").strip().title()
-    return {"kingdom": kingdom, "result": result, "land": land, "att_lost": lost, "att_sent": sent, "att_unit": unit}
+
+    # Pull the "Received:" timestamp if present
+    received_iso: Optional[str] = None
+    m_rec = ATTACK_RECEIVED_PAT.search(raw)
+    if m_rec:
+        received_iso = parse_datetime_fuzzy(m_rec.group(1))
+    if not received_iso:
+        received_iso = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "kingdom": kingdom,
+        "result": result,
+        "land": land,
+        "att_lost": lost,
+        "att_sent": sent,
+        "att_unit": unit,
+        "received_at": received_iso,
+    }
 
 # Base defender loss % per tier (tune to your meta)
 DEFENDER_LOSS_BASE = {
-    "Stalemate":            0.02,  # smallest
+    "Stalemate":            0.02,
     "Minor Victory":        0.04,
     "Victory":              0.08,
     "Major Victory":        0.13,
-    "Overwhelming Victory": 0.22,  # largest
+    "Overwhelming Victory": 0.22,
 }
 # Heuristic modifiers (casualties & land taken)
 ALPHA_CASUALTY = 0.30      # scales with (att_lost / att_sent)
@@ -595,31 +659,116 @@ def estimate_loss_pct(result_tier: str, att_lost: Optional[int], att_sent: Optio
         cas_ratio = max(0.0, min(1.0, att_lost / att_sent))
     land_factor = max(0.0, min(1.0, land_gained / 1000.0))
     loss = base + ALPHA_CASUALTY * cas_ratio + BETA_LAND * land_factor
-    return max(0.01, min(loss, 0.45))  # clamp to sane range
+    return max(0.01, min(loss, 0.45))
 
-def estimate_dp_after_one_hit(base_dp: int, result_tier: str, att_lost: Optional[int], att_sent: Optional[int], land_gained: int) -> int:
+def estimate_dp_after_one_hit(prev_base_dp: int, result_tier: str, att_lost: Optional[int], att_sent: Optional[int], land_gained: int) -> int:
     pct = estimate_loss_pct(result_tier, att_lost, att_sent, land_gained)
-    return max(0, ceil(base_dp * (1.0 - pct)))
+    return max(0, ceil(prev_base_dp * (1.0 - pct)))
 
-def build_dp_after_hit_embed(kingdom: str, base_dp: int, castles: Optional[int], result: str, land_gained: int, att_lost: Optional[int], att_sent: Optional[int]) -> discord.Embed:
-    c_bonus = castle_bonus_percent(castles or 0)
-    dp_with_castles = ceil(base_dp * (1.0 + c_bonus))
-    dp_after = estimate_dp_after_one_hit(base_dp, result, att_lost, att_sent, land_gained)
-    dp_after_with_castles = ceil(dp_after * (1.0 + c_bonus))
-    est_pct = int(round((1 - dp_after / base_dp) * 100)) if base_dp > 0 else 0
+# ---------- DP Session (NEW) ----------
+SESSION_MAX_AGE_MIN = 120  # tie attack to spies from the last 2 hours (adjust as needed)
 
-    e = discord.Embed(title=f"AP Update • {kingdom}", color=THEME_COLOR, description="Estimated defender DP after 1 hit")
-    e.add_field(name="🧮 Previous Base DP", value=human(base_dp), inline=True)
-    e.add_field(name="🏰 Previous With Castles", value=human(dp_with_castles), inline=True)
-    e.add_field(name="⚔️ Result Tier", value=result, inline=True)
+def upsert_dp_session(*, target: str, spy_report_id: int, captured_at: str, base_dp: int, castles: int, with_castles: int) -> None:
+    cur = conn.cursor()
+    # Start a fresh session at each new spy
+    cur.execute("""
+      INSERT INTO dp_sessions(target, spy_report_id, captured_at, base_dp_start, castles, current_base_dp, current_with_castles, hits_applied)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+    """, (target, spy_report_id, captured_at, base_dp, castles, base_dp, with_castles))
+    conn.commit()
 
-    e.add_field(name="🧮 Est. Base DP (after 1 hit)", value=f"{human(dp_after)} (−{est_pct}%)", inline=True)
-    e.add_field(name="🏰 Est. With Castles", value=f"{human(dp_after_with_castles)} (+{round(c_bonus*100):.0f}% castles)", inline=True)
-    e.add_field(name="🗺️ Land Gained (attacker)", value=human(land_gained), inline=True)
+def find_active_session(*, target: str, attack_time_iso: str) -> Optional[dict]:
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT id, captured_at, current_base_dp, current_with_castles, hits_applied, castles, base_dp_start
+      FROM dp_sessions
+      WHERE target=?
+        AND captured_at <= ?
+      ORDER BY captured_at DESC
+      LIMIT 1
+    """, (target, attack_time_iso))
+    row = cur.fetchone()
+    if not row:
+        return None
+    sid, captured_at, cur_base, cur_with_castles, hits, castles, base_start = row
+    t_cap = datetime.fromisoformat(captured_at)
+    t_att = datetime.fromisoformat(attack_time_iso)
+    if (t_att - t_cap) > timedelta(minutes=SESSION_MAX_AGE_MIN):
+        return None
+    return {
+        "id": sid,
+        "captured_at": captured_at,
+        "current_base_dp": cur_base,
+        "current_with_castles": cur_with_castles,
+        "hits_applied": hits,
+        "castles": castles,
+        "base_dp_start": base_start
+    }
 
-    if att_lost is not None and att_sent:
-        e.add_field(name="🪖 Attacker Casualties", value=f"{human(att_lost)}/{human(att_sent)}", inline=True)
+def get_last_known_spy_base_dp(target: str) -> Optional[Tuple[int, int]]:
+    """Return (base_dp, castles) from the latest spy."""
+    row = fetch_latest(target)
+    if row and row["defense_power"] is not None:
+        return int(row["defense_power"]), int(row["castles"] or 0)
+    return None
 
+def handle_attack_report(*, target: str, tier: str, casualties: Optional[int], attacker_army_size: Optional[int], land_gained: int, attack_time_iso: str) -> Optional[dict]:
+    session = find_active_session(target=target, attack_time_iso=attack_time_iso)
+    if session:
+        prev_base = int(session["current_base_dp"])
+        castles = int(session["castles"] or 0)
+    else:
+        fallback = get_last_known_spy_base_dp(target)
+        if not fallback:
+            return None
+        prev_base, castles = fallback
+
+    new_base = estimate_dp_after_one_hit(prev_base, tier, casualties, attacker_army_size, land_gained)
+    c_bonus = castle_bonus_percent(castles)
+    new_with_castles = ceil(new_base * (1.0 + c_bonus))
+    prev_with_castles = ceil(prev_base * (1.0 + c_bonus))
+
+    if session:
+        cur = conn.cursor()
+        cur.execute("""
+          UPDATE dp_sessions
+          SET current_base_dp = ?, current_with_castles = ?, hits_applied = hits_applied + 1
+          WHERE id = ?
+        """, (new_base, new_with_castles, session["id"]))
+        cur.execute("""
+          INSERT INTO dp_hits(session_id, hit_at, tier, attacker_casualties, attacker_army_size, land_gained)
+          VALUES (?, ?, ?, ?, ?, ?)
+        """, (session["id"], attack_time_iso, tier, casualties, attacker_army_size, land_gained))
+        conn.commit()
+        hits_total = session["hits_applied"] + 1
+    else:
+        hits_total = 1  # no session; single calc
+
+    return {
+        "prev_base_dp": prev_base,
+        "prev_with_castles": prev_with_castles,
+        "new_base_dp": new_base,
+        "new_with_castles": new_with_castles,
+        "castles": castles,
+        "hits_total": hits_total,
+        "tier": tier
+    }
+
+def build_dp_chain_embed(*, kingdom: str, chain: dict) -> discord.Embed:
+    # Show "After N hit(s)"
+    desc = f"Estimated defender DP after {chain['hits_total']} hit{'s' if chain['hits_total'] != 1 else ''}"
+    c_bonus_pct = int(round(castle_bonus_percent(chain["castles"]) * 100))
+    pct_drop = 0
+    if chain["prev_base_dp"] > 0:
+        pct_drop = int(round((1 - (chain["new_base_dp"] / chain["prev_base_dp"])) * 100))
+
+    e = discord.Embed(title=f"AP Update • {kingdom}", color=THEME_COLOR, description=desc)
+    e.add_field(name="🧮 Previous Base DP", value=human(chain["prev_base_dp"]), inline=True)
+    e.add_field(name="🏰 Previous With Castles", value=human(chain["prev_with_castles"]), inline=True)
+    e.add_field(name="⚔️ Result Tier", value=chain["tier"], inline=True)
+
+    e.add_field(name="🧮 Est. Base DP (now)", value=f"{human(chain['new_base_dp'])} (−{pct_drop}%)", inline=True)
+    e.add_field(name="🏰 Est. With Castles", value=f"{human(chain['new_with_castles'])} (+{c_bonus_pct}% castles)", inline=True)
     e.set_footer(text="Heuristic estimate using tier, attacker casualties, and land gained. Actual losses vary.")
     return e
 
@@ -844,7 +993,7 @@ async def ap(ctx: commands.Context, *, args: str = ""):
         return
 
     castles = row["castles"] if "castles" in row.keys() else None
-    c_bonus = castle_bonus_percent(castles or 0)
+    c_bonus = castle_bonus_percent(int(castles or 0))
     dp_with_bonus = ceil(int(dp) * (1.0 + c_bonus))
 
     br = ap_breakdown(int(dp_with_bonus))
@@ -1090,23 +1239,20 @@ async def on_message(message: discord.Message):
             row = fetch_latest(parsed_kingdom or (default_kingdom or ""))
             await message.channel.send("Auto-saved spy report for this channel.", embed=fmt_embed_from_row(row))
 
-    # auto-reply to Attack Reports with an estimated defender DP-after-1-hit
+    # auto-reply to Attack Reports with a chained estimated defender DP
     if looks_like_attack_report(message.content):
         ar = parse_attack_report(message.content)
         if ar:
-            row = fetch_latest(ar["kingdom"])
-            if row and row["defense_power"] is not None:
-                base_dp = int(row["defense_power"])
-                castles = row["castles"] if "castles" in row.keys() else None
-                embed = build_dp_after_hit_embed(
-                    kingdom=ar["kingdom"],
-                    base_dp=base_dp,
-                    castles=castles,
-                    result=ar["result"],
-                    land_gained=ar["land"] or 0,
-                    att_lost=ar["att_lost"],
-                    att_sent=ar["att_sent"]
-                )
+            chain = handle_attack_report(
+                target=ar["kingdom"],
+                tier=ar["result"],
+                casualties=ar["att_lost"],
+                attacker_army_size=ar["att_sent"],
+                land_gained=ar["land"] or 0,
+                attack_time_iso=ar["received_at"]
+            )
+            if chain:
+                embed = build_dp_chain_embed(kingdom=ar["kingdom"], chain=chain)
                 try:
                     await message.channel.send(embed=embed)
                 except Exception:
