@@ -1,10 +1,10 @@
 # KG2 Recon Bot (discord.py v2)
-# Sleek embeds • Auto-capture • History • AP Planner • Castle bonus • DP chaining • Battle Calculator (!calc)
+# Sleek embeds • Auto-capture • History • AP Planner • Castle bonus • DP chaining • Calc feature
 # Commands:
 # !kg2help, !watchhere, !watchall, !savereport, !addspy, !spy, !ap, !spyhistory, !spyid, !exportspy, !rescanlast, !rescanrange, !checklast, !calc
 
 import os, re, json, sqlite3, asyncio
-from math import ceil, sqrt
+from math import ceil
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -141,7 +141,7 @@ async def kg2help(ctx):
     embed.add_field(name="!rescanlast <Kingdom>", value="Admin: re-parse latest raw row", inline=False)
     embed.add_field(name="!rescanrange <Kingdom> [N]", value="Admin: re-parse last N rows", inline=False)
     embed.add_field(name="!checklast <Kingdom>", value="Quick sanity check for troop keys", inline=False)
-    embed.add_field(name="!calc", value="Interactive battle calculator: send spy report and troops to get result", inline=False)
+    embed.add_field(name="!calc", value="Interactive combat calculator against a spy report", inline=False)
     await ctx.send(embed=embed)
 
 # ---------- Channel Settings ----------
@@ -311,78 +311,79 @@ def save_report(author_id:int, raw:str)->Tuple[Optional[int],Optional[str]]:
         upsert_dp_session(target=kingdom, spy_report_id=rid, captured_at=data.get("captured_at") or datetime.now(timezone.utc).isoformat(), base_dp=base_dp, castles=castles, with_castles=with_castles)
     return rid, kingdom
 
-# ---------- TEMP SESSION FOR !calc ----------
-calc_sessions: Dict[int, Dict[str, Any]] = {}  # key = user_id
+# ---------- Troop Attack Values ----------
+TROOP_ATTACK_VALUES = {
+    "pikemen":5,
+    "footmen":10,
+    "archers":15,
+    "crossbowmen":20,
+    "heavy cavalry":50,
+    "knights":60,
+    "peasants":1,
+    "horses":30
+}
 
-# ---------- Battle Calculation ----------
-def calculate_battle(attacker:Dict[str,int], defender:Dict[str,int], castles:int) -> str:
-    """
-    Simple battle result:
-    sum attack vs sum defense (scaled by castles)
-    returns: OV, VIC, MV/STALEMATE, FLEE
-    """
-    total_def = sum(defender.values())
-    if castles: total_def *= (1 + sqrt(castles)/100)
-    total_att = sum(attacker.values())
-    ratio = total_att / total_def if total_def else 999
-
-    if ratio >= 1.5: return "Overkill (OV)"
-    elif ratio >= 1.1: return "Victory (VIC)"
-    elif ratio >= 0.9: return "Marginal / Stalemate"
-    else: return "Flee / Failed"
-
-# ---------- !calc command ----------
+# ---------- !calc Command ----------
 @bot.command(name="calc")
 async def calc(ctx):
-    await ctx.send("Please send the **spy report** for the target kingdom.")
-    calc_sessions[ctx.author.id] = {"stage":"waiting_for_report"}
+    await ctx.send("Please send the spy report you want to calculate against.")
 
-# ---------- MESSAGE LISTENER FOR CALC ----------
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        await bot.process_commands(message)
+    try:
+        spy_msg = await bot.wait_for(
+            'message',
+            check=lambda m: m.author==ctx.author and m.channel==ctx.channel,
+            timeout=300
+        )
+    except asyncio.TimeoutError:
+        await ctx.send("Timed out. Please run !calc again.")
         return
 
-    uid = message.author.id
-    session = calc_sessions.get(uid)
-
-    # Stage 1: waiting for spy report
-    if session and session.get("stage") == "waiting_for_report":
-        report = message.content
-        parsed = parse_spy_report(report)
-        if not parsed.get("troops"):
-            await message.channel.send("Could not parse troops from this spy report. Please try again.")
-            return
-        session["stage"] = "waiting_for_attack"
-        session["defender_troops"] = parsed["troops"]
-        session["castles"] = parsed.get("castles",0)
-        await message.channel.send("Got the spy report! Now send the troops you plan to **attack with** in format:\n`Pikemen: 5000`\n`Archers: 2000`\n`Heavy Cavalry: 1000`")
+    spy_data = parse_spy_report(spy_msg.content)
+    if not spy_data.get("kingdom") or not spy_data.get("defense_power"):
+        await ctx.send("Failed to parse spy report. Make sure it's in the correct KG2 format.")
         return
 
-    # Stage 2: waiting for attacking troops
-    if session and session.get("stage") == "waiting_for_attack":
-        attacker_troops = {}
-        for line in message.content.splitlines():
-            m = TROOP_LINE_PAT.match(line.strip())
-            if m:
-                name = m.group("name").strip().title()
-                count = int(float(m.group("count").replace(",","")))
-                attacker_troops[name] = count
-        if not attacker_troops:
-            await message.channel.send("Could not parse any attacking troops. Please use the correct format.")
-            return
-        # Calculate result
-        defender_troops = session["defender_troops"]
-        castles = session["castles"]
-        result = calculate_battle(attacker_troops, defender_troops, castles)
-        # Display result
-        await message.channel.send(f"**Attack Simulation Result:** {result}")
-        # Cleanup session
-        del calc_sessions[uid]
+    base_dp=int(spy_data["defense_power"])
+    castles=int(spy_data.get("castles") or 0)
+    defender_dp = ceil(base_dp*(1+castle_bonus_percent(castles)))
+
+    await ctx.send(f"Spy report saved for **{spy_data['kingdom']}**. Now send the troops you want to send in this format:\n`Pikemen 1000, Archers 500, Knights 50`")
+
+    try:
+        troops_msg = await bot.wait_for(
+            'message',
+            check=lambda m: m.author==ctx.author and m.channel==ctx.channel,
+            timeout=300
+        )
+    except asyncio.TimeoutError:
+        await ctx.send("Timed out. Please run !calc again.")
         return
 
-    await bot.process_commands(message)
+    # Parse user troops
+    attacker_power=0
+    for part in troops_msg.content.split(","):
+        if not part.strip(): continue
+        try:
+            name,count = part.strip().rsplit(" ",1)
+            name=name.lower()
+            count=int(count.replace(",",""))
+            atk_val=TROOP_ATTACK_VALUES.get(name)
+            if atk_val: attacker_power+=atk_val*count
+        except:
+            continue
+
+    if attacker_power==0:
+        await ctx.send("Failed to parse your troops. Make sure the format is correct and troop names are valid.")
+        return
+
+    ratio = attacker_power / defender_dp
+    if ratio>=1.75: result="Major Victory (OV)"
+    elif ratio>=1.55: result="Victory (V)"
+    elif ratio>=1.25: result="Minor Victory (MV)"
+    elif ratio<0.9: result="Flee"
+    else: result="Stalemate"
+
+    await ctx.send(f"Attacker Power: {attacker_power}\nDefender Power (with castle bonus): {defender_dp}\nRatio: {ratio:.2f}\n**Result:** {result}")
 
 # ---------- Run Bot ----------
 @bot.event
