@@ -316,7 +316,7 @@ TROOP_ATTACK_VALUES = {
     "pikemen":5, "footmen":5, "archers":7, "crossbowmen":8, "heavy cavalry":15, "knights":20
 }
 
-# ---------- !calc Command with Realistic Ideal Troops (No Archers/Knights) ----------
+# ---------- !calc Command with Only Heavy Cavalry Suggestion ----------
 @bot.command(name="calc")
 async def calc(ctx):
     await ctx.send("Please send the spy report you want to calculate against.")
@@ -340,26 +340,19 @@ async def calc(ctx):
     castles = int(spy_data.get("castles") or 0)
     defender_dp = ceil(base_dp * (1 + castle_bonus_percent(castles)))
 
-    # Function to calculate ideal attack for Major Victory (ignoring archers and knights)
-    def calc_ideal_attack(def_dp:int) -> Dict[str,int]:
-        factor = 1.75  # aiming for Major Victory
-        needed_power = int(def_dp * factor)
-        # ignore archers and knights
-        usable_troops = {k:v for k,v in TROOP_ATTACK_VALUES.items() if k not in ["archers","knights"]}
-        total_weight = sum(usable_troops.values())
-        ideal = {}
-        for t, v in usable_troops.items():
-            # proportional to attack value
-            count = ceil((v / total_weight) * needed_power / v)
-            ideal[t] = max(count, 0)
-        return ideal
+    # Only Heavy Cavalry suggestion
+    HEAVY_CALV_AP = 7
+    HEAVY_CALV_DP = 5
 
-    ideal_hit = calc_ideal_attack(defender_dp)
+    needed_power = ceil(defender_dp * 1.75)  # aiming for Major Victory
+    heavy_calv_count = ceil(needed_power / HEAVY_CALV_AP)
 
-    # Format recommendation for user
-    rec_lines = [f"{t.title()}: {human(c)}" for t,c in ideal_hit.items()]
-    rec_text = "\n".join(rec_lines)
-    await ctx.send(f"Based on this report, the recommended ideal troops to send for best result are:\n```{rec_text}```\nNow send the troops you have available in this format:\n`Pikemen 1000, Archers 500, Knights 50`")
+    await ctx.send(
+        f"Based on this report, the recommended ideal troops to send for best result are:\n"
+        f"Heavy Cavalry: {human(heavy_calv_count)}\n\n"
+        "Now send the troops you have available in this format:\n"
+        "`Pikemen 1000, Footmen 500, Crossbowmen 50, Heavy Cavalry 100`"
+    )
 
     try:
         troops_msg = await bot.wait_for(
@@ -398,31 +391,25 @@ async def calc(ctx):
     elif ratio < 0.9: result="Flee"
     else: result="Stalemate"
 
-    # Suggest adjustments based on ideal hit
-    adjust_lines = []
-    for t, ideal_count in ideal_hit.items():
-        user_count = user_troops.get(t,0)
-        diff = ideal_count - user_count
-        if diff > 0:
-            adjust_lines.append(f"Consider adding {diff} {t.title()}")
-        elif diff < 0:
-            adjust_lines.append(f"Consider removing {abs(diff)} {t.title()}")
-
-    adjust_text = "\n".join(adjust_lines) if adjust_lines else "Your troop composition matches the ideal distribution closely."
+    # Suggest adjustment only for Heavy Cavalry
+    ideal_hc = heavy_calv_count
+    user_hc = user_troops.get("heavy cavalry", 0)
+    diff = ideal_hc - user_hc
+    if diff > 0:
+        adjust_text = f"Consider adding {human(diff)} Heavy Cavalry"
+    elif diff < 0:
+        adjust_text = f"Consider removing {human(abs(diff))} Heavy Cavalry"
+    else:
+        adjust_text = "Your Heavy Cavalry count matches the ideal recommendation."
 
     await ctx.send(
         f"**Attacker Power:** {attacker_power}\n"
         f"**Defender Power (with castle bonus):** {defender_dp}\n"
         f"**Ratio:** {ratio:.2f}\n"
         f"**Expected Result:** {result}\n\n"
-        f"**Suggestions for adjusting troops:**\n{adjust_text}"
+        f"**Suggestion:** {adjust_text}"
     )
 
-
-
-    # --- Display Results ---
-    user_text = "\n".join([f"{k.title()}: {v}" for k,v in user_troops.items()])
-    await ctx.send(f"Your troops:\n{code_block(user_text)}\nExpected result: **{result}**\n\nSuggestions:\n{code_block(sug_text)}")
 
 # ---------- Run Bot ----------
 bot.run(TOKEN)
