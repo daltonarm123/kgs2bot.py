@@ -124,6 +124,26 @@ def table_from_dict(d: Dict[str, int], emoji_map: Dict[str, str]) -> str:
     if len(out) > 990: out = out[:990] + "\n…"
     return code_block(out)
 
+# ---------- Help Command ----------
+@bot.command(name="kg2help", aliases=["commands"])
+async def kg2help(ctx):
+    embed = discord.Embed(title="KG2 Recon Bot Commands", color=0x5865F2)
+    embed.add_field(name="!kg2help / !commands", value="Shows this help message", inline=False)
+    embed.add_field(name="!watchhere on/off [Kingdom]", value="Start/stop watching this channel for spy reports", inline=False)
+    embed.add_field(name="!watchall on/off [Kingdom]", value="Admin: watch all channels in the guild", inline=False)
+    embed.add_field(name="!savereport [message link]", value="Save a spy report from a message link", inline=False)
+    embed.add_field(name="!addspy <Kingdom>", value="Admin: add a spy manually", inline=False)
+    embed.add_field(name="!spy <Kingdom>", value="Show last spy report for the kingdom", inline=False)
+    embed.add_field(name="!ap <Kingdom> [hits]", value="Calculate attack points for a kingdom", inline=False)
+    embed.add_field(name="!spyhistory <Kingdom> [N]", value="Show last N spy reports", inline=False)
+    embed.add_field(name="!spyid <Kingdom> <ID>", value="Show spy report by ID", inline=False)
+    embed.add_field(name="!exportspy <Kingdom> [N]", value="Admin: export spy report data", inline=False)
+    embed.add_field(name="!rescanlast <Kingdom>", value="Admin: re-parse latest raw row", inline=False)
+    embed.add_field(name="!rescanrange <Kingdom> [N]", value="Admin: re-parse last N rows", inline=False)
+    embed.add_field(name="!checklast <Kingdom>", value="Quick sanity check for troop keys", inline=False)
+    await ctx.send(embed=embed)
+
+
 # ---------- Channel Settings ----------
 def set_watch(guild_id:int, channel_id:int, on:bool, default_kingdom:Optional[str]=None):
     conn.execute("""
