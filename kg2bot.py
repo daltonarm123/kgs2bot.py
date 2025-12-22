@@ -316,7 +316,7 @@ TROOP_ATTACK_VALUES = {
     "pikemen":5, "footmen":5, "archers":7, "crossbowmen":8, "heavy cavalry":15, "knights":20
 }
 
-# ---------- !calc Command with Ideal Troop Recommendation ----------
+# ---------- !calc Command with Realistic Ideal Troops ----------
 @bot.command(name="calc")
 async def calc(ctx):
     await ctx.send("Please send the spy report you want to calculate against.")
@@ -340,14 +340,17 @@ async def calc(ctx):
     castles = int(spy_data.get("castles") or 0)
     defender_dp = ceil(base_dp * (1 + castle_bonus_percent(castles)))
 
-    # Function to calculate ideal attack for Major Victory
+    # Function to calculate ideal attack for Major Victory (ignoring archers)
     def calc_ideal_attack(def_dp:int) -> Dict[str,int]:
         factor = 1.75  # aiming for Major Victory
         needed_power = int(def_dp * factor)
-        total_attack_weight = sum(TROOP_ATTACK_VALUES.values())
+        # ignore archers
+        usable_troops = {k:v for k,v in TROOP_ATTACK_VALUES.items() if k != "archers"}
+        total_weight = sum(usable_troops.values())
         ideal = {}
-        for t, v in TROOP_ATTACK_VALUES.items():
-            count = ceil((v / total_attack_weight) * needed_power / v)
+        for t, v in usable_troops.items():
+            # proportional to attack value
+            count = ceil((v / total_weight) * needed_power / v)
             ideal[t] = max(count, 0)
         return ideal
 
@@ -395,7 +398,7 @@ async def calc(ctx):
     elif ratio < 0.9: result="Flee"
     else: result="Stalemate"
 
-    # Optional: Suggest adjustments based on ideal hit
+    # Suggest adjustments based on ideal hit
     adjust_lines = []
     for t, ideal_count in ideal_hit.items():
         user_count = user_troops.get(t,0)
