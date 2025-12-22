@@ -316,7 +316,7 @@ TROOP_ATTACK_VALUES = {
     "pikemen":5, "footmen":5, "archers":7, "crossbowmen":8, "heavy cavalry":15, "knights":20
 }
 
-# ---------- !calc Command with Only Heavy Cavalry Suggestion ----------
+# ---------- !calc Command (Improved) ----------
 @bot.command(name="calc")
 async def calc(ctx):
     await ctx.send("Please send the spy report you want to calculate against.")
@@ -340,18 +340,17 @@ async def calc(ctx):
     castles = int(spy_data.get("castles") or 0)
     defender_dp = ceil(base_dp * (1 + castle_bonus_percent(castles)))
 
-    # Only Heavy Cavalry suggestion
+    # ---------- Ideal Hit Suggestion ----------
     HEAVY_CALV_AP = 7
-    HEAVY_CALV_DP = 5
-
-    needed_power = ceil(defender_dp * 1.75)  # aiming for Major Victory
-    heavy_calv_count = ceil(needed_power / HEAVY_CALV_AP)
+    ratio_for_major = 1.75  # target ratio for Major Victory
+    needed_power = defender_dp * ratio_for_major
+    suggested_heavy_calv = round(needed_power / HEAVY_CALV_AP)
 
     await ctx.send(
         f"Based on this report, the recommended ideal troops to send for best result are:\n"
-        f"Heavy Cavalry: {human(heavy_calv_count)}\n\n"
-        "Now send the troops you have available in this format:\n"
-        "`Pikemen 1000, Footmen 500, Crossbowmen 50, Heavy Cavalry 100`"
+        f"**Heavy Cavalry:** {suggested_heavy_calv}\n\n"
+        f"Now send the troops you have available in this format:\n"
+        f"`Pikemen 1000, Archers 500, Heavy Cavalry 50`"
     )
 
     try:
@@ -364,19 +363,19 @@ async def calc(ctx):
         await ctx.send("Timed out. Please run !calc again.")
         return
 
-    # Parse user troops
+    # ---------- Parse User Troops ----------
     attacker_power = 0
     user_troops = {}
     for part in troops_msg.content.split(","):
         if not part.strip(): continue
         try:
-            name, count = part.strip().rsplit(" ",1)
+            name, count = part.strip().rsplit(" ", 1)
             name = name.lower()
-            count = int(count.replace(",",""))
+            count = int(count.replace(",", ""))
             atk_val = TROOP_ATTACK_VALUES.get(name)
             if atk_val:
                 attacker_power += atk_val * count
-                user_troops[name] = count
+                user_troops[name.title()] = count
         except:
             continue
 
@@ -384,30 +383,20 @@ async def calc(ctx):
         await ctx.send("Failed to parse your troops. Make sure the format is correct and troop names are valid.")
         return
 
+    # ---------- Calculate Outcome ----------
     ratio = attacker_power / defender_dp
-    if ratio >= 1.75: result="Major Victory (OV)"
-    elif ratio >= 1.55: result="Victory (V)"
-    elif ratio >= 1.25: result="Minor Victory (MV)"
-    elif ratio < 0.9: result="Flee"
-    else: result="Stalemate"
-
-    # Suggest adjustment only for Heavy Cavalry
-    ideal_hc = heavy_calv_count
-    user_hc = user_troops.get("heavy cavalry", 0)
-    diff = ideal_hc - user_hc
-    if diff > 0:
-        adjust_text = f"Consider adding {human(diff)} Heavy Cavalry"
-    elif diff < 0:
-        adjust_text = f"Consider removing {human(abs(diff))} Heavy Cavalry"
-    else:
-        adjust_text = "Your Heavy Cavalry count matches the ideal recommendation."
+    if ratio >= 1.75: result = "Major Victory (OV)"
+    elif ratio >= 1.55: result = "Victory (V)"
+    elif ratio >= 1.25: result = "Minor Victory (MV)"
+    elif ratio < 0.9: result = "Flee"
+    else: result = "Stalemate"
 
     await ctx.send(
-        f"**Attacker Power:** {attacker_power}\n"
-        f"**Defender Power (with castle bonus):** {defender_dp}\n"
-        f"**Ratio:** {ratio:.2f}\n"
-        f"**Expected Result:** {result}\n\n"
-        f"**Suggestion:** {adjust_text}"
+        f"Attacker Power: {attacker_power}\n"
+        f"Defender Power (with castle bonus): {defender_dp}\n"
+        f"Ratio: {ratio:.2f}\n"
+        f"**Result:** {result}\n\n"
+        f"Troops you are sending:\n{table_from_dict(user_troops, E)}"
     )
 
 
