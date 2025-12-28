@@ -1,11 +1,12 @@
 # ---------- KG2 Recon Bot • FULL FEATURE BUILD ----------
-# Interactive Calc • AP Hit Tracking • Cogs • Slash Commands
+# Interactive Calc • AP Hit Tracking • Buttons • Live Dashboard (UNRESTRICTED)
 
 import os, re, json, sqlite3, asyncio, difflib, hashlib, logging
 from math import ceil
 from datetime import datetime, timezone
 import discord
 from discord.ext import commands
+from discord.ui import View, Button
 from dotenv import load_dotenv
 
 # ---------- Setup ----------
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS dp_sessions (
     castles INTEGER,
     current_dp INTEGER,
     hits INTEGER,
+    last_hit TEXT,
     captured_at TEXT
 );
 """)
@@ -77,9 +79,7 @@ def hash_report(t):
     return hashlib.sha256(t.encode()).hexdigest()
 
 def parse_spy(text):
-    dp = None
-    castles = 0
-    kingdom = None
+    dp, castles, kingdom = None, 0, None
     for line in text.splitlines():
         if "Target" in line:
             kingdom = line.split(":")[1].strip()
@@ -96,7 +96,7 @@ def fuzzy_kingdom(q):
     m = difflib.get_close_matches(q, names, 1, 0.5)
     return m[0] if m else None
 
-# ---------- Events ----------
+# ---------- EVENTS ----------
 @bot.event
 async def on_message(msg):
     if msg.author.bot or not msg.guild:
@@ -120,14 +120,14 @@ async def on_message(msg):
                 )
                 cur.execute(
                     "INSERT INTO dp_sessions VALUES (NULL,?,?,?,?,?,?)",
-                    (kingdom, dp, castles, dp, 0, ts)
+                    (kingdom, dp, castles, dp, 0, None, ts)
                 )
                 conn.commit()
                 await msg.channel.send(f"📥 Spy report saved for **{kingdom}**")
 
     await bot.process_commands(msg)
 
-# ---------- Watch ----------
+# ---------- WATCH ----------
 @bot.command()
 async def watchhere(ctx, mode: str):
     conn.execute(
@@ -147,8 +147,8 @@ async def watchall(ctx, mode: str):
     conn.commit()
     await ctx.send("📡 Watching all channels." if mode=="on" else "🛑 Stopped watching all channels.")
 
-# ---------- Spy ----------
-@bot.hybrid_command()
+# ---------- SPY ----------
+@bot.command()
 async def spy(ctx, *, kingdom: str):
     cur = conn.cursor()
     row = cur.execute(
@@ -160,7 +160,6 @@ async def spy(ctx, *, kingdom: str):
         kingdom = fuzzy_kingdom(kingdom)
         if not kingdom:
             return await ctx.send("❌ No spy reports found.")
-
         row = cur.execute(
             "SELECT defense_power, castles, captured_at FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
             (kingdom,)
@@ -173,54 +172,63 @@ async def spy(ctx, *, kingdom: str):
     embed.add_field(name="Base DP", value=f"{base:,}")
     embed.add_field(name="With Castles", value=f"{with_castles:,}")
     embed.set_footer(text=f"Captured {ts}")
-
     await ctx.send(embed=embed)
 
-# ---------- AP ----------
-@bot.command()
-async def ap(ctx, action: str, kingdom: str = None, result: str = None):
+# ---------- AP DASHBOARD ----------
+def build_ap_embed(kingdom):
     cur = conn.cursor()
+    base, dp, hits, last_hit = cur.execute(
+        "SELECT base_dp, current_dp, hits, last_hit FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
+        (kingdom,)
+    ).fetchone()
 
-    if action == "hit":
-        if result not in AP_MULTIPLIERS:
-            return await ctx.send("Use: minor | victory | major | overwhelming")
+    embed = discord.Embed(title=f"⚔️ AP Planner • {kingdom}", color=0xE74C3C)
+    embed.add_field(name="Base DP", value=f"{base:,}")
+    embed.add_field(name="Current DP", value=f"{dp:,}")
+    embed.add_field(name="Hits Applied", value=str(hits))
+    if last_hit:
+        embed.set_footer(text=f"Last hit by {last_hit}")
+    return embed
 
-        row = cur.execute(
+class APView(View):
+    def __init__(self, kingdom):
+        super().__init__(timeout=None)
+        self.kingdom = kingdom
+        for k in AP_MULTIPLIERS:
+            self.add_item(APButton(k, kingdom))
+
+class APButton(Button):
+    def __init__(self, label, kingdom):
+        super().__init__(label=label.title(), style=discord.ButtonStyle.danger)
+        self.result = label
+        self.kingdom = kingdom
+
+    async def callback(self, interaction: discord.Interaction):
+        cur = conn.cursor()
+        sid, dp = cur.execute(
             "SELECT id, current_dp FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
-            (kingdom,)
+            (self.kingdom,)
         ).fetchone()
 
-        if not row:
-            return await ctx.send("❌ No AP session.")
-
-        sid, dp = row
-        reduction = int(dp / AP_MULTIPLIERS[result])
+        reduction = int(dp / AP_MULTIPLIERS[self.result])
         new_dp = max(0, dp - reduction)
 
         cur.execute(
-            "UPDATE dp_sessions SET current_dp=?, hits=hits+1 WHERE id=?",
-            (new_dp, sid)
+            "UPDATE dp_sessions SET current_dp=?, hits=hits+1, last_hit=? WHERE id=?",
+            (new_dp, interaction.user.display_name, sid)
         )
         conn.commit()
 
-        return await ctx.send(
-            f"⚔️ **{result.title()} hit applied**\nDP: {dp:,} → {new_dp:,}"
+        await interaction.response.edit_message(
+            embed=build_ap_embed(self.kingdom),
+            view=self.view
         )
 
-    # view
-    row = cur.execute(
-        "SELECT base_dp, current_dp, hits FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
-        (action,)
-    ).fetchone()
-
-    if not row:
-        return await ctx.send("❌ No AP session.")
-
+@bot.command()
+async def ap(ctx, kingdom: str):
     await ctx.send(
-        f"📊 **AP Planner • {action}**\n"
-        f"Base DP: {row[0]:,}\n"
-        f"Current DP: {row[1]:,}\n"
-        f"Hits Applied: {row[2]}"
+        embed=build_ap_embed(kingdom),
+        view=APView(kingdom)
     )
 
 # ---------- CALC ----------
@@ -240,25 +248,9 @@ async def calc(ctx):
     embed.add_field(name="Target", value=kingdom)
     embed.add_field(name="Defense Power", value=f"{dp:,}")
     embed.add_field(name="Suggested Troop", value=f"{best[0].title()} × {needed}")
-
-    await ctx.send(embed=embed)
-    await ctx.send("📦 Send troops as `troop=count` (comma separated):")
-
-    msg = await bot.wait_for("message", check=lambda m: m.author==ctx.author)
-    troops = {}
-    for part in msg.content.split(","):
-        t,c = part.split("=")
-        troops[t.strip().lower()] = int(c)
-
-    attack = sum(TROOP_ATTACK.get(t,0)*c for t,c in troops.items())
-    ratio = attack / dp
-    outcome = "💀 Loss" if ratio < 1 else "⚔️ Win" if ratio < 2 else "🏆 Overkill"
-
-    embed.add_field(name="Your Attack", value=f"{attack:,}")
-    embed.add_field(name="Outcome", value=outcome)
     await ctx.send(embed=embed)
 
-# ---------- Help ----------
+# ---------- HELP ----------
 @bot.command(name="kg2help")
 @bot.command(name="commands")
 async def help_cmd(ctx):
@@ -267,10 +259,9 @@ async def help_cmd(ctx):
         "`!watchhere on/off`\n"
         "`!watchall on/off`\n"
         "`!spy <kingdom>`\n"
-        "`!ap <kingdom>`\n"
-        "`!ap hit <kingdom> <minor|victory|major|overwhelming>`\n"
+        "`!ap <kingdom>` (buttons)\n"
         "`!calc`"
     )
 
-# ---------- Run ----------
+# ---------- RUN ----------
 bot.run(TOKEN)
