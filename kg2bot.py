@@ -96,6 +96,32 @@ def fuzzy_kingdom(q):
     m = difflib.get_close_matches(q, names, 1, 0.5)
     return m[0] if m else None
 
+def ensure_ap_session(kingdom):
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT id FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
+        (kingdom,)
+    ).fetchone()
+
+    if row:
+        return
+
+    spy = cur.execute(
+        "SELECT defense_power, castles, captured_at FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
+        (kingdom,)
+    ).fetchone()
+
+    if not spy:
+        return False
+
+    dp, castles, ts = spy
+    cur.execute(
+        "INSERT INTO dp_sessions VALUES (NULL,?,?,?,?,?,?)",
+        (kingdom, dp, castles, dp, 0, None, ts)
+    )
+    conn.commit()
+    return True
+
 # ---------- EVENTS ----------
 @bot.event
 async def on_message(msg):
@@ -127,26 +153,6 @@ async def on_message(msg):
 
     await bot.process_commands(msg)
 
-# ---------- WATCH ----------
-@bot.command()
-async def watchhere(ctx, mode: str):
-    conn.execute(
-        "INSERT OR REPLACE INTO channel_settings VALUES (?,?,?)",
-        (str(ctx.guild.id), str(ctx.channel.id), 1 if mode=="on" else 0)
-    )
-    conn.commit()
-    await ctx.send("📡 Watching this channel." if mode=="on" else "🛑 Stopped watching.")
-
-@bot.command()
-async def watchall(ctx, mode: str):
-    for ch in ctx.guild.text_channels:
-        conn.execute(
-            "INSERT OR REPLACE INTO channel_settings VALUES (?,?,?)",
-            (str(ctx.guild.id), str(ch.id), 1 if mode=="on" else 0)
-        )
-    conn.commit()
-    await ctx.send("📡 Watching all channels." if mode=="on" else "🛑 Stopped watching all channels.")
-
 # ---------- SPY ----------
 @bot.command()
 async def spy(ctx, *, kingdom: str):
@@ -160,6 +166,7 @@ async def spy(ctx, *, kingdom: str):
         kingdom = fuzzy_kingdom(kingdom)
         if not kingdom:
             return await ctx.send("❌ No spy reports found.")
+
         row = cur.execute(
             "SELECT defense_power, castles, captured_at FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
             (kingdom,)
@@ -177,10 +184,15 @@ async def spy(ctx, *, kingdom: str):
 # ---------- AP DASHBOARD ----------
 def build_ap_embed(kingdom):
     cur = conn.cursor()
-    base, dp, hits, last_hit = cur.execute(
+    row = cur.execute(
         "SELECT base_dp, current_dp, hits, last_hit FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
         (kingdom,)
     ).fetchone()
+
+    if not row:
+        return None
+
+    base, dp, hits, last_hit = row
 
     embed = discord.Embed(title=f"⚔️ AP Planner • {kingdom}", color=0xE74C3C)
     embed.add_field(name="Base DP", value=f"{base:,}")
@@ -225,43 +237,14 @@ class APButton(Button):
         )
 
 @bot.command()
-async def ap(ctx, kingdom: str):
-    await ctx.send(
-        embed=build_ap_embed(kingdom),
-        view=APView(kingdom)
-    )
+async def ap(ctx, *, kingdom: str):
+    real = fuzzy_kingdom(kingdom) or kingdom
 
-# ---------- CALC ----------
-@bot.command()
-async def calc(ctx):
-    await ctx.send("📄 Paste spy report:")
-    spy = await bot.wait_for("message", check=lambda m: m.author==ctx.author)
+    if not ensure_ap_session(real):
+        return await ctx.send("❌ No spy report found for that kingdom.")
 
-    kingdom, dp, castles = parse_spy(spy.content)
-    if not dp:
-        return await ctx.send("❌ Could not parse DP.")
-
-    best = max(TROOP_ATTACK.items(), key=lambda x: x[1])
-    needed = ceil(dp / best[1])
-
-    embed = discord.Embed(title="⚔️ Combat Calculator", color=0x5865F2)
-    embed.add_field(name="Target", value=kingdom)
-    embed.add_field(name="Defense Power", value=f"{dp:,}")
-    embed.add_field(name="Suggested Troop", value=f"{best[0].title()} × {needed}")
-    await ctx.send(embed=embed)
-
-# ---------- HELP ----------
-@bot.command(name="kg2help")
-@bot.command(name="commands")
-async def help_cmd(ctx):
-    await ctx.send(
-        "**KG2 Recon Commands**\n"
-        "`!watchhere on/off`\n"
-        "`!watchall on/off`\n"
-        "`!spy <kingdom>`\n"
-        "`!ap <kingdom>` (buttons)\n"
-        "`!calc`"
-    )
+    embed = build_ap_embed(real)
+    await ctx.send(embed=embed, view=APView(real))
 
 # ---------- RUN ----------
 bot.run(TOKEN)
