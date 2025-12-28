@@ -1,25 +1,28 @@
-# ---------- KG2 Recon Bot (Enhanced Version) ----------
-# Discord.py v2 • Auto-capture • Deduplication • Fuzzy matching • AP Planner • Troop Calc
-# Commands: !kg2help, !watchhere, !watchall, !watchstatus, !spy, !ap, !calc
+# ---------- KG2 Recon Bot (FULL ENHANCED VERSION) ----------
+# Discord.py v2 • Auto-capture • Deduplication • Fuzzy matching
+# AP Planner • Troop Calc • Spy History • Auto-watch channels
 
-import os, re, json, sqlite3, asyncio, difflib
+import os, re, json, sqlite3, asyncio, difflib, hashlib, logging
 from math import ceil
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# ---------- Setup ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "kg2_reports.sqlite3")
+
+logging.basicConfig(level=logging.INFO)
 
 # ---------- Database ----------
 conn = sqlite3.connect(DB_PATH)
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA foreign_keys=ON;")
 
-SCHEMA = """
+conn.executescript("""
 CREATE TABLE IF NOT EXISTS spy_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kingdom TEXT NOT NULL,
@@ -31,295 +34,279 @@ CREATE TABLE IF NOT EXISTS spy_reports (
     spies_lost INTEGER,
     result_level TEXT,
     castles INTEGER,
-    resources_json TEXT,
-    troops_json TEXT,
-    movements_json TEXT,
-    markets_json TEXT,
-    tech_json TEXT,
     defense_power INTEGER,
     captured_at TEXT,
     author_id TEXT,
-    raw TEXT
+    raw TEXT,
+    report_hash TEXT UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS idx_spy_kingdom_captured
+CREATE INDEX IF NOT EXISTS idx_spy_kingdom_time
 ON spy_reports(kingdom, captured_at DESC);
 
 CREATE TABLE IF NOT EXISTS channel_settings (
     guild_id TEXT,
     channel_id TEXT,
     autocapture INTEGER DEFAULT 0,
-    default_kingdom TEXT,
     PRIMARY KEY (guild_id, channel_id)
 );
 
 CREATE TABLE IF NOT EXISTS dp_sessions (
-    id INTEGER PRIMARY KEY,
-    target TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT,
     spy_report_id INTEGER,
-    captured_at TEXT NOT NULL,
-    base_dp_start INTEGER NOT NULL,
-    castles INTEGER NOT NULL,
-    current_base_dp INTEGER NOT NULL,
-    current_with_castles INTEGER NOT NULL,
-    hits_applied INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (spy_report_id) REFERENCES spy_reports(id) ON DELETE SET NULL
+    base_dp INTEGER,
+    castles INTEGER,
+    with_castles INTEGER,
+    captured_at TEXT
 );
-"""
-conn.executescript(SCHEMA)
+""")
 conn.commit()
 
-# ---------- Discord Client ----------
+# ---------- Discord ----------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- Theme & Emojis ----------
+# ---------- Constants ----------
 THEME_COLOR = 0x5865F2
-E = {
-    "kingdom": "👑", "alliance": "🛡️", "honour": "🏅", "ranking": "#️⃣",
-    "networth": "💰", "castles": "🏰", "dp": "🧮", "resources": "📦",
-    "troops": "⚔️", "movement": "🚩", "market": "📈", "tech": "🔧"
-}
-RES_E = {
-    "land": "🗺️", "gold": "🪙", "food": "🍞", "horses": "🐎",
-    "stone": "🧱", "blue_gems": "💎", "green_gems": "🟢💎", "wood": "🪵"
+
+TROOP_ATTACK_VALUES = {
+    "pikemen": 5,
+    "footmen": 5,
+    "archers": 7,
+    "crossbowmen": 8,
+    "heavy cavalry": 15,
+    "knights": 20
 }
 
-TROOP_ATTACK_VALUES = {"pikemen":5, "footmen":5, "archers":7, "crossbowmen":8, "heavy cavalry":15, "knights":20}
+TROOP_EFFICIENCY = {
+    "heavy cavalry": 15,
+    "knights": 20,
+    "archers": 7,
+    "pikemen": 5
+}
 
 # ---------- Helpers ----------
-def human(n: Optional[float]) -> str:
-    if n is None: return "-"
-    try:
-        f = float(n)
-        if f.is_integer(): return f"{int(f):,}"
-        return f"{f:.2f}".rstrip("0").rstrip(".")
-    except: return str(n)
+def hash_report(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
-def code_block(text: str) -> str:
-    return f"```{text}```"
+def castle_bonus(castles: int) -> float:
+    return (castles ** 0.5) / 100 if castles else 0
 
-def table_from_dict(d: Dict[str, int], emoji_map: Dict[str, str]) -> str:
-    if not d: return "-"
-    items = [(f"{emoji_map.get(k.lower(),'•')} {k.replace('_',' ').title()}", human(v)) for k,v in d.items()]
-    left = max(len(a) for a,_ in items) if items else 0
-    lines = [f"{a.ljust(left)}  {b}" for a,b in items]
-    out = "\n".join(lines)
-    if len(out) > 990: out = out[:990] + "\n…"
-    return code_block(out)
+def human(n):
+    return f"{int(n):,}" if n is not None else "-"
 
-def castle_bonus_percent(castles:int)->float:
-    try: return (int(castles or 0)**0.5)/100
-    except: return 0.0
-
-def set_watch(guild_id:int, channel_id:int, on:bool, default_kingdom:Optional[str]=None):
-    conn.execute("""
-    INSERT INTO channel_settings (guild_id, channel_id, autocapture, default_kingdom)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(guild_id, channel_id)
-    DO UPDATE SET autocapture=excluded.autocapture,
-                  default_kingdom=COALESCE(excluded.default_kingdom, channel_settings.default_kingdom)
-    """, (str(guild_id), str(channel_id), 1 if on else 0, default_kingdom))
-    conn.commit()
-
-def get_watch(guild_id:int, channel_id:int) -> Tuple[bool, Optional[str]]:
-    cur = conn.cursor()
-    cur.execute("SELECT autocapture, default_kingdom FROM channel_settings WHERE guild_id=? AND channel_id=?", (str(guild_id), str(channel_id)))
-    row = cur.fetchone()
-    if not row: return False, None
-    return bool(row[0]), row[1]
-
-def get_close_kingdom_match(query:str) -> Optional[str]:
+def fuzzy_kingdom(name: str) -> Optional[str]:
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT kingdom FROM spy_reports")
     kingdoms = [r[0] for r in cur.fetchall()]
-    if not kingdoms: return None
-    match = difflib.get_close_matches(query, kingdoms, n=1, cutoff=0.5)
+    match = difflib.get_close_matches(name, kingdoms, n=1, cutoff=0.5)
     return match[0] if match else None
 
 # ---------- Spy Parsing ----------
-FIELD_PAT = re.compile(
-    r"^(?P<k>Target|Alliance|Honour|Ranking|Networth|Spies Sent|Spies Lost|Result Level|Number of Castles|Approximate defensive power\*?)\s*[:：]\s*(?P<v>.+)$",
-    re.I
-)
-NUM_PAT = re.compile(r"[-+]?\d+(?:\.\d+)?")
-TROOP_LINE_PAT = re.compile(r"^(?P<name>[A-Za-z ]+):\s*(?P<count>[-+]?\d[\d,]*)$", re.I)
+FIELD_PAT = re.compile(r"^(Target|Alliance|Honour|Ranking|Networth|Spies Sent|Spies Lost|Result Level|Number of Castles|Approximate defensive power).*?:\s*(.+)$", re.I)
+NUM_PAT = re.compile(r"\d+")
 
-def parse_spy_report(raw:str) -> Dict[str,Any]:
-    data={"kingdom":None,"alliance":None,"honour":None,"ranking":None,"networth":None,"spies_sent":None,"spies_lost":None,"result_level":None,"castles":None,"resources":{},"troops":{},"movements":[],"markets":[],"tech":[],"defense_power":None,"captured_at":datetime.now(timezone.utc).isoformat()}
+def parse_spy(raw: str) -> Dict[str, Any]:
+    data = {
+        "kingdom": None, "alliance": None, "honour": None,
+        "ranking": None, "networth": None, "spies_sent": None,
+        "spies_lost": None, "result_level": None,
+        "castles": None, "defense_power": None
+    }
     for line in raw.splitlines():
-        m=FIELD_PAT.match(line.strip())
+        m = FIELD_PAT.match(line.strip())
         if not m: continue
-        k,v=m.group("k").lower(),m.group("v").strip()
-        nums=NUM_PAT.findall(v.replace(",",""))
-        if k.startswith("target"): data["kingdom"]=v
-        elif k.startswith("alliance"): data["alliance"]=re.sub(r"\[/?url[^\]]*\]","",v).strip()
-        elif k.startswith("honour") and nums: data["honour"]=float(nums[0])
-        elif k.startswith("ranking") and nums: data["ranking"]=int(float(nums[0]))
-        elif k.startswith("networth") and nums: data["networth"]=int(float(nums[0]))
-        elif k.startswith("spies sent") and nums: data["spies_sent"]=int(float(nums[0]))
-        elif k.startswith("spies lost") and nums: data["spies_lost"]=int(float(nums[0]))
-        elif k.startswith("result level"): data["result_level"]=v
-        elif k.startswith("number of castles") and nums: data["castles"]=int(float(nums[0]))
-        elif k.startswith("approximate defensive power") and nums: data["defense_power"]=int(float(nums[0]))
+        key, val = m.group(1).lower(), m.group(2)
+        nums = NUM_PAT.findall(val.replace(",", ""))
+        if key.startswith("target"): data["kingdom"] = val.strip()
+        elif key.startswith("alliance"): data["alliance"] = val.strip()
+        elif nums:
+            data[key.replace(" ", "_")] = int(nums[0])
     return data
 
-def save_report(author_id:int, raw:str)->Tuple[Optional[int],Optional[str]]:
-    data=parse_spy_report(raw)
-    if not data.get("kingdom"): return None, None
-    cur=conn.cursor()
-    cur.execute("""INSERT INTO spy_reports(kingdom,alliance,honour,ranking,networth,spies_sent,spies_lost,result_level,castles,resources_json,troops_json,movements_json,markets_json,tech_json,defense_power,captured_at,author_id,raw)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-    (data.get("kingdom"),data.get("alliance"),data.get("honour"),data.get("ranking"),data.get("networth"),data.get("spies_sent"),data.get("spies_lost"),data.get("result_level"),data.get("castles"),json.dumps(data.get("resources")),json.dumps(data.get("troops")),json.dumps(data.get("movements")),json.dumps(data.get("markets")),json.dumps(data.get("tech")),data.get("defense_power"),data.get("captured_at"),str(author_id),raw))
+def save_spy(author_id: int, raw: str):
+    data = parse_spy(raw)
+    if not data["kingdom"]: return None
+
+    h = hash_report(raw)
+    cur = conn.cursor()
+    if cur.execute("SELECT 1 FROM spy_reports WHERE report_hash=?", (h,)).fetchone():
+        return None
+
+    ts = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        INSERT INTO spy_reports
+        (kingdom, alliance, honour, ranking, networth,
+         spies_sent, spies_lost, result_level,
+         castles, defense_power, captured_at, author_id, raw, report_hash)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        data["kingdom"], data["alliance"], data["honour"],
+        data["ranking"], data["networth"],
+        data["spies_sent"], data["spies_lost"],
+        data["result_level"], data["castles"],
+        data["defense_power"], ts, str(author_id), raw, h
+    ))
+    rid = cur.lastrowid
+
+    if data["defense_power"]:
+        with_castles = ceil(data["defense_power"] * (1 + castle_bonus(data["castles"] or 0)))
+        cur.execute("""
+            INSERT INTO dp_sessions
+            (target, spy_report_id, base_dp, castles, with_castles, captured_at)
+            VALUES (?,?,?,?,?,?)
+        """, (data["kingdom"], rid, data["defense_power"], data["castles"], with_castles, ts))
+
     conn.commit()
-    rid=cur.lastrowid
-    kingdom=data.get("kingdom")
-    if kingdom and data.get("defense_power"):
-        base_dp=int(data["defense_power"])
-        castles=int(data.get("castles") or 0)
-        with_castles=ceil(base_dp*(1+castle_bonus_percent(castles)))
-        conn.execute("""INSERT INTO dp_sessions(target, spy_report_id, captured_at, base_dp_start, castles, current_base_dp, current_with_castles, hits_applied)
-        VALUES(?,?,?,?,?,?,?,0)""", (kingdom, rid, data.get("captured_at") or datetime.now(timezone.utc).isoformat(), base_dp, castles, base_dp, with_castles))
-        conn.commit()
-    return rid, kingdom
+    return data["kingdom"]
 
 # ---------- Events ----------
 @bot.event
 async def on_message(message):
-    if message.author.bot: return
-    watch, default_kingdom = get_watch(message.guild.id, message.channel.id)
-    if watch:
-        rid, kingdom = save_report(message.author.id, message.content)
-        if rid and kingdom:
-            await message.channel.send(f"📥 Spy report for **{kingdom}** saved (ID {rid}).")
+    if message.author.bot or not message.guild:
+        return
+
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT autocapture FROM channel_settings WHERE guild_id=? AND channel_id=?",
+        (str(message.guild.id), str(message.channel.id))
+    ).fetchone()
+
+    if row and row[0]:
+        kingdom = save_spy(message.author.id, message.content)
+        if kingdom:
+            await message.channel.send(f"📥 Spy report saved for **{kingdom}**")
+
     await bot.process_commands(message)
 
 @bot.event
 async def on_guild_channel_create(channel):
     if not isinstance(channel, discord.TextChannel): return
-    guild_id = channel.guild.id
-    watchall_on = any(get_watch(guild_id, ch.id)[0] for ch in channel.guild.text_channels)
-    if watchall_on:
-        set_watch(guild_id, channel.id, True)
-        await channel.send("📡 Auto-watching new channel.")
+    cur = conn.cursor()
+    if cur.execute("SELECT 1 FROM channel_settings WHERE guild_id=? AND autocapture=1", (str(channel.guild.id),)).fetchone():
+        cur.execute("INSERT OR IGNORE INTO channel_settings VALUES (?,?,1)", (str(channel.guild.id), str(channel.id)))
+        conn.commit()
+        await channel.send("📡 Auto-watching this new channel.")
 
 # ---------- Commands ----------
 @bot.command(name="kg2help")
-async def kg2help(ctx):
-    embed = discord.Embed(title="KG2 Recon Bot Commands", color=THEME_COLOR)
-    embed.add_field(name="!watchhere on/off [Kingdom]", value="Start/stop watching this channel", inline=False)
-    embed.add_field(name="!watchall on/off [Kingdom]", value="Admin: watch all channels in the guild", inline=False)
-    embed.add_field(name="!watchstatus", value="Shows watch status", inline=False)
-    embed.add_field(name="!spy <Kingdom>", value="Show last spy report for kingdom (fuzzy supported)", inline=False)
-    embed.add_field(name="!ap <Kingdom> [hits]", value="Calculate attack points for a kingdom", inline=False)
-    embed.add_field(name="!calc", value="Interactive combat calculator against a spy report", inline=False)
+@bot.command(name="commands")
+async def help_cmd(ctx):
+    embed = discord.Embed(title="KG2 Recon Commands", color=THEME_COLOR)
+    embed.add_field(name="!watchhere on/off", value="Watch this channel", inline=False)
+    embed.add_field(name="!watchall on/off", value="Watch all channels", inline=False)
+    embed.add_field(name="!watchstatus", value="Show watch status", inline=False)
+    embed.add_field(name="!spy <kingdom>", value="Show latest spy report", inline=False)
+    embed.add_field(name="!spyhistory <kingdom>", value="Show past reports", inline=False)
+    embed.add_field(name="!ap <kingdom>", value="AP planner", inline=False)
+    embed.add_field(name="!calc", value="Combat calculator", inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(name="watchhere")
-async def watchhere(ctx, mode:str, kingdom:Optional[str]=None):
-    mode = mode.lower()
-    if mode not in ["on","off"]: return await ctx.send("Usage: !watchhere on/off [Kingdom]")
-    set_watch(ctx.guild.id, ctx.channel.id, mode=="on", kingdom)
-    await ctx.send(f"{'📡 Watching' if mode=='on' else '🛑 Stopped watching'} this channel{' for '+kingdom if kingdom else ''}.")
+@bot.command()
+async def watchhere(ctx, mode: str):
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO channel_settings VALUES (?,?,?)",
+                (str(ctx.guild.id), str(ctx.channel.id), 1 if mode=="on" else 0))
+    conn.commit()
+    await ctx.send("📡 Watching this channel." if mode=="on" else "🛑 Stopped watching this channel.")
 
-@bot.command(name="watchall")
-async def watchall(ctx, mode:str, kingdom:Optional[str]=None):
-    mode = mode.lower()
-    if mode not in ["on","off"]: return await ctx.send("Usage: !watchall on/off [Kingdom]")
+@bot.command()
+async def watchall(ctx, mode: str):
     for ch in ctx.guild.text_channels:
-        set_watch(ctx.guild.id, ch.id, mode=="on", kingdom)
-    await ctx.send(f"{'📡 Watching all channels' if mode=='on' else '🛑 Stopped watching all channels'}{' for '+kingdom if kingdom else ''}.")
+        conn.execute("INSERT OR REPLACE INTO channel_settings VALUES (?,?,?)",
+                     (str(ctx.guild.id), str(ch.id), 1 if mode=="on" else 0))
+    conn.commit()
+    await ctx.send("📡 Watching all channels." if mode=="on" else "🛑 Stopped watching all channels.")
 
-@bot.command(name="watchstatus")
+@bot.command()
 async def watchstatus(ctx):
     cur = conn.cursor()
-    cur.execute("SELECT channel_id, autocapture, default_kingdom FROM channel_settings WHERE guild_id=?", (str(ctx.guild.id),))
-    rows = cur.fetchall()
-    if not rows: return await ctx.send("No channels being watched.")
-    msg = "\n".join([f"<#{r[0]}>: {'ON' if r[1] else 'OFF'}" + (f" | Kingdom: {r[2]}" if r[2] else "") for r in rows])
-    await ctx.send(code_block(msg))
+    rows = cur.execute("SELECT channel_id, autocapture FROM channel_settings WHERE guild_id=?", (str(ctx.guild.id),)).fetchall()
+    msg = "\n".join([f"<#{r[0]}> → {'ON' if r[1] else 'OFF'}" for r in rows])
+    await ctx.send(f"```{msg}```")
 
-@bot.command(name="spy")
-async def spy(ctx, *, kingdom:str):
+@bot.command()
+async def spy(ctx, *, kingdom: str):
     cur = conn.cursor()
-    cur.execute("SELECT * FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1", (kingdom,))
-    row = cur.fetchone()
+    row = cur.execute(
+        "SELECT kingdom, defense_power, castles, captured_at FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
+        (kingdom,)
+    ).fetchone()
+
     if not row:
-        match = get_close_kingdom_match(kingdom)
-        if not match: return await ctx.send("❌ No spy reports found.")
-        cur.execute("SELECT * FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1", (match,))
-        row = cur.fetchone()
-        if not row: return await ctx.send("❌ No spy reports found.")
+        match = fuzzy_kingdom(kingdom)
+        if not match:
+            return await ctx.send("❌ No spy reports found.")
+        kingdom = match
+        row = cur.execute(
+            "SELECT kingdom, defense_power, castles, captured_at FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
+            (kingdom,)
+        ).fetchone()
 
-    # Extract fields
-    rid, kingdom, alliance, honour, ranking, networth, spies_sent, spies_lost, result_level, castles, resources_json, troops_json, movements_json, markets_json, tech_json, defense_power, captured_at, author_id, raw = row
-    resources = json.loads(resources_json or "{}")
-    troops = json.loads(troops_json or "{}")
-    movements = json.loads(movements_json or "[]")
-    markets = json.loads(markets_json or "[]")
-    tech = json.loads(tech_json or "[]")
+    base, castles = row[1], row[2]
+    with_castles = ceil(base * (1 + castle_bonus(castles)))
+    await ctx.send(
+        f"🕵️ **Last Spy Report for {kingdom}**\n"
+        f"🛡️ Base DP: {human(base)}\n"
+        f"🏰 With Castles: {human(with_castles)}\n"
+        f"📅 {row[3]}"
+    )
 
-    base_dp = defense_power or 0
-    with_castles = ceil(base_dp*(1+castle_bonus_percent(castles)))
+@bot.command()
+async def spyhistory(ctx, kingdom: str):
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT captured_at, defense_power FROM spy_reports WHERE kingdom=? ORDER BY captured_at DESC LIMIT 5",
+        (kingdom,)
+    ).fetchall()
+    if not rows:
+        return await ctx.send("❌ No history found.")
+    msg = "\n".join([f"{r[0]} → DP {human(r[1])}" for r in rows])
+    await ctx.send(f"📜 **Spy History for {kingdom}**\n```{msg}```")
 
-    # Last DP message
-    await ctx.send(f"🛡️ Last recorded DP for **{kingdom}**: {human(base_dp)} (with castle bonus: {human(with_castles)})")
+@bot.command()
+async def ap(ctx, kingdom: str):
+    cur = conn.cursor()
+    row = cur.execute(
+        "SELECT base_dp, castles, with_castles FROM dp_sessions WHERE target=? ORDER BY captured_at DESC LIMIT 1",
+        (kingdom,)
+    ).fetchone()
+    if not row:
+        return await ctx.send("❌ No AP session found.")
+    await ctx.send(
+        f"📊 **AP Planner • {kingdom}**\n"
+        f"Base DP: {human(row[0])}\n"
+        f"With Castles: {human(row[2])}"
+    )
 
-    # Full report embed
-    embed = discord.Embed(title=f"🕵️ Spy Report • {kingdom}", color=THEME_COLOR, timestamp=datetime.fromisoformat(captured_at))
-    embed.add_field(name="Overview", value=f"**Alliance:** {alliance or '-'}\n**Honour:** {human(honour)}\n**Ranking:** {human(ranking)}\n**Networth:** {human(networth)}\n**Castles:** {castles}", inline=False)
-    embed.add_field(name="Defense", value=f"**Base DP:** {human(base_dp)}\n**With Castles:** {human(with_castles)}", inline=False)
-    embed.add_field(name="Spies", value=f"Sent: {human(spies_sent)} | Lost: {human(spies_lost)}", inline=False)
-    if resources: embed.add_field(name="Resources", value=table_from_dict(resources, RES_E), inline=False)
-    if troops: embed.add_field(name="Troops", value=table_from_dict(troops, E), inline=False)
-    if movements: embed.add_field(name="Movements", value=code_block("\n".join(movements[:15])), inline=False)
-    if markets: embed.add_field(name="Markets", value=code_block("\n".join(markets[:15])), inline=False)
-    if tech: embed.add_field(name="Tech", value=code_block("\n".join(tech[:15])), inline=False)
-    embed.set_footer(text=f"Report ID: {rid}")
-    await ctx.send(embed=embed)
-
-@bot.command(name="ap")
-async def ap(ctx, kingdom:str):
-    cur=conn.cursor()
-    cur.execute("SELECT * FROM dp_sessions WHERE target=? ORDER BY captured_at DESC LIMIT 1",(kingdom,))
-    row=cur.fetchone()
-    if not row: return await ctx.send("❌ No DP session found for kingdom.")
-    base_dp=row[5]
-    castles=row[4]
-    with_castles=row[6]
-    hits=row[7]
-    await ctx.send(f"📊 AP Planner • {kingdom}\nBase DP: {base_dp}\nWith Castle Bonus: {with_castles}\nCastles: {castles}\nHits Applied: {hits}")
-
-@bot.command(name="calc")
+@bot.command()
 async def calc(ctx):
-    await ctx.send("Please paste the spy report to calculate against.")
-    try:
-        spy_msg = await bot.wait_for('message', check=lambda m: m.author==ctx.author and m.channel==ctx.channel, timeout=300)
-    except asyncio.TimeoutError:
-        return await ctx.send("❌ Timeout waiting for spy report.")
+    await ctx.send("📄 Paste spy report:")
+    spy_msg = await bot.wait_for("message", check=lambda m: m.author==ctx.author, timeout=300)
+    data = parse_spy(spy_msg.content)
+    dp = data.get("defense_power")
+    if not dp:
+        return await ctx.send("❌ Failed to parse DP.")
 
-    data=parse_spy_report(spy_msg.content)
-    if not data.get("kingdom"): return await ctx.send("❌ Failed to parse spy report.")
+    best = max(TROOP_EFFICIENCY.items(), key=lambda x: x[1])
+    needed = ceil(dp / best[1])
 
-    # Suggest troops
-    hc_suggestion = ceil((data.get("defense_power") or 0)/TROOP_ATTACK_VALUES.get("heavy cavalry",15))
-    await ctx.send(f"⚔️ Suggested heavy cavalry to attack **{data['kingdom']}**: {hc_suggestion}")
+    await ctx.send(
+        f"🧠 **Optimal Troop:** {best[0].title()}\n"
+        f"⚔️ Needed to match DP: {needed}"
+    )
 
-    await ctx.send("Enter the troops you are sending as JSON (e.g., {\"Heavy Cavalry\":50,\"Archers\":200}):")
-    try:
-        troops_msg = await bot.wait_for('message', check=lambda m: m.author==ctx.author and m.channel==ctx.channel, timeout=300)
-        sent_troops = json.loads(troops_msg.content)
-    except:
-        return await ctx.send("❌ Failed to parse troops input.")
+    await ctx.send("📦 Send your troops as JSON:")
+    tmsg = await bot.wait_for("message", check=lambda m: m.author==ctx.author, timeout=300)
+    troops = json.loads(tmsg.content)
 
-    dp = data.get("defense_power") or 0
-    total_attack = sum([TROOP_ATTACK_VALUES.get(k.lower(),0)*v for k,v in sent_troops.items()])
-    ratio = total_attack/dp if dp else 0
-    outcome = "💀 Likely loss" if ratio<1 else "⚔️ Likely win" if ratio<2 else "🏆 Overkill"
-    await ctx.send(f"Total attack power: {total_attack}\nDefensive power: {dp}\nOutcome suggestion: {outcome}")
+    total = sum(TROOP_ATTACK_VALUES.get(k.lower(),0)*v for k,v in troops.items())
+    ratio = total/dp
+    outcome = "💀 Loss" if ratio<1 else "⚔️ Win" if ratio<2 else "🏆 Overkill"
+    await ctx.send(f"Attack: {human(total)} vs DP {human(dp)} → {outcome}")
 
-# ---------- Run Bot ----------
+# ---------- Run ----------
 bot.run(TOKEN)
