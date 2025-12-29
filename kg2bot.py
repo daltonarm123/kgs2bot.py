@@ -1,10 +1,9 @@
-# ---------- KG2 Recon Bot • FULL PATCHED BUILD w/ ERROR LOGGING ----------
-# Calc (HC only) • AP Planner w/ Buttons + Reset • Spy Capture • Auto-Watch • Error Logs
+# ---------- KG2 Recon Bot • FULL PATCHED BUILD w/ ERROR LOGGING TO DISCORD ----------
+# Calc (HC only) • AP Planner w/ Buttons + Reset • Spy Capture • Auto-Watch • Error Logs to Channel
 
-import os, re, sqlite3, asyncio, difflib, hashlib, logging
+import os, re, sqlite3, asyncio, difflib, hashlib, logging, traceback
 from math import ceil
 from datetime import datetime, timezone
-import traceback
 
 import discord
 from discord.ext import commands
@@ -16,6 +15,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_PATH = "kg2_reports.sqlite3"
 ERROR_LOG = "kg2_errors.log"
+ERROR_CHANNEL_NAME = "kg2recon-updates"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -87,10 +87,26 @@ def ensure_ap_session(kingdom):
     conn.commit()
     return True
 
-def log_error(ctx, error):
+async def log_error(ctx, error):
     ts = datetime.now(timezone.utc).isoformat()
+    err_text = f"\n[{ts}] ERROR in {ctx}:\n{traceback.format_exc()}\n"
+
+    # Save to file
     with open(ERROR_LOG,"a",encoding="utf-8") as f:
-        f.write(f"\n[{ts}] ERROR in {ctx}:\n{traceback.format_exc()}\n")
+        f.write(err_text)
+
+    # Send to Discord channel if exists
+    await bot.wait_until_ready()
+    guilds = bot.guilds
+    for guild in guilds:
+        channel = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        if channel:
+            # Limit message length for Discord
+            chunks = [err_text[i:i+1900] for i in range(0, len(err_text), 1900)]
+            for chunk in chunks:
+                try: await channel.send(f"```py\n{chunk}\n```")
+                except: pass
+            break
 
 # ---------- Auto Capture ----------
 @bot.event
@@ -98,7 +114,6 @@ async def on_message(msg):
     try:
         if msg.author.bot or not msg.guild: return
         cur = conn.cursor()
-        # Auto-capture all messages for spy reports
         kingdom, dp, castles = parse_spy(msg.content)
         if kingdom and dp:
             h = hash_report(msg.content)
@@ -109,7 +124,7 @@ async def on_message(msg):
                 conn.commit()
                 await msg.channel.send(f"📥 Spy report saved for **{kingdom}**")
     except Exception as e:
-        log_error("on_message", e)
+        await log_error("on_message", e)
     await bot.process_commands(msg)
 
 # ---------- AP Dashboard ----------
@@ -147,7 +162,7 @@ class APButton(Button):
             conn.commit()
             await interaction.response.edit_message(embed=build_ap_embed(self.kingdom), view=self.view)
         except Exception as e:
-            log_error(f"APButton({self.result})", e)
+            await log_error(f"APButton({self.result})", e)
             await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
 
 class APResetButton(Button):
@@ -164,7 +179,7 @@ class APResetButton(Button):
             conn.commit()
             await interaction.response.edit_message(embed=build_ap_embed(self.kingdom), view=self.view)
         except Exception as e:
-            log_error("APResetButton", e)
+            await log_error("APResetButton", e)
             await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
 
 # ---------- Commands ----------
@@ -172,22 +187,17 @@ class APResetButton(Button):
 async def ap(ctx, *, kingdom: str):
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
-        if not ensure_ap_session(real):
-            return await ctx.send("❌ No spy report found for that kingdom.")
+        if not ensure_ap_session(real): return await ctx.send("❌ No spy report found for that kingdom.")
         embed = build_ap_embed(real)
         if not embed: return await ctx.send("❌ Failed to load AP session.")
         await ctx.send(embed=embed, view=APView(real))
-    except Exception as e: log_error("ap command", e)
+    except Exception as e: await log_error("ap command", e)
 
 @bot.command()
 async def calc(ctx):
     try:
         await ctx.send("📄 Paste spy report:")
-        spy_msg = await bot.wait_for(
-            "message",
-            timeout=300,
-            check=lambda m: m.author==ctx.author and m.channel==ctx.channel
-        )
+        spy_msg = await bot.wait_for("message", timeout=300, check=lambda m: m.author==ctx.author and m.channel==ctx.channel)
         await ctx.send("🔍 Processing spy report...")
         kingdom, dp, castles = parse_spy(spy_msg.content)
         if not kingdom or not dp: return await ctx.send("❌ Could not parse spy report. Make sure it’s a full KG2 spy report.")
@@ -205,7 +215,7 @@ async def calc(ctx):
         embed.set_footer(text="AP session created / updated")
         await ctx.send(embed=embed)
     except Exception as e:
-        log_error("calc command", e)
+        await log_error("calc command", e)
         await ctx.send("❌ An error occurred while processing the spy report.")
 
 @bot.command()
@@ -225,7 +235,7 @@ async def spy(ctx, *, kingdom: str):
         embed.set_footer(text=f"Captured {ts}")
         await ctx.send(embed=embed)
     except Exception as e:
-        log_error("spy command", e)
+        await log_error("spy command", e)
         await ctx.send("❌ An error occurred while fetching the spy report.")
 
 # ---------- Help ----------
@@ -239,7 +249,7 @@ async def kg2help(ctx):
             "`!ap <kingdom>` (buttons + reset)"
         )
     except Exception as e:
-        log_error("kg2help command", e)
+        await log_error("kg2help command", e)
 
 # ---------- Run ----------
 bot.run(TOKEN)
