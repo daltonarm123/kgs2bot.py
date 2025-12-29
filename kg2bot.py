@@ -1,5 +1,5 @@
-# ---------- KG2 Recon Bot • FULL PATCHED BUILD w/ ERROR LOGGING TO DISCORD ----------
-# Calc (HC only) • AP Planner w/ Buttons + Reset • Spy Capture • Auto-Watch • Error Logs to Channel
+# ---------- KG2 Recon Bot • FULL PATCHED BUILD w/ ERROR LOGGING & STARTUP CONFIRM ----------
+# Calc (HC only) • AP Planner w/ Buttons + Reset • Spy Capture • Auto-Watch • Error Logs to Discord
 
 import os, re, sqlite3, asyncio, difflib, hashlib, logging, traceback
 from math import ceil
@@ -97,11 +97,9 @@ async def log_error(ctx, error):
 
     # Send to Discord channel if exists
     await bot.wait_until_ready()
-    guilds = bot.guilds
-    for guild in guilds:
+    for guild in bot.guilds:
         channel = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
         if channel:
-            # Limit message length for Discord
             chunks = [err_text[i:i+1900] for i in range(0, len(err_text), 1900)]
             for chunk in chunks:
                 try: await channel.send(f"```py\n{chunk}\n```")
@@ -238,7 +236,6 @@ async def spy(ctx, *, kingdom: str):
         await log_error("spy command", e)
         await ctx.send("❌ An error occurred while fetching the spy report.")
 
-# ---------- Help ----------
 @bot.command(name="kg2help")
 async def kg2help(ctx):
     try:
@@ -250,6 +247,16 @@ async def kg2help(ctx):
         )
     except Exception as e:
         await log_error("kg2help command", e)
+
+# ---------- Startup Event ----------
+@bot.event
+async def on_ready():
+    await bot.wait_until_ready()
+    total_channels = sum(len(guild.text_channels) for guild in bot.guilds)
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        if channel:
+            await channel.send(f"✅ KG2 Recon Bot is online and actively watching **{total_channels} channels** across {len(bot.guilds)} servers.")
 
 # ---------- Run ----------
 bot.run(TOKEN)
