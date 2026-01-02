@@ -1,3 +1,4 @@
 discord.py
 python-dotenv
 tzdata
+psycopg2-binary
