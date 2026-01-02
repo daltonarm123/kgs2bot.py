@@ -60,11 +60,12 @@ ap_lock = asyncio.Lock()
 # ---------- Constants ----------
 HEAVY_CAVALRY_AP = 7  # ✅ CORRECT KG2 VALUE
 
-AP_MULTIPLIERS = {
-    "minor": 1.2,          # ~20%
-    "victory": 1.55,       # ~35%
-    "major": 2.2,          # ~55%
-    "overwhelming": 8.0    # ~87.5%
+# Remaining DP after hit (KG2 accurate)
+KG2_REMAINING = {
+    "Minor Victory": 0.80,
+    "Victory": 0.65,
+    "Major Victory": 0.45,
+    "Overwhelming Victory": 0.125
 }
 
 # ---------- Helpers ----------
@@ -79,7 +80,7 @@ def parse_spy(text):
     for line in text.splitlines():
         if line.lower().startswith("target:"):
             kingdom = line.split(":", 1)[1].strip()
-        if "defensive power" in line.lower() or "approximate defensive power" in line.lower():
+        if "defensive power" in line.lower():
             m = re.search(r"\d+", line.replace(",", ""))
             if m:
                 dp = int(m.group())
@@ -174,33 +175,7 @@ def build_spy_embed(row):
     embed.set_footer(text=f"ID {sid} • Captured {ts}")
     return embed
 
-def build_ap_embed(kingdom):
-    cur = conn.cursor()
-    row = cur.execute(
-        "SELECT base_dp, current_dp, hits, last_hit FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
-        (kingdom,)
-    ).fetchone()
-    if not row:
-        return None
-
-    base, dp, hits, last = row
-    embed = discord.Embed(title=f"⚔️ AP Planner • {kingdom}", color=0xE74C3C)
-    embed.add_field(name="Base DP", value=f"{base:,}")
-    embed.add_field(name="Current DP", value=f"{dp:,}")
-    embed.add_field(name="Hits Applied", value=hits)
-    if last:
-        embed.set_footer(text=f"Last hit by {last}")
-    return embed
-
-async def send_error(guild, msg):
-    try:
-        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
-        if ch:
-            await ch.send(f"⚠️ ERROR LOG:\n```py\n{msg}\n```")
-    except:
-        pass
-
-# ---------- Commands ----------
+# ---------- CALC COMMAND (FIXED) ----------
 @bot.command()
 async def calc(ctx):
     await ctx.send("📄 Paste spy report:")
@@ -215,97 +190,32 @@ async def calc(ctx):
 
     adjusted_dp = ceil(dp * (1 + castle_bonus(castles)))
 
-    def hc_needed(value):
-        return ceil(value / HEAVY_CAVALRY_AP)
-
     embed = discord.Embed(title="⚔️ Combat Calculator (KG2)", color=0x5865F2)
     embed.add_field(name="Target", value=kingdom, inline=False)
     embed.add_field(name="Base DP", value=f"{dp:,}")
-    embed.add_field(name="Adjusted DP", value=f"{adjusted_dp:,}")
+    embed.add_field(name="Adjusted DP", value=f"{adjusted_dp:,}", inline=False)
 
     embed.add_field(
         name="HC Needed (No AP)",
-        value=f"{hc_needed(adjusted_dp):,}",
+        value=f"{ceil(adjusted_dp / HEAVY_CAVALRY_AP):,} HC",
         inline=False
     )
 
-    for k, m in AP_MULTIPLIERS.items():
-        remaining = adjusted_dp - int(adjusted_dp / m)
+    for label, pct in KG2_REMAINING.items():
+        remaining_dp = ceil(adjusted_dp * pct)
+        hc = ceil(remaining_dp / HEAVY_CAVALRY_AP)
+        removed = int((1 - pct) * 100)
+
         embed.add_field(
-            name=f"After {k.title()}",
-            value=f"{hc_needed(remaining):,} HC",
+            name=f"After {label} (−{removed}%)",
+            value=(
+                f"Remaining DP: `{remaining_dp:,}`\n"
+                f"HC Required: `{hc:,}`"
+            ),
             inline=True
         )
 
-    embed.set_footer(text="HC = 7 AP | Percent-based KG2 reductions")
-
-    await ctx.send(embed=embed)
-
-# ---------- AP Planner ----------
-class APView(View):
-    def __init__(self, kingdom):
-        super().__init__(timeout=None)
-        self.kingdom = kingdom
-        for k in AP_MULTIPLIERS:
-            self.add_item(APButton(k, kingdom))
-        self.add_item(APResetButton(kingdom))
-
-class APButton(Button):
-    def __init__(self, label, kingdom):
-        super().__init__(label=label.title(), style=discord.ButtonStyle.danger)
-        self.key = label
-        self.kingdom = kingdom
-
-    async def callback(self, interaction):
-        async with ap_lock:
-            cur = conn.cursor()
-            sid, dp = cur.execute(
-                "SELECT id, current_dp FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
-                (self.kingdom,)
-            ).fetchone()
-
-            reduction = int(dp / AP_MULTIPLIERS[self.key])
-            cur.execute(
-                "UPDATE dp_sessions SET current_dp=?, hits=hits+1, last_hit=? WHERE id=?",
-                (max(0, dp - reduction), interaction.user.display_name, sid)
-            )
-            conn.commit()
-
-        await interaction.response.edit_message(embed=build_ap_embed(self.kingdom), view=self.view)
-
-class APResetButton(Button):
-    def __init__(self, kingdom):
-        super().__init__(label="Reset", style=discord.ButtonStyle.secondary)
-        self.kingdom = kingdom
-
-    async def callback(self, interaction):
-        async with ap_lock:
-            cur = conn.cursor()
-            sid, base = cur.execute(
-                "SELECT id, base_dp FROM dp_sessions WHERE kingdom=? ORDER BY captured_at DESC LIMIT 1",
-                (self.kingdom,)
-            ).fetchone()
-            cur.execute(
-                "UPDATE dp_sessions SET current_dp=?, hits=0, last_hit=NULL WHERE id=?",
-                (base, sid)
-            )
-            conn.commit()
-
-        await interaction.response.edit_message(embed=build_ap_embed(self.kingdom), view=self.view)
-
-@bot.command()
-async def ap(ctx, *, kingdom: str):
-    real = fuzzy_kingdom(kingdom) or kingdom
-    if not ensure_ap_session(real):
-        return await ctx.send("❌ No spy report found.")
-    await ctx.send(embed=build_ap_embed(real), view=APView(real))
-
-@bot.command()
-async def apstatus(ctx, *, kingdom: str):
-    real = fuzzy_kingdom(kingdom) or kingdom
-    embed = build_ap_embed(real)
-    if not embed:
-        return await ctx.send("❌ No active AP session.")
+    embed.set_footer(text="HC = 7 AP | Explicit KG2 remaining % math")
     await ctx.send(embed=embed)
 
 # ---------- Run ----------
