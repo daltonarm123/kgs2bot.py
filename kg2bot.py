@@ -1,8 +1,9 @@
-# ---------- KG2 Recon Bot • PostgreSQL Version ----------
+# ---------- KG2 Recon Bot • FULL FINAL BUILD (PostgreSQL) ----------
 # Spy Capture + Embed Display • Spy History • Spy ID Lookup
-# Calc (HC fixed @ 7 AP + AP→HC estimates)
+# Calc (HC fixed @ 7 AP + explicit remaining % + Remaining DP shown)
 # AP Planner w/ Buttons + Reset • AP Status • Session Locking • Error Logging
-# Startup message to kg2recon-updates
+# Startup announces to #kg2recon-updates
+# Startup self-heals ID sequences (prevents duplicate key errors forever)
 
 import os, re, asyncio, difflib, hashlib, logging
 from math import ceil
@@ -18,58 +19,30 @@ from psycopg2.extras import RealDictCursor
 # ---------- Setup ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+ERROR_CHANNEL_NAME = "kg2recon-updates"
+
+# Prefer Render env var if you add it; otherwise fallback to your external host details
 DB_HOST = os.getenv("DB_HOST", "dpg-d54eklm3jp1c73970rdg-a.oregon-postgres.render.com")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "kg2bot_db")
 DB_USER = os.getenv("DB_USER", "kg2bot_db_user")
 DB_PASS = os.getenv("DB_PASS", "tH4jvQNiIAvE8jmIVbVCMxsFnG1hvccA")
-ERROR_CHANNEL_NAME = "kg2recon-updates"
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------- Database ----------
-def get_conn():
-    for _ in range(5):
-        try:
-            return psycopg2.connect(
-                host=DB_HOST,
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASS,
-                cursor_factory=RealDictCursor,
-                sslmode="require"
-            )
-        except Exception as e:
-            logging.error(f"DB connection failed, retrying... {e}")
-            asyncio.sleep(1)
-    raise ConnectionError("Could not connect to database.")
+# ---------- Constants ----------
+HEAVY_CAVALRY_AP = 7  # ✅ KG2: 1 HC = 7 AP
 
-conn = get_conn()
-conn.autocommit = True
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS spy_reports (
-    id SERIAL PRIMARY KEY,
-    kingdom TEXT,
-    alliance TEXT,
-    defense_power INTEGER,
-    castles INTEGER,
-    created_at TIMESTAMP,
-    raw TEXT,
-    report_hash TEXT UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS dp_sessions (
-    id SERIAL PRIMARY KEY,
-    kingdom TEXT,
-    base_dp INTEGER,
-    castles INTEGER,
-    current_dp INTEGER,
-    hits INTEGER,
-    last_hit TEXT,
-    captured_at TIMESTAMP
-);
-""")
+# Explicit KG2 reductions (your desired labeling)
+# Note: You asked for "-19%" on Minor, so we use 0.19.
+# Overwhelming uses 0.875 (87.5%) in KG2.
+AP_REDUCTIONS = [
+    ("Minor Victory", 0.19),
+    ("Victory", 0.35),
+    ("Major Victory", 0.55),
+    ("Overwhelming Victory", 0.875),
+]
 
 # ---------- Discord ----------
 intents = discord.Intents.default()
@@ -79,129 +52,176 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ---------- Global Locks ----------
 ap_lock = asyncio.Lock()
 
-# ---------- Constants ----------
-HEAVY_CAVALRY_AP = 7  # ✅ Correct KG2 value
+# ---------- DB ----------
+def db_connect():
+    # New connection per operation is OK for Render; keep it simple/reliable
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        cursor_factory=RealDictCursor,
+        sslmode="require",
+    )
 
-AP_MULTIPLIERS = {
-    "minor": 0.19,         # −19%
-    "victory": 0.35,       # −35%
-    "major": 0.55,         # −55%
-    "overwhelming": 0.87   # −87%
-}
+def init_db():
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS spy_reports (
+            id SERIAL PRIMARY KEY,
+            kingdom TEXT,
+            defense_power INTEGER,
+            castles INTEGER,
+            created_at TIMESTAMPTZ,
+            raw TEXT,
+            report_hash TEXT UNIQUE
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS dp_sessions (
+            id SERIAL PRIMARY KEY,
+            kingdom TEXT,
+            base_dp INTEGER,
+            castles INTEGER,
+            current_dp INTEGER,
+            hits INTEGER,
+            last_hit TEXT,
+            captured_at TIMESTAMPTZ
+        );
+        """)
 
-# ---------- Helpers ----------
-def castle_bonus(c):
-    return (c ** 0.5) / 100 if c else 0
+        # Safe “self-heal” for older schemas (won’t error if already present)
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS defense_power INTEGER;")
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS castles INTEGER;")
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS raw TEXT;")
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS report_hash TEXT;")
 
-def hash_report(text):
+        # Ensure unique constraint exists (best effort)
+        try:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS spy_reports_report_hash_uq ON spy_reports(report_hash);")
+        except Exception:
+            pass
+
+def heal_sequences():
+    """
+    Startup self-heal for SERIAL sequences.
+    Fixes: duplicate key value violates unique constraint spy_reports_pkey / dp_sessions_pkey
+    """
+    with db_connect() as conn, conn.cursor() as cur:
+        # Spy reports sequence
+        cur.execute("""
+            SELECT setval(
+              pg_get_serial_sequence('spy_reports','id'),
+              COALESCE((SELECT MAX(id) FROM spy_reports), 1),
+              true
+            );
+        """)
+        # DP sessions sequence
+        cur.execute("""
+            SELECT setval(
+              pg_get_serial_sequence('dp_sessions','id'),
+              COALESCE((SELECT MAX(id) FROM dp_sessions), 1),
+              true
+            );
+        """)
+
+def castle_bonus(c: int) -> float:
+    return (c ** 0.5) / 100 if c else 0.0
+
+def hash_report(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
-def parse_spy(text):
+def parse_spy(text: str):
     kingdom, dp, castles = None, None, 0
     for line in text.splitlines():
-        if line.lower().startswith("target:"):
+        ll = line.lower().strip()
+        if ll.startswith("target:"):
             kingdom = line.split(":", 1)[1].strip()
-        if "defensive power" in line.lower() or "approximate defensive power" in line.lower():
+        if "approximate defensive power" in ll or "defensive power" in ll:
             m = re.search(r"\d+", line.replace(",", ""))
             if m:
                 dp = int(m.group())
-        if "number of castles" in line.lower():
+        if "number of castles" in ll:
             m = re.search(r"\d+", line)
             if m:
                 castles = int(m.group())
     return kingdom, dp, castles
 
-def fuzzy_kingdom(query):
-    cur.execute("SELECT DISTINCT kingdom FROM spy_reports")
-    names = [r['kingdom'] for r in cur.fetchall()]
+def fuzzy_kingdom(query: str):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT kingdom FROM spy_reports WHERE kingdom IS NOT NULL;")
+        names = [r["kingdom"] for r in cur.fetchall() if r.get("kingdom")]
     match = difflib.get_close_matches(query, names, 1, 0.5)
     return match[0] if match else None
 
-def ensure_ap_session(kingdom):
-    cur.execute(
-        "SELECT 1 FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1",
-        (kingdom,)
-    )
-    if cur.fetchone():
+def ensure_ap_session(kingdom: str) -> bool:
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;",
+            (kingdom,)
+        )
+        if cur.fetchone():
+            return True
+
+        cur.execute(
+            "SELECT defense_power, castles, created_at FROM spy_reports WHERE kingdom=%s ORDER BY created_at DESC LIMIT 1;",
+            (kingdom,)
+        )
+        spy = cur.fetchone()
+        if not spy:
+            return False
+
+        dp = spy["defense_power"] or 0
+        castles = spy["castles"] or 0
+        ts = spy["created_at"] or datetime.now(timezone.utc)
+
+        # IMPORTANT: omit id; Postgres will assign it
+        cur.execute(
+            """
+            INSERT INTO dp_sessions (kingdom, base_dp, castles, current_dp, hits, last_hit, captured_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s);
+            """,
+            (kingdom, dp, castles, dp, 0, None, ts)
+        )
         return True
 
-    cur.execute(
-        "SELECT defense_power, castles, created_at FROM spy_reports WHERE kingdom=%s ORDER BY created_at DESC LIMIT 1",
-        (kingdom,)
-    )
-    spy = cur.fetchone()
-    if not spy:
-        return False
-    dp, castles, ts = spy['defense_power'], spy['castles'], spy['created_at']
-    cur.execute(
-        "INSERT INTO dp_sessions (kingdom, base_dp, castles, current_dp, hits, last_hit, captured_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-        (kingdom, dp, castles, dp, 0, None, ts)
-    )
-    return True
-
-# ---------- Startup ----------
-@bot.event
-async def on_ready():
-    logging.info(f"KG2 Recon Bot logged in as {bot.user}")
-    for guild in bot.guilds:
-        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
-        if ch:
-            await ch.send(f"✅ KG2 Recon Bot started up at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# ---------- Auto Capture ----------
-@bot.event
-async def on_message(msg):
-    if msg.author.bot or not msg.guild:
-        return
-    try:
-        kingdom, dp, castles = parse_spy(msg.content)
-        if not kingdom or not dp or dp < 1000:
-            await bot.process_commands(msg)
-            return
-
-        h = hash_report(msg.content)
-        cur.execute("SELECT 1 FROM spy_reports WHERE report_hash=%s", (h,))
-        if not cur.fetchone():
-            ts = datetime.now(timezone.utc)
-            cur.execute(
-                "INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, report_hash) VALUES (%s,%s,%s,%s,%s,%s)",
-                (kingdom, dp, castles, ts, msg.content, h)
-            )
-            ensure_ap_session(kingdom)
-
-            cur.execute("SELECT id, kingdom, defense_power, castles, created_at FROM spy_reports WHERE report_hash=%s", (h,))
-            row = cur.fetchone()
-            await msg.channel.send(embed=build_spy_embed(row))
-
-    except Exception as e:
-        await send_error(msg.guild, str(e))
-    await bot.process_commands(msg)
-
-# ---------- Embeds ----------
 def build_spy_embed(row):
-    adjusted = ceil(row['defense_power'] * (1 + castle_bonus(row['castles'])))
+    sid = row["id"]
+    kingdom = row["kingdom"]
+    dp = row["defense_power"] or 0
+    castles = row["castles"] or 0
+    ts = row["created_at"]
+
+    adjusted = ceil(dp * (1 + castle_bonus(castles)))
     embed = discord.Embed(title="🕵️ Spy Report", color=0x5865F2)
-    embed.add_field(name="Kingdom", value=row['kingdom'], inline=False)
-    embed.add_field(name="Base DP", value=f"{row['defense_power']:,}", inline=True)
+    embed.add_field(name="Kingdom", value=kingdom or "Unknown", inline=False)
+    embed.add_field(name="Base DP", value=f"{dp:,}", inline=True)
     embed.add_field(name="Adjusted DP", value=f"{adjusted:,}", inline=True)
-    embed.add_field(name="Castles", value=row['castles'], inline=True)
-    embed.set_footer(text=f"ID {row['id']} • Captured {row['created_at']}")
+    embed.add_field(name="Castles", value=str(castles), inline=True)
+    embed.set_footer(text=f"ID {sid} • Captured {ts}")
     return embed
 
-def build_ap_embed(kingdom):
-    cur.execute("SELECT base_dp, current_dp, hits, last_hit FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1", (kingdom,))
-    row = cur.fetchone()
+def build_ap_embed(kingdom: str):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT base_dp, current_dp, hits, last_hit FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;",
+            (kingdom,)
+        )
+        row = cur.fetchone()
     if not row:
         return None
+
     embed = discord.Embed(title=f"⚔️ AP Planner • {kingdom}", color=0xE74C3C)
     embed.add_field(name="Base DP", value=f"{row['base_dp']:,}")
     embed.add_field(name="Current DP", value=f"{row['current_dp']:,}")
-    embed.add_field(name="Hits Applied", value=row['hits'])
-    if row['last_hit']:
+    embed.add_field(name="Hits Applied", value=str(row["hits"]))
+    if row.get("last_hit"):
         embed.set_footer(text=f"Last hit by {row['last_hit']}")
     return embed
 
-async def send_error(guild, msg):
+async def send_error(guild, msg: str):
     try:
         ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
         if ch:
@@ -209,12 +229,108 @@ async def send_error(guild, msg):
     except:
         pass
 
-# ---------- Commands ----------
+# ---------- Startup ----------
+@bot.event
+async def on_ready():
+    init_db()
+    heal_sequences()  # ✅ PATCH: auto-fix sequences every startup
+    logging.info(f"KG2 Recon Bot logged in as {bot.user}")
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        if ch:
+            await ch.send(
+                f"✅ KG2 Recon Bot started up • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • DB sequences healed"
+            )
+
+# ---------- Auto Capture ----------
+@bot.event
+async def on_message(msg):
+    if msg.author.bot or not msg.guild:
+        return
+
+    try:
+        kingdom, dp, castles = parse_spy(msg.content)
+
+        # Safety guard: avoid false positives & junk
+        if not kingdom or not dp or dp < 1000:
+            await bot.process_commands(msg)
+            return
+
+        h = hash_report(msg.content)
+        ts = datetime.now(timezone.utc)
+
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
+            existing = cur.fetchone()
+
+            if not existing:
+                # IMPORTANT: omit id; Postgres assigns it
+                cur.execute(
+                    """
+                    INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, report_hash)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    RETURNING id, kingdom, defense_power, castles, created_at;
+                    """,
+                    (kingdom, dp, castles, ts, msg.content, h)
+                )
+                row = cur.fetchone()
+                ensure_ap_session(kingdom)
+                await msg.channel.send(embed=build_spy_embed(row))
+
+    except Exception as e:
+        await send_error(msg.guild, str(e))
+
+    await bot.process_commands(msg)
+
+# ---------- Spy Commands ----------
+@bot.command()
+async def spy(ctx, *, kingdom: str):
+    real = fuzzy_kingdom(kingdom) or kingdom
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, kingdom, defense_power, castles, created_at FROM spy_reports WHERE kingdom=%s ORDER BY created_at DESC LIMIT 1;",
+            (real,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return await ctx.send("❌ No spy report found.")
+    await ctx.send(embed=build_spy_embed(row))
+
+@bot.command()
+async def spyid(ctx, sid: int):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, kingdom, defense_power, castles, created_at FROM spy_reports WHERE id=%s;",
+            (sid,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return await ctx.send("❌ Invalid spy report ID.")
+    await ctx.send(embed=build_spy_embed(row))
+
+@bot.command()
+async def spyhistory(ctx, *, kingdom: str):
+    real = fuzzy_kingdom(kingdom) or kingdom
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, defense_power, created_at FROM spy_reports WHERE kingdom=%s ORDER BY created_at DESC LIMIT 5;",
+            (real,)
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return await ctx.send("❌ No spy history found.")
+
+    out = [f"🗂 **Spy History — {real}**"]
+    for r in rows:
+        out.append(f"ID `{r['id']}` • DP `{r['defense_power']:,}` • {r['created_at']}")
+    await ctx.send("\n".join(out))
+
+# ---------- Calc (Correct Output) ----------
 @bot.command()
 async def calc(ctx):
     await ctx.send("📄 Paste spy report:")
     try:
-        msg = await bot.wait_for("message", timeout=300, check=lambda m: m.author == ctx.author)
+        msg = await bot.wait_for("message", timeout=300, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
     except asyncio.TimeoutError:
         return await ctx.send("⏰ Timed out.")
 
@@ -223,62 +339,92 @@ async def calc(ctx):
         return await ctx.send("❌ Could not parse spy report.")
 
     adjusted_dp = ceil(dp * (1 + castle_bonus(castles)))
-    hc_needed_no_ap = ceil(adjusted_dp / HEAVY_CAVALRY_AP)
+    hc_no_ap = ceil(adjusted_dp / HEAVY_CAVALRY_AP)
 
     embed = discord.Embed(title="⚔️ Combat Calculator (KG2)", color=0x5865F2)
     embed.add_field(name="Target", value=kingdom, inline=False)
-    embed.add_field(name="Base DP", value=f"{dp:,}")
-    embed.add_field(name="Adjusted DP", value=f"{adjusted_dp:,}")
-    embed.add_field(name="HC Needed (No AP)", value=f"{hc_needed_no_ap:,} HC", inline=False)
+    embed.add_field(name="Base DP", value=f"{dp:,}", inline=True)
+    embed.add_field(name="Adjusted DP", value=f"{adjusted_dp:,}", inline=True)
 
-    remaining = adjusted_dp
-    for label, pct in AP_MULTIPLIERS.items():
-        remaining_dp = ceil(remaining * (1 - pct))
-        hc_required = ceil(remaining_dp / HEAVY_CAVALRY_AP)
-        embed.add_field(name=f"After {label.title()} Victory (−{int(pct*100)}%)",
-                        value=f"Remaining DP: {remaining_dp:,}\nHC Required: {hc_required:,}",
-                        inline=False)
-        remaining = remaining_dp
+    embed.add_field(name="HC Needed (No AP)", value=f"{hc_no_ap:,} HC", inline=False)
 
-    embed.set_footer(text="HC = 7 AP | Explicit KG2 remaining % math")
+    # One-hit estimates (not chained) — matches your desired output
+    for label, reduction in AP_REDUCTIONS:
+        remaining_dp = ceil(adjusted_dp * (1 - reduction))
+        hc_req = ceil(remaining_dp / HEAVY_CAVALRY_AP)
+        embed.add_field(
+            name=f"After {label} (−{int(reduction*100)}%)",
+            value=f"Remaining DP: {remaining_dp:,}\nHC Required: {hc_req:,}",
+            inline=False
+        )
+
+    embed.set_footer(text=f"HC = {HEAVY_CAVALRY_AP} AP | Explicit KG2 remaining % math")
     await ctx.send(embed=embed)
 
-# ---------- AP Planner ----------
+# ---------- AP Planner (Buttons + Reset) ----------
 class APView(View):
-    def __init__(self, kingdom):
+    def __init__(self, kingdom: str):
         super().__init__(timeout=None)
         self.kingdom = kingdom
-        for k in AP_MULTIPLIERS:
-            self.add_item(APButton(k, kingdom))
+        self.add_item(APButton("minor", kingdom))
+        self.add_item(APButton("victory", kingdom))
+        self.add_item(APButton("major", kingdom))
+        self.add_item(APButton("overwhelming", kingdom))
         self.add_item(APResetButton(kingdom))
 
 class APButton(Button):
-    def __init__(self, label, kingdom):
-        super().__init__(label=label.title(), style=discord.ButtonStyle.danger)
-        self.key = label
+    def __init__(self, key: str, kingdom: str):
+        super().__init__(label=key.title(), style=discord.ButtonStyle.danger)
+        self.key = key
         self.kingdom = kingdom
 
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
         async with ap_lock:
-            cur.execute("SELECT id, current_dp FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1", (self.kingdom,))
-            row = cur.fetchone()
-            reduction = int(row['current_dp'] * AP_MULTIPLIERS[self.key])
-            new_dp = max(0, row['current_dp'] - reduction)
-            cur.execute("UPDATE dp_sessions SET current_dp=%s, hits=hits+1, last_hit=%s WHERE id=%s",
-                        (new_dp, interaction.user.display_name, row['id']))
+            reduction = dict(minor=0.19, victory=0.35, major=0.55, overwhelming=0.875)[self.key]
+
+            with db_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, current_dp FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;",
+                    (self.kingdom,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return await interaction.response.send_message("❌ No active AP session.", ephemeral=True)
+
+                sid = row["id"]
+                dp = row["current_dp"]
+
+                reduce_amt = ceil(dp * reduction)
+                new_dp = max(0, dp - reduce_amt)
+
+                cur.execute(
+                    "UPDATE dp_sessions SET current_dp=%s, hits=hits+1, last_hit=%s WHERE id=%s;",
+                    (new_dp, interaction.user.display_name, sid)
+                )
+
         await interaction.response.edit_message(embed=build_ap_embed(self.kingdom), view=self.view)
 
 class APResetButton(Button):
-    def __init__(self, kingdom):
+    def __init__(self, kingdom: str):
         super().__init__(label="Reset", style=discord.ButtonStyle.secondary)
         self.kingdom = kingdom
 
-    async def callback(self, interaction):
+    async def callback(self, interaction: discord.Interaction):
         async with ap_lock:
-            cur.execute("SELECT id, base_dp FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1", (self.kingdom,))
-            row = cur.fetchone()
-            cur.execute("UPDATE dp_sessions SET current_dp=%s, hits=0, last_hit=NULL WHERE id=%s",
-                        (row['base_dp'], row['id']))
+            with db_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, base_dp FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;",
+                    (self.kingdom,)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return await interaction.response.send_message("❌ No active AP session.", ephemeral=True)
+
+                cur.execute(
+                    "UPDATE dp_sessions SET current_dp=%s, hits=0, last_hit=NULL WHERE id=%s;",
+                    (row["base_dp"], row["id"])
+                )
+
         await interaction.response.edit_message(embed=build_ap_embed(self.kingdom), view=self.view)
 
 @bot.command()
