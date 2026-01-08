@@ -5,11 +5,25 @@
 # Startup announces to #kg2recon-updates
 # Startup self-heals ID sequences
 # Tech indexing + pull from saved spy reports
-# Commands: !spy !spyid !spyhistory !calc !ap !apstatus !techindex !tech !techtop !techpull
+# Storage upgrade: compress raw spy report into BYTEA (raw_gz) to store many more reports
+# Backfill: scan every readable channel history and import old spy reports into DB
+#
+# Commands:
+#   !spy <kingdom>
+#   !spyid <id>
+#   !spyhistory <kingdom>
+#   !calc
+#   !ap <kingdom>
+#   !apstatus <kingdom>
+#   !techindex
+#   !tech <kingdom>
+#   !techtop
+#   !techpull <kingdom>
+#   !backfill [days]   (ADMIN ONLY)
 
-import os, re, asyncio, difflib, hashlib, logging
+import os, re, asyncio, difflib, hashlib, logging, gzip
 from math import ceil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord.ext import commands
@@ -30,13 +44,13 @@ if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
 
 # ---------- DB config ----------
-# Prefer URL env vars if you set them later; otherwise fallback to your Render DB (internal host).
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("INTERNAL_DATABASE_URL")
     or os.getenv("EXTERNAL_DATABASE_URL")
 )
 
+# Fallback to your Render DB (internal host)
 FALLBACK_DB = {
     "host": os.getenv("DB_HOST", "dpg-d54eklm3jp1c73970rdg-a"),
     "port": int(os.getenv("DB_PORT", "5432")),
@@ -44,6 +58,9 @@ FALLBACK_DB = {
     "user": os.getenv("DB_USER", "kg2bot_db_user"),
     "password": os.getenv("DB_PASS", "tH4jvQNiIAvE8jmIVbVCMxsFnG1hvccA"),
 }
+
+# If you ever want to ALSO store plaintext raw again, set KEEP_RAW_TEXT=true in Render env vars
+KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
 
 # ---------- Constants ----------
 HEAVY_CAVALRY_AP = 7  # KG2: 1 HC = 7 AP
@@ -99,6 +116,7 @@ def init_db():
             castles INTEGER,
             created_at TIMESTAMPTZ,
             raw TEXT,
+            raw_gz BYTEA,
             report_hash TEXT UNIQUE
         );
         """)
@@ -132,6 +150,7 @@ def init_db():
         cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS castles INTEGER;")
         cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS raw TEXT;")
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS raw_gz BYTEA;")
         cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS report_hash TEXT;")
         try:
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS spy_reports_report_hash_uq ON spy_reports(report_hash);")
@@ -160,7 +179,7 @@ def castle_bonus(c: int) -> float:
     return (c ** 0.5) / 100 if c else 0.0
 
 def hash_report(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def parse_spy(text: str):
     kingdom, dp, castles = None, None, 0
@@ -189,8 +208,23 @@ def is_battle_related_tech(name: str) -> bool:
     n = name.lower()
     return any(k in n for k in BATTLE_TECH_KEYWORDS)
 
+def compress_report(text: str) -> bytes:
+    return gzip.compress(text.encode("utf-8"), compresslevel=9)
+
+def decompress_report(blob: bytes) -> str:
+    return gzip.decompress(blob).decode("utf-8", errors="replace")
+
+def get_raw_text(row) -> str:
+    if row is None:
+        return ""
+    if row.get("raw_gz"):
+        try:
+            return decompress_report(row["raw_gz"])
+        except Exception:
+            pass
+    return row.get("raw") or ""
+
 def extract_tech_from_raw(raw: str):
-    """Extract lines like 'Better Training Methods lvl 6' from the tech section."""
     if not raw:
         return []
     lines = raw.splitlines()
@@ -321,6 +355,9 @@ async def on_message(msg):
         h = hash_report(msg.content)
         ts = datetime.now(timezone.utc)
 
+        raw_gz = psycopg2.Binary(compress_report(msg.content))
+        raw_text = msg.content if KEEP_RAW_TEXT else None
+
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
             if cur.fetchone():
@@ -328,10 +365,10 @@ async def on_message(msg):
                 return
 
             cur.execute("""
-                INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, report_hash)
-                VALUES (%s,%s,%s,%s,%s,%s)
+                INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, raw_gz, report_hash)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id, kingdom, defense_power, castles, created_at;
-            """, (kingdom, dp, castles, ts, msg.content, h))
+            """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
             row = cur.fetchone()
 
         ensure_ap_session(kingdom)
@@ -390,7 +427,11 @@ async def spyhistory(ctx, *, kingdom: str):
 async def calc(ctx):
     await ctx.send("📄 Paste spy report:")
     try:
-        msg = await bot.wait_for("message", timeout=300, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+        msg = await bot.wait_for(
+            "message",
+            timeout=300,
+            check=lambda m: m.author == ctx.author and m.channel == ctx.channel
+        )
     except asyncio.TimeoutError:
         return await ctx.send("⏰ Timed out.")
 
@@ -439,7 +480,6 @@ class APButton(Button):
     async def callback(self, interaction: discord.Interaction):
         async with ap_lock:
             reduction = dict(minor=0.19, victory=0.35, major=0.55, overwhelming=0.875)[self.key]
-
             with db_connect() as conn, conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, current_dp FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;",
@@ -510,16 +550,17 @@ async def techindex(ctx, *junk):
         upserts = 0
 
         with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, kingdom, created_at, raw FROM spy_reports WHERE raw IS NOT NULL ORDER BY created_at DESC;")
+            cur.execute("SELECT id, kingdom, created_at, raw, raw_gz FROM spy_reports ORDER BY created_at DESC;")
             reports = cur.fetchall()
 
             for r in reports:
                 scanned += 1
-                kingdom = r["kingdom"]
+                kingdom = r.get("kingdom")
                 if not kingdom:
                     continue
 
-                techs = extract_tech_from_raw(r["raw"])
+                raw_text = get_raw_text(r)
+                techs = extract_tech_from_raw(raw_text)
                 if not techs:
                     continue
 
@@ -595,20 +636,13 @@ async def techtop(ctx):
 
 @bot.command()
 async def techpull(ctx, *, kingdom: str):
-    """
-    Pull tech directly from ALL saved spy reports for a kingdom.
-    Dedupes by tech name:
-      - highest level wins
-      - if same level, newest report wins
-    Read-only (does not write to player_tech).
-    """
     real = fuzzy_kingdom(kingdom) or kingdom
 
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT id, created_at, raw
+            SELECT id, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE kingdom=%s AND raw IS NOT NULL
+            WHERE kingdom=%s
             ORDER BY created_at DESC;
         """, (real,))
         reports = cur.fetchall()
@@ -616,13 +650,14 @@ async def techpull(ctx, *, kingdom: str):
     if not reports:
         return await ctx.send(f"❌ No saved spy reports found for **{real}**.")
 
-    tech_map = {}  # name -> {"lvl": int, "seen": ts, "rid": id}
+    tech_map = {}
     scanned = 0
     seen_lines = 0
 
     for r in reports:
         scanned += 1
-        techs = extract_tech_from_raw(r["raw"])
+        raw_text = get_raw_text(r)
+        techs = extract_tech_from_raw(raw_text)
         if not techs:
             continue
 
@@ -658,6 +693,99 @@ async def techpull(ctx, *, kingdom: str):
         embed.set_footer(text=f"Showing 25 of {len(items)} (I can add paging if you want)")
 
     await ctx.send(embed=embed)
+
+# ---------- Backfill (import old spy reports from all channels) ----------
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def backfill(ctx, days: int = 30):
+    """
+    Backfill spy reports from ALL channels the bot can read.
+    Default: last 30 days.
+    Usage: !backfill 30
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    status_ch = discord.utils.get(ctx.guild.text_channels, name=ERROR_CHANNEL_NAME)
+
+    async def post_status(text: str):
+        try:
+            if status_ch:
+                await status_ch.send(text)
+            else:
+                await ctx.send(text)
+        except:
+            pass
+
+    await post_status(f"⏳ Backfill starting… scanning messages from last **{days}** days (since {cutoff.isoformat()}).")
+
+    channels_scanned = 0
+    msgs_scanned = 0
+    spy_found = 0
+    inserted = 0
+    dupes = 0
+    errors = 0
+
+    for ch in ctx.guild.text_channels:
+        perms = ch.permissions_for(ctx.guild.me)
+        if not perms.view_channel or not perms.read_message_history:
+            continue
+
+        channels_scanned += 1
+        await asyncio.sleep(0.25)
+
+        try:
+            async for m in ch.history(limit=None, after=cutoff, oldest_first=True):
+                msgs_scanned += 1
+                if m.author.bot:
+                    continue
+
+                kingdom, dp, castles = parse_spy(m.content)
+                if not kingdom or not dp or dp < 1000:
+                    continue
+
+                spy_found += 1
+                h = hash_report(m.content)
+                ts = m.created_at.replace(tzinfo=timezone.utc) if m.created_at else datetime.now(timezone.utc)
+
+                raw_gz = psycopg2.Binary(compress_report(m.content))
+                raw_text = m.content if KEEP_RAW_TEXT else None
+
+                try:
+                    with db_connect() as conn, conn.cursor() as cur:
+                        cur.execute("SELECT 1 FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
+                        if cur.fetchone():
+                            dupes += 1
+                            continue
+
+                        cur.execute("""
+                            INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, raw_gz, report_hash)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s);
+                        """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
+                        inserted += 1
+                except Exception:
+                    errors += 1
+
+                if msgs_scanned % 200 == 0:
+                    await asyncio.sleep(1.0)
+
+        except Exception as e:
+            errors += 1
+            await send_error(ctx.guild, f"backfill channel {ch.name}: {e}")
+
+    try:
+        heal_sequences()
+    except Exception:
+        pass
+
+    await post_status(
+        "✅ Backfill complete.\n"
+        f"Channels scanned: **{channels_scanned}**\n"
+        f"Messages scanned: **{msgs_scanned:,}**\n"
+        f"Spy reports detected: **{spy_found:,}**\n"
+        f"Inserted: **{inserted:,}**\n"
+        f"Duplicates skipped: **{dupes:,}**\n"
+        f"Errors: **{errors:,}**"
+    )
 
 # ---------- Run ----------
 bot.run(TOKEN)
