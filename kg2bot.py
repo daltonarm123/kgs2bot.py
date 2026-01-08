@@ -7,19 +7,7 @@
 # Tech indexing + pull from saved spy reports
 # Storage upgrade: compress raw spy report into BYTEA (raw_gz)
 # Backfill: scan every readable channel history and import old spy reports
-#
-# Commands:
-#   !spy <kingdom>
-#   !spyid <id>
-#   !spyhistory <kingdom>
-#   !calc
-#   !ap <kingdom>
-#   !apstatus <kingdom>
-#   !techindex
-#   !tech <kingdom>
-#   !techtop
-#   !techpull <kingdom>
-#   !backfill [days]   (Admin/Owner only)
+# Export: !techallcsv (clean spreadsheet import)
 
 import os, re, asyncio, difflib, hashlib, logging, gzip
 from math import ceil
@@ -722,6 +710,37 @@ async def techpull(ctx, *, kingdom: str):
         embed.set_footer(text=f"Showing 25 of {len(items)}")
     await ctx.send(embed=embed)
 
+# ---------- Export: techallcsv ----------
+@bot.command()
+async def techallcsv(ctx):
+    """
+    Uploads a CSV of ALL indexed battle-related tech for ALL kingdoms.
+    Cleanest spreadsheet import.
+    """
+    import io, csv
+
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT kingdom, tech_name, tech_level, last_seen
+            FROM player_tech
+            ORDER BY kingdom ASC, tech_name ASC;
+        """)
+        rows = cur.fetchall()
+
+    if not rows:
+        return await ctx.send("❌ No tech indexed yet. Run `!techindex` first.")
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Kingdom", "Tech", "Level", "Last Seen"])
+    for r in rows:
+        d = r["last_seen"].strftime("%Y-%m-%d %H:%M:%S") if r.get("last_seen") else ""
+        w.writerow([r["kingdom"], r["tech_name"], r["tech_level"], d])
+
+    data = buf.getvalue().encode("utf-8")
+    file = discord.File(fp=io.BytesIO(data), filename="kg2_battle_tech_all.csv")
+    await ctx.send("✅ Here’s the CSV export:", file=file)
+
 # ---------- Backfill ----------
 @bot.command()
 @commands.check(is_admin_or_owner)
@@ -730,6 +749,7 @@ async def backfill(ctx, days: int = 30):
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
         status_ch = discord.utils.get(ctx.guild.text_channels, name=ERROR_CHANNEL_NAME)
+
         async def post_status(text: str):
             try:
                 if status_ch:
