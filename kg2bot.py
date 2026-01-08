@@ -4,8 +4,8 @@
 # AP Planner w/ Buttons + Reset • AP Status • Session Locking • Error Logging
 # Startup announces to #kg2recon-updates
 # Startup self-heals ID sequences
-# NEW: Tech indexing from saved spy report "technology information" section
-#      !techindex / !tech <kingdom> / !techtop
+# Tech indexing + pull from saved spy reports
+# Commands: !spy !spyid !spyhistory !calc !ap !apstatus !techindex !tech !techtop !techpull
 
 import os, re, asyncio, difflib, hashlib, logging
 from math import ceil
@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 from discord.ui import View, Button
 from dotenv import load_dotenv
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -23,23 +24,30 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ERROR_CHANNEL_NAME = "kg2recon-updates"
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
-
 logging.basicConfig(level=logging.INFO)
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
-if not all([DB_HOST, DB_NAME, DB_USER, DB_PASS]):
-    raise RuntimeError("Missing one or more DB env vars: DB_HOST, DB_NAME, DB_USER, DB_PASS")
+
+# ---------- DB config ----------
+# Prefer URL env vars if you set them later; otherwise fallback to your Render DB (internal host).
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("INTERNAL_DATABASE_URL")
+    or os.getenv("EXTERNAL_DATABASE_URL")
+)
+
+FALLBACK_DB = {
+    "host": os.getenv("DB_HOST", "dpg-d54eklm3jp1c73970rdg-a"),
+    "port": int(os.getenv("DB_PORT", "5432")),
+    "dbname": os.getenv("DB_NAME", "kg2bot_db"),
+    "user": os.getenv("DB_USER", "kg2bot_db_user"),
+    "password": os.getenv("DB_PASS", "tH4jvQNiIAvE8jmIVbVCMxsFnG1hvccA"),
+}
 
 # ---------- Constants ----------
 HEAVY_CAVALRY_AP = 7  # KG2: 1 HC = 7 AP
 
-# One-hit estimates (not chained), as you requested
 AP_REDUCTIONS = [
     ("Minor Victory", 0.19),
     ("Victory", 0.35),
@@ -47,7 +55,6 @@ AP_REDUCTIONS = [
     ("Overwhelming Victory", 0.875),
 ]
 
-# Battle-related tech filter: tweak anytime
 BATTLE_TECH_KEYWORDS = [
     "training", "leadership", "battle", "attack", "defense", "defensive", "offense", "offensive",
     "troop", "army", "cavalry", "archer", "pikemen", "knight", "siege",
@@ -59,18 +66,25 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- Global Locks ----------
+# ---------- Locks ----------
 ap_lock = asyncio.Lock()
 tech_index_lock = asyncio.Lock()
 
 # ---------- DB ----------
 def db_connect():
+    """Connect using DATABASE_URL if available, else fallback. Render Postgres generally requires SSL."""
+    if DATABASE_URL:
+        return psycopg2.connect(
+            DATABASE_URL,
+            cursor_factory=RealDictCursor,
+            sslmode="require",
+        )
     return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
+        host=FALLBACK_DB["host"],
+        port=FALLBACK_DB["port"],
+        dbname=FALLBACK_DB["dbname"],
+        user=FALLBACK_DB["user"],
+        password=FALLBACK_DB["password"],
         cursor_factory=RealDictCursor,
         sslmode="require",
     )
@@ -100,7 +114,6 @@ def init_db():
             captured_at TIMESTAMPTZ
         );
         """)
-        # Indexed tech table (normalized)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS player_tech (
             kingdom TEXT NOT NULL,
@@ -177,16 +190,9 @@ def is_battle_related_tech(name: str) -> bool:
     return any(k in n for k in BATTLE_TECH_KEYWORDS)
 
 def extract_tech_from_raw(raw: str):
-    """
-    Finds section:
-      The following technology information was also discovered:
-    and parses lines like:
-      Better Training Methods lvl 6
-    Returns list of (tech_name, tech_level)
-    """
+    """Extract lines like 'Better Training Methods lvl 6' from the tech section."""
     if not raw:
         return []
-
     lines = raw.splitlines()
     start_idx = None
     for i, line in enumerate(lines):
@@ -201,7 +207,7 @@ def extract_tech_from_raw(raw: str):
         line = lines[j].strip()
         if not line:
             break
-        # Stop if we hit another “section”
+
         low = line.lower()
         if low.startswith("our spies also found") or low.startswith("the following ") or low.startswith("sender:") or low.startswith("recipient"):
             break
@@ -211,18 +217,11 @@ def extract_tech_from_raw(raw: str):
             name = m.group(1).strip()
             lvl = int(m.group(2))
             techs.append((name, lvl))
-        else:
-            # if a weird line shows up, ignore it
-            continue
-
     return techs
 
 def ensure_ap_session(kingdom: str) -> bool:
     with db_connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;",
-            (kingdom,)
-        )
+        cur.execute("SELECT 1 FROM dp_sessions WHERE kingdom=%s ORDER BY captured_at DESC LIMIT 1;", (kingdom,))
         if cur.fetchone():
             return True
 
@@ -238,13 +237,10 @@ def ensure_ap_session(kingdom: str) -> bool:
         castles = spy["castles"] or 0
         ts = spy["created_at"] or datetime.now(timezone.utc)
 
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO dp_sessions (kingdom, base_dp, castles, current_dp, hits, last_hit, captured_at)
             VALUES (%s,%s,%s,%s,%s,%s,%s);
-            """,
-            (kingdom, dp, castles, dp, 0, None, ts)
-        )
+        """, (kingdom, dp, castles, dp, 0, None, ts))
         return True
 
 def build_spy_embed(row):
@@ -283,12 +279,26 @@ async def send_error(guild, msg: str):
     except:
         pass
 
+# ---------- Command error logging ----------
+@bot.event
+async def on_command_error(ctx, error):
+    try:
+        await ctx.send(f"❌ Command error: `{type(error).__name__}` — {error}")
+    except:
+        pass
+    try:
+        if ctx.guild:
+            await send_error(ctx.guild, f"{ctx.command} by {ctx.author}: {type(error).__name__} — {error}")
+    except:
+        pass
+
 # ---------- Startup ----------
 @bot.event
 async def on_ready():
     init_db()
     heal_sequences()
     logging.info(f"KG2 Recon Bot logged in as {bot.user}")
+
     for guild in bot.guilds:
         ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
         if ch:
@@ -313,20 +323,19 @@ async def on_message(msg):
 
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
-            existing = cur.fetchone()
+            if cur.fetchone():
+                await bot.process_commands(msg)
+                return
 
-            if not existing:
-                cur.execute(
-                    """
-                    INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, report_hash)
-                    VALUES (%s,%s,%s,%s,%s,%s)
-                    RETURNING id, kingdom, defense_power, castles, created_at;
-                    """,
-                    (kingdom, dp, castles, ts, msg.content, h)
-                )
-                row = cur.fetchone()
-                ensure_ap_session(kingdom)
-                await msg.channel.send(embed=build_spy_embed(row))
+            cur.execute("""
+                INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, report_hash)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                RETURNING id, kingdom, defense_power, castles, created_at;
+            """, (kingdom, dp, castles, ts, msg.content, h))
+            row = cur.fetchone()
+
+        ensure_ap_session(kingdom)
+        await msg.channel.send(embed=build_spy_embed(row))
 
     except Exception as e:
         await send_error(msg.guild, str(e))
@@ -376,7 +385,7 @@ async def spyhistory(ctx, *, kingdom: str):
         out.append(f"ID `{r['id']}` • DP `{r['defense_power']:,}` • {r['created_at']}")
     await ctx.send("\n".join(out))
 
-# ---------- Calc (Correct Output) ----------
+# ---------- Calc ----------
 @bot.command()
 async def calc(ctx):
     await ctx.send("📄 Paste spy report:")
@@ -410,7 +419,7 @@ async def calc(ctx):
     embed.set_footer(text=f"HC = {HEAVY_CAVALRY_AP} AP | Explicit KG2 remaining % math")
     await ctx.send(embed=embed)
 
-# ---------- AP Planner (Buttons + Reset) ----------
+# ---------- AP Planner ----------
 class APView(View):
     def __init__(self, kingdom: str):
         super().__init__(timeout=None)
@@ -440,8 +449,9 @@ class APButton(Button):
                 if not row:
                     return await interaction.response.send_message("❌ No active AP session.", ephemeral=True)
 
-                reduce_amt = ceil((row["current_dp"] or 0) * reduction)
-                new_dp = max(0, (row["current_dp"] or 0) - reduce_amt)
+                dp = row["current_dp"] or 0
+                reduce_amt = ceil(dp * reduction)
+                new_dp = max(0, dp - reduce_amt)
 
                 cur.execute(
                     "UPDATE dp_sessions SET current_dp=%s, hits=hits+1, last_hit=%s WHERE id=%s;",
@@ -488,18 +498,15 @@ async def apstatus(ctx, *, kingdom: str):
         return await ctx.send("❌ No active AP session.")
     await ctx.send(embed=embed)
 
-# ---------- NEW: Tech Commands ----------
+# ---------- Tech Commands ----------
 @bot.command()
-async def techindex(ctx):
-    """
-    Scans all saved spy_reports.raw, extracts tech section, filters battle-related,
-    upserts into player_tech for fast lookup.
-    """
+async def techindex(ctx, *junk):
     async with tech_index_lock:
         await ctx.send("🔎 Scanning saved spy reports for battle-related trainings...")
 
-        scanned_reports = 0
-        extracted_lines = 0
+        scanned = 0
+        reports_with_section = 0
+        kept_lines = 0
         upserts = 0
 
         with db_connect() as conn, conn.cursor() as cur:
@@ -507,7 +514,7 @@ async def techindex(ctx):
             reports = cur.fetchall()
 
             for r in reports:
-                scanned_reports += 1
+                scanned += 1
                 kingdom = r["kingdom"]
                 if not kingdom:
                     continue
@@ -516,12 +523,13 @@ async def techindex(ctx):
                 if not techs:
                     continue
 
-                # Keep only battle-related tech lines
+                reports_with_section += 1
                 techs = [(name, lvl) for (name, lvl) in techs if is_battle_related_tech(name)]
                 if not techs:
                     continue
 
-                extracted_lines += len(techs)
+                kept_lines += len(techs)
+
                 for name, lvl in techs:
                     cur.execute("""
                         INSERT INTO player_tech (kingdom, tech_name, tech_level, last_seen, source_report_id)
@@ -535,13 +543,16 @@ async def techindex(ctx):
                     """, (kingdom, name, lvl, r["created_at"] or datetime.now(timezone.utc), r["id"]))
                     upserts += 1
 
-        await ctx.send(f"✅ Tech index updated.\nReports scanned: {scanned_reports:,}\nBattle-tech lines found: {extracted_lines:,}\nRows upserted: {upserts:,}")
+        await ctx.send(
+            "✅ Tech index updated.\n"
+            f"Reports scanned: {scanned:,}\n"
+            f"Reports w/ tech section: {reports_with_section:,}\n"
+            f"Battle-tech lines kept: {kept_lines:,}\n"
+            f"Rows upserted: {upserts:,}"
+        )
 
 @bot.command()
 async def tech(ctx, *, kingdom: str):
-    """
-    Shows battle-related training/tech we last saw for a player.
-    """
     real = fuzzy_kingdom(kingdom) or kingdom
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -553,21 +564,17 @@ async def tech(ctx, *, kingdom: str):
         rows = cur.fetchall()
 
     if not rows:
-        return await ctx.send(f"❌ No indexed battle-related tech for **{real}**.\nRun `!techindex` first (or spy them again).")
+        return await ctx.send(f"❌ No indexed battle-related tech for **{real}**.\nRun `!techindex` first (or use `!techpull {real}`).")
 
     embed = discord.Embed(title=f"📚 Battle Trainings • {real}", color=0x2ECC71)
-    # Discord embed field limits: keep it readable
     lines = [f"• {r['tech_name']} — lvl {r['tech_level']} (last: {r['last_seen']})" for r in rows[:25]]
     embed.description = "\n".join(lines)
     if len(rows) > 25:
-        embed.set_footer(text=f"Showing 25 of {len(rows)}. (Add pagination later if needed)")
+        embed.set_footer(text=f"Showing 25 of {len(rows)}")
     await ctx.send(embed=embed)
 
 @bot.command()
 async def techtop(ctx):
-    """
-    Shows the most common battle-related tech across all indexed players.
-    """
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT tech_name, COUNT(*) AS cnt
@@ -585,6 +592,72 @@ async def techtop(ctx):
     for r in rows:
         msg.append(f"• **{r['tech_name']}** — {r['cnt']}")
     await ctx.send("\n".join(msg))
+
+@bot.command()
+async def techpull(ctx, *, kingdom: str):
+    """
+    Pull tech directly from ALL saved spy reports for a kingdom.
+    Dedupes by tech name:
+      - highest level wins
+      - if same level, newest report wins
+    Read-only (does not write to player_tech).
+    """
+    real = fuzzy_kingdom(kingdom) or kingdom
+
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, created_at, raw
+            FROM spy_reports
+            WHERE kingdom=%s AND raw IS NOT NULL
+            ORDER BY created_at DESC;
+        """, (real,))
+        reports = cur.fetchall()
+
+    if not reports:
+        return await ctx.send(f"❌ No saved spy reports found for **{real}**.")
+
+    tech_map = {}  # name -> {"lvl": int, "seen": ts, "rid": id}
+    scanned = 0
+    seen_lines = 0
+
+    for r in reports:
+        scanned += 1
+        techs = extract_tech_from_raw(r["raw"])
+        if not techs:
+            continue
+
+        techs = [(name, lvl) for (name, lvl) in techs if is_battle_related_tech(name)]
+        if not techs:
+            continue
+
+        for name, lvl in techs:
+            seen_lines += 1
+            prev = tech_map.get(name)
+            seen_ts = r["created_at"] or datetime.now(timezone.utc)
+
+            if (prev is None) or (lvl > prev["lvl"]) or (lvl == prev["lvl"] and seen_ts > prev["seen"]):
+                tech_map[name] = {"lvl": lvl, "seen": seen_ts, "rid": r["id"]}
+
+    if not tech_map:
+        return await ctx.send(
+            f"❌ No battle-related tech found in saved reports for **{real}**.\n"
+            f"(Scanned {scanned} reports — tech section may be missing.)"
+        )
+
+    items = sorted(tech_map.items(), key=lambda x: x[0].lower())
+
+    embed = discord.Embed(title=f"📚 Tech Pull • {real}", color=0x2ECC71)
+    embed.add_field(name="Reports scanned", value=str(scanned), inline=True)
+    embed.add_field(name="Tech lines seen", value=str(seen_lines), inline=True)
+    embed.add_field(name="Unique tech kept", value=str(len(items)), inline=True)
+
+    lines = [f"• **{name}** — lvl **{data['lvl']}**" for name, data in items[:25]]
+    embed.description = "\n".join(lines)
+
+    if len(items) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(items)} (I can add paging if you want)")
+
+    await ctx.send(embed=embed)
 
 # ---------- Run ----------
 bot.run(TOKEN)
