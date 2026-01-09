@@ -23,7 +23,7 @@ from psycopg2.extras import RealDictCursor
 
 # ---------- Setup ----------
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")i
+TOKEN = os.getenv("DISCORD_TOKEN")
 ERROR_CHANNEL_NAME = "kg2recon-updates"
 
 logging.basicConfig(level=logging.INFO)
