@@ -8,6 +8,11 @@
 # Storage upgrade: compress raw spy report into BYTEA (raw_gz)
 # Backfill: scan every readable channel history and import old spy reports
 # Export: !techallcsv (clean spreadsheet import)
+#
+# UPGRADE (MERGED):
+# - TECH now captures ALL research, not battle-only
+# - Auto-capture announces "checking research on file..." and shows what it did
+# - Dedup rules: insert only new, update only on level-up; refresh last_seen if report newer
 
 import os, re, asyncio, difflib, hashlib, logging, gzip
 from math import ceil
@@ -60,13 +65,6 @@ AP_REDUCTIONS = [
     ("Victory", 0.35),
     ("Major Victory", 0.55),
     ("Overwhelming Victory", 0.875),
-]
-
-# Battle-ish keyword filter (for techindex/techpull)
-BATTLE_TECH_KEYWORDS = [
-    "training", "leadership", "battle", "attack", "defense", "defensive", "offense", "offensive",
-    "troop", "army", "cavalry", "archer", "pikemen", "knight", "siege",
-    "damage", "health", "hp", "armor", "speed", "march", "morale", "accuracy",
 ]
 
 # ---------- Discord ----------
@@ -220,12 +218,9 @@ def fuzzy_kingdom(query: str):
     match = difflib.get_close_matches(query, names, 1, 0.5)
     return match[0] if match else None
 
-def is_battle_related_tech(name: str) -> bool:
-    n = name.lower()
-    return any(k in n for k in BATTLE_TECH_KEYWORDS)
-
+# --------- TECH EXTRACTION (ALL RESEARCH) ----------
 def extract_tech_from_raw(raw: str):
-    """Extract lines like 'Better Training Methods lvl 6' from tech section."""
+    """Extract lines like 'Better Training Methods lvl 6' from tech section (ALL research)."""
     if not raw:
         return []
     lines = raw.splitlines()
@@ -242,14 +237,75 @@ def extract_tech_from_raw(raw: str):
         line = lines[j].strip()
         if not line:
             break
+
         low = line.lower()
+
+        # Stop if someone typed a command after the paste
+        if low.startswith("!") or low.startswith("/"):
+            break
+
+        # Stop if another section header begins (e.g., "Our spies also found..." or "Resources:")
         if low.startswith("our spies also found") or low.startswith("the following ") or low.startswith("sender:") or low.startswith("recipient"):
+            break
+        if line.endswith(":") and "lvl" not in low:
             break
 
         m = re.match(r"^(.*?)\s+lvl\s+(\d+)\s*$", line, flags=re.IGNORECASE)
         if m:
             techs.append((m.group(1).strip(), int(m.group(2))))
     return techs
+
+def upsert_tech_rows(cur, kingdom: str, techs: list[tuple[str, int]], seen_ts: datetime, report_id: int):
+    """
+    Upsert ALL research into player_tech.
+    Rules:
+      - if not exists -> insert
+      - if exists and lvl higher -> update lvl + last_seen
+      - if exists and lvl same/lower -> keep lvl, but update last_seen if this report is newer
+    Returns (new_count, levelup_count, already_count)
+    """
+    new_count = 0
+    levelup_count = 0
+    already_count = 0
+
+    for name, lvl in techs:
+        cur.execute("""
+            SELECT tech_level, last_seen
+            FROM player_tech
+            WHERE kingdom=%s AND tech_name=%s
+            LIMIT 1;
+        """, (kingdom, name))
+        row = cur.fetchone()
+
+        if not row:
+            cur.execute("""
+                INSERT INTO player_tech (kingdom, tech_name, tech_level, last_seen, source_report_id)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (kingdom, name, lvl, seen_ts, report_id))
+            new_count += 1
+            continue
+
+        existing_lvl = int(row["tech_level"])
+        existing_seen = row["last_seen"]
+
+        if lvl > existing_lvl:
+            cur.execute("""
+                UPDATE player_tech
+                SET tech_level=%s, last_seen=%s, source_report_id=%s
+                WHERE kingdom=%s AND tech_name=%s;
+            """, (lvl, seen_ts, report_id, kingdom, name))
+            levelup_count += 1
+        else:
+            # do not downgrade; just refresh last_seen if newer
+            if existing_seen is None or seen_ts > existing_seen:
+                cur.execute("""
+                    UPDATE player_tech
+                    SET last_seen=%s, source_report_id=%s
+                    WHERE kingdom=%s AND tech_name=%s;
+                """, (seen_ts, report_id, kingdom, name))
+            already_count += 1
+
+    return new_count, levelup_count, already_count
 
 def ensure_ap_session(kingdom: str) -> bool:
     with db_connect() as conn, conn.cursor() as cur:
@@ -353,27 +409,78 @@ async def on_message(msg: discord.Message):
             await bot.process_commands(msg)
             return
 
+        # Visible status so people see what bot is doing
+        status = await msg.channel.send(f"🔎 Checking to see if we have research on file for **{kingdom}**...")
+
         h = hash_report(msg.content)
         ts = msg.created_at.replace(tzinfo=timezone.utc) if msg.created_at else datetime.now(timezone.utc)
 
         raw_gz = psycopg2.Binary(compress_report(msg.content))
         raw_text = msg.content if KEEP_RAW_TEXT else None
 
+        inserted_row = None
+        already_exists = False
+
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
-            if cur.fetchone():
-                await bot.process_commands(msg)
-                return
+            existing = cur.fetchone()
+            if existing:
+                already_exists = True
+                report_id = existing["id"]
+            else:
+                cur.execute("""
+                    INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, raw_gz, report_hash)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id, kingdom, defense_power, castles, created_at;
+                """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
+                inserted_row = cur.fetchone()
+                report_id = inserted_row["id"]
 
-            cur.execute("""
-                INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, raw_gz, report_hash)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id, kingdom, defense_power, castles, created_at;
-            """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
-            row = cur.fetchone()
+            # TECH: extract ALL research and upsert (only new/levelups, no dupes)
+            raw_for_tech = msg.content  # safest (fresh paste)
+            techs = extract_tech_from_raw(raw_for_tech)
+
+            new_added = 0
+            levelups = 0
+            already = 0
+
+            if techs:
+                new_added, levelups, already = upsert_tech_rows(cur, kingdom, techs, ts, report_id)
 
         ensure_ap_session(kingdom)
-        await msg.channel.send(embed=build_spy_embed(row))
+
+        # Show SR embed only when new report inserted (keeps old behavior)
+        if inserted_row:
+            await msg.channel.send(embed=build_spy_embed(inserted_row))
+
+        if already_exists:
+            # Report duplicate; still may have refreshed tech last_seen if they pasted same content
+            if techs:
+                await status.edit(
+                    content=(
+                        f"✅ Duplicate spy report detected (already saved).\n"
+                        f"📚 Research check complete for **{kingdom}** — "
+                        f"New: **{new_added}**, Level-ups: **{levelups}**, Already on file: **{already}**"
+                    )
+                )
+            else:
+                await status.edit(content=f"✅ Duplicate spy report detected (already saved). No tech section found.")
+        else:
+            if techs:
+                await status.edit(
+                    content=(
+                        f"✅ Spy report saved (ID: **{report_id}**) for **{kingdom}**.\n"
+                        f"📚 Research check complete — Tech lines seen: **{len(techs)}** | "
+                        f"New: **{new_added}**, Level-ups: **{levelups}**, Already on file: **{already}**"
+                    )
+                )
+            else:
+                await status.edit(
+                    content=(
+                        f"✅ Spy report saved (ID: **{report_id}**) for **{kingdom}**.\n"
+                        f"ℹ️ No tech section found in this report."
+                    )
+                )
 
     except Exception as e:
         await send_error(msg.guild, f"on_message: {e}")
@@ -560,12 +667,16 @@ async def apstatus(ctx, *, kingdom: str):
 @bot.command()
 async def techindex(ctx):
     async with tech_index_lock:
-        await ctx.send("🔎 Scanning saved spy reports for battle-related trainings...")
+        await ctx.send("🔎 Scanning saved spy reports for **ALL research**...")
 
         scanned = 0
         reports_with_section = 0
         kept_lines = 0
-        upserts = 0
+        upserts_attempted = 0
+
+        new_added = 0
+        levelups = 0
+        already = 0
 
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id, kingdom, created_at, raw, raw_gz FROM spy_reports ORDER BY created_at DESC;")
@@ -583,32 +694,21 @@ async def techindex(ctx):
                     continue
 
                 reports_with_section += 1
-
-                techs = [(name, lvl) for (name, lvl) in techs if is_battle_related_tech(name)]
-                if not techs:
-                    continue
-
                 kept_lines += len(techs)
+                upserts_attempted += len(techs)
 
-                for name, lvl in techs:
-                    cur.execute("""
-                        INSERT INTO player_tech (kingdom, tech_name, tech_level, last_seen, source_report_id)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (kingdom, tech_name)
-                        DO UPDATE SET
-                            tech_level = EXCLUDED.tech_level,
-                            last_seen = EXCLUDED.last_seen,
-                            source_report_id = EXCLUDED.source_report_id
-                        WHERE player_tech.last_seen <= EXCLUDED.last_seen;
-                    """, (kingdom, name, lvl, r["created_at"] or datetime.now(timezone.utc), r["id"]))
-                    upserts += 1
+                seen_ts = r["created_at"] or datetime.now(timezone.utc)
+                n, u, a = upsert_tech_rows(cur, kingdom, techs, seen_ts, r["id"])
+                new_added += n
+                levelups += u
+                already += a
 
         await ctx.send(
-            "✅ Tech index updated.\n"
+            "✅ Tech index updated (ALL research).\n"
             f"Reports scanned: {scanned:,}\n"
             f"Reports w/ tech section: {reports_with_section:,}\n"
-            f"Battle-tech lines kept: {kept_lines:,}\n"
-            f"Rows upserted: {upserts:,}"
+            f"Tech lines processed: {kept_lines:,}\n"
+            f"New: {new_added:,} • Level-ups: {levelups:,} • Already on file: {already:,}"
         )
 
 @bot.command()
@@ -624,9 +724,9 @@ async def tech(ctx, *, kingdom: str):
         rows = cur.fetchall()
 
     if not rows:
-        return await ctx.send(f"❌ No indexed battle-related tech for **{real}**.\nRun `!techindex` first (or use `!techpull {real}`).")
+        return await ctx.send(f"❌ No indexed research for **{real}**.\nRun `!techindex` first (or use `!techpull {real}`).")
 
-    embed = discord.Embed(title=f"📚 Battle Trainings • {real}", color=0x2ECC71)
+    embed = discord.Embed(title=f"📚 Research • {real}", color=0x2ECC71)
     lines = [f"• {r['tech_name']} — lvl {r['tech_level']} (last: {r['last_seen']})" for r in rows[:25]]
     embed.description = "\n".join(lines)
     if len(rows) > 25:
@@ -648,7 +748,7 @@ async def techtop(ctx):
     if not rows:
         return await ctx.send("❌ No tech indexed yet. Run `!techindex` first.")
 
-    msg = ["🏆 **Most common battle-related trainings (indexed)**"]
+    msg = ["🏆 **Most common research (indexed)**"]
     for r in rows:
         msg.append(f"• **{r['tech_name']}** — {r['cnt']}")
     await ctx.send("\n".join(msg))
@@ -681,10 +781,6 @@ async def techpull(ctx, *, kingdom: str):
         if not techs:
             continue
 
-        techs = [(name, lvl) for (name, lvl) in techs if is_battle_related_tech(name)]
-        if not techs:
-            continue
-
         for name, lvl in techs:
             seen_lines += 1
             seen_ts = r["created_at"] or datetime.now(timezone.utc)
@@ -694,7 +790,7 @@ async def techpull(ctx, *, kingdom: str):
                 tech_map[name] = {"lvl": lvl, "seen": seen_ts, "rid": r["id"]}
 
     if not tech_map:
-        return await ctx.send(f"❌ No battle-related tech found in saved reports for **{real}**.")
+        return await ctx.send(f"❌ No tech found in saved reports for **{real}**.")
 
     items = sorted(tech_map.items(), key=lambda x: x[0].lower())
 
@@ -714,7 +810,7 @@ async def techpull(ctx, *, kingdom: str):
 @bot.command()
 async def techallcsv(ctx):
     """
-    Uploads a CSV of ALL indexed battle-related tech for ALL kingdoms.
+    Uploads a CSV of ALL indexed research for ALL kingdoms.
     Cleanest spreadsheet import.
     """
     import io, csv
@@ -738,7 +834,7 @@ async def techallcsv(ctx):
         w.writerow([r["kingdom"], r["tech_name"], r["tech_level"], d])
 
     data = buf.getvalue().encode("utf-8")
-    file = discord.File(fp=io.BytesIO(data), filename="kg2_battle_tech_all.csv")
+    file = discord.File(fp=io.BytesIO(data), filename="kg2_tech_all.csv")
     await ctx.send("✅ Here’s the CSV export:", file=file)
 
 # ---------- Backfill ----------
