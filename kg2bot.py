@@ -1,12 +1,13 @@
 # ---------- KG2 Recon Bot • FULL PATCHED BUILD ----------
 # Spy auto-capture (Postgres) • Combat Calc • AP Planner w/ Buttons • Spy History/ID
-# Tech capture/indexing (supports raw OR gz)
-# REMOVED: Scheduled self-restart / maintenance auto refresher (was causing spam)
+# Tech capture/indexing (supports raw OR gz) • Per-kingdom deduped tech table + CSV export
 # FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
-# ADD: !refresh (admin-only manual restart)
-# FIX: !calc now prompts for SR paste by default (DB used only when you specify a kingdom or "db")
+# FIX: !calc prompts for paste by default, DB optional
+# FIX: tech parsing supports KG2 format: "lvl 5" / "lv 5" and backward-searching techpull
+# ADD: !refresh (admin-only) restart
+# ADD: !techexport creates CSV of each kingdom + all deduped research
 
-import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time
+import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time, io
 from math import ceil
 from datetime import datetime, timezone
 
@@ -18,20 +19,18 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# ------------------- PATCH INFO (edit this each deploy) -------------------
-BOT_VERSION = "2026-01-20.7"
+# ------------------- PATCH INFO -------------------
+BOT_VERSION = "2026-01-20.9"
 PATCH_NOTES = [
-    "Fixed: !calc now prompts for a pasted spy report by default (no more auto-DB calc).",
-    "Added: !calc db (use latest saved report) + !calc <kingdom> (use latest for that kingdom).",
+    "Fixed: Tech parsing for KG2 format (lvl/lv/level).",
+    "Fixed: Reports save even if DP missing when tech lines exist.",
+    "Fixed: !techpull searches backwards through recent reports until tech is found.",
+    "Added: kingdom_tech table (deduped: best level per kingdom+tech).",
+    "Added: !techexport CSV (kingdom + tech list) for Excel/PowerBI.",
     "Added: !refresh (admin-only manual restart).",
-    "Removed: Scheduled Maintenance auto-refresh (was spamming).",
-    "Fixed: Restart announcement spam (on_ready reconnect guard + DB cooldown).",
-    "Fixed: Missing APView (AP buttons now work; !ap / !apfix no longer crash).",
-    "Fixed: Tech indexing works even when KEEP_RAW_TEXT=false (reads gz backup).",
-    "Fixed: !techtop command completed (was truncated / syntax issue).",
-    "Added: !techpull (index latest report tech) + !techindex (index all) + !tech (view top tech).",
+    "Kept: Restart announcement dedupe + AP planner + spy history/ID + calc prompt.",
 ]
-# ------------------------------------------------------------------------
+# -------------------------------------------------
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -45,7 +44,6 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL env var.")
 
-# If false, store gz bytes but NOT plain-text raw column.
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
 
 # ---------- Constants ----------
@@ -91,6 +89,7 @@ def init_db():
             report_hash TEXT UNIQUE
         );
         """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS dp_sessions (
             id SERIAL PRIMARY KEY,
@@ -103,6 +102,8 @@ def init_db():
             captured_at TIMESTAMPTZ
         );
         """)
+
+        # Raw tech lines per report (history)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS tech_index (
             id SERIAL PRIMARY KEY,
@@ -114,7 +115,20 @@ def init_db():
             UNIQUE(kingdom, tech_name, tech_level, report_id)
         );
         """)
-        # meta table to dedupe announcements across restarts
+
+        # NEW: deduped “best tech per kingdom”
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kingdom_tech (
+            kingdom TEXT NOT NULL,
+            tech_name TEXT NOT NULL,
+            best_level INTEGER NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            source_report_id INTEGER,
+            PRIMARY KEY (kingdom, tech_name)
+        );
+        """)
+
+        # meta table for restart announcement dedupe
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_meta (
             k TEXT PRIMARY KEY,
@@ -172,12 +186,38 @@ def parse_spy(text: str):
     return kingdom, dp, castles
 
 def parse_tech(text: str):
+    """
+    KG2 tech section uses:
+      "Improved Tools lvl 5"
+      "Something lv 12"
+    We support: lv / lvl / level / Lv / Lv.
+    """
     techs = []
     for line in text.splitlines():
-        m = re.search(r"([\w\s\-\(\)\+\/]+?)\s+Lv\.?\s*(\d+)", line, re.IGNORECASE)
+        s = line.strip()
+        if not s:
+            continue
+
+        s = s.lstrip("•-*—– ").strip()
+
+        # Name + lvl/lv/level + number
+        m = re.match(r"^(.+?)\s+(?:lv\.?|lvl\.?|level)\s*(\d{1,3})\s*$", s, re.IGNORECASE)
         if m:
-            name, level = m.groups()
-            techs.append((name.strip(), int(level)))
+            name = m.group(1).strip()
+            lvl = int(m.group(2))
+            if 1 <= lvl <= 300 and len(name) >= 3:
+                techs.append((name, lvl))
+            continue
+
+        # Name: 12  OR  Name - 12
+        m = re.match(r"^(.+?)\s*[:\-–—]\s*(\d{1,3})\s*$", s)
+        if m:
+            name = m.group(1).strip()
+            lvl = int(m.group(2))
+            if 1 <= lvl <= 300 and len(name) >= 3:
+                techs.append((name, lvl))
+            continue
+
     return techs
 
 def compress_report(text: str) -> bytes:
@@ -228,24 +268,6 @@ def extract_report_text_for_row(row) -> str:
         return decompress_report(raw_gz)
     return ""
 
-def index_tech_from_report_row(cur, row) -> int:
-    text = extract_report_text_for_row(row)
-    if not text:
-        return 0
-    techs = parse_tech(text)
-    if not techs:
-        return 0
-
-    count = 0
-    for name, lvl in techs:
-        cur.execute("""
-            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING;
-        """, (row.get("kingdom"), name, lvl, row.get("created_at") or now_utc(), row.get("id")))
-        count += 1
-    return count
-
 def fuzzy_kingdom(query: str):
     if not query:
         return None
@@ -256,6 +278,7 @@ def fuzzy_kingdom(query: str):
     return match[0] if match else None
 
 def get_latest_spy_report_for_kingdom(kingdom: str):
+    """DP-valid report (used by AP sessions)"""
     if not kingdom:
         return None
     with db_connect() as conn, conn.cursor() as cur:
@@ -263,6 +286,20 @@ def get_latest_spy_report_for_kingdom(kingdom: str):
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
             WHERE kingdom=%s AND defense_power IS NOT NULL AND defense_power > 0
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        return cur.fetchone()
+
+def get_latest_report_for_kingdom_any(kingdom: str):
+    """Any report (DP or not)"""
+    if not kingdom:
+        return None
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
+            FROM spy_reports
+            WHERE kingdom=%s
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
         """, (kingdom,))
@@ -278,6 +315,17 @@ def get_latest_spy_report_any():
             LIMIT 1;
         """)
         return cur.fetchone()
+
+def get_recent_reports_for_kingdom(kingdom: str, limit: int = 25):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
+            FROM spy_reports
+            WHERE kingdom=%s
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT %s;
+        """, (kingdom, limit))
+        return cur.fetchall()
 
 def rebuild_ap_session(kingdom: str) -> bool:
     spy = get_latest_spy_report_for_kingdom(kingdom)
@@ -318,13 +366,14 @@ def ensure_ap_session(kingdom: str) -> bool:
     return rebuild_ap_session(kingdom)
 
 def build_spy_embed(row):
-    dp = int(row.get("defense_power") or 0)
+    dp = int(row.get("defense_power") or 0) if row.get("defense_power") is not None else 0
     castles = int(row.get("castles") or 0)
-    adjusted = ceil(dp * (1 + castle_bonus(castles)))
+    adjusted = ceil(dp * (1 + castle_bonus(castles))) if dp > 0 else 0
+
     embed = discord.Embed(title="🕵️ Spy Report", color=0x5865F2)
     embed.add_field(name="Kingdom", value=row.get("kingdom") or "Unknown", inline=False)
-    embed.add_field(name="Base DP", value=f"{dp:,}", inline=True)
-    embed.add_field(name="Adjusted DP", value=f"{adjusted:,}", inline=True)
+    embed.add_field(name="Base DP", value=(f"{dp:,}" if dp else "N/A"), inline=True)
+    embed.add_field(name="Adjusted DP", value=(f"{adjusted:,}" if adjusted else "N/A"), inline=True)
     embed.add_field(name="Castles", value=str(castles), inline=True)
     embed.set_footer(text=f"ID {row['id']} • Captured {row.get('created_at')}")
     return embed
@@ -375,6 +424,69 @@ def build_ap_embed(kingdom: str):
     else:
         embed.set_footer(text=f"Captured {row.get('captured_at')}")
     return embed
+
+# ---------- Tech Indexing (dedupe) ----------
+def upsert_kingdom_tech(cur, kingdom: str, tech_name: str, level: int, report_id: int, captured_at):
+    """
+    Deduped: keep best (highest) level for kingdom+tech_name.
+    """
+    if not kingdom or not tech_name or not level:
+        return False
+
+    cur.execute("""
+        SELECT best_level FROM kingdom_tech
+        WHERE kingdom=%s AND tech_name=%s
+        LIMIT 1;
+    """, (kingdom, tech_name))
+    row = cur.fetchone()
+    existing = int(row["best_level"]) if row else None
+
+    if existing is None or level > existing:
+        cur.execute("""
+            INSERT INTO kingdom_tech (kingdom, tech_name, best_level, updated_at, source_report_id)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (kingdom, tech_name) DO UPDATE
+            SET best_level=EXCLUDED.best_level,
+                updated_at=EXCLUDED.updated_at,
+                source_report_id=EXCLUDED.source_report_id;
+        """, (kingdom, tech_name, level, captured_at or now_utc(), report_id))
+        return True
+
+    return False
+
+def index_tech_from_report_row(cur, row) -> tuple[int, int]:
+    """
+    Index tech from a report:
+      - tech_index (history): ON CONFLICT DO NOTHING
+      - kingdom_tech (dedupe): keep max level per tech
+    Returns: (history_count, dedupe_updates)
+    """
+    text = extract_report_text_for_row(row)
+    if not text:
+        return (0, 0)
+
+    techs = parse_tech(text)
+    if not techs:
+        return (0, 0)
+
+    history_count = 0
+    dedupe_updates = 0
+    captured_at = row.get("created_at") or now_utc()
+    kingdom = row.get("kingdom")
+    report_id = row.get("id")
+
+    for name, lvl in techs:
+        cur.execute("""
+            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING;
+        """, (kingdom, name, lvl, captured_at, report_id))
+        history_count += 1
+
+        if upsert_kingdom_tech(cur, kingdom, name, lvl, report_id, captured_at):
+            dedupe_updates += 1
+
+    return (history_count, dedupe_updates)
 
 # ---------- AP View ----------
 class APView(View):
@@ -518,13 +630,13 @@ async def on_ready():
     except Exception as e:
         logging.error(f"DB init failed: {e}")
 
-    # ---- FIX: stop restart announcement spam ----
+    # suppress reconnect spam in same process
     if ANNOUNCED_READY_THIS_PROCESS:
         logging.info("on_ready called again (same process) - announcement suppressed.")
         return
     ANNOUNCED_READY_THIS_PROCESS = True
 
-    # DB cooldown blocks repeated posts across process restarts
+    # suppress rapid restarts via DB cooldown
     try:
         with db_connect() as conn, conn.cursor() as cur:
             last_ver = _meta_get(cur, "announce_last_ver")
@@ -561,7 +673,17 @@ async def on_message(msg: discord.Message):
 
     try:
         kingdom, dp, castles = parse_spy(msg.content)
-        if kingdom and dp and dp >= 1000:
+        techs = parse_tech(msg.content)
+
+        # Save if we have a target AND either:
+        # - DP looks valid, OR
+        # - tech lines exist (even if DP missing)
+        should_save = bool(kingdom) and (
+            (dp is not None and dp >= 1000) or
+            (techs and len(techs) >= 1)
+        )
+
+        if should_save:
             h = hash_report(msg.content)
             ts = (msg.created_at.replace(tzinfo=timezone.utc) if msg.created_at else now_utc())
             raw_gz = psycopg2.Binary(compress_report(msg.content))
@@ -579,7 +701,9 @@ async def on_message(msg: discord.Message):
                     """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
                     row = cur.fetchone()
 
-                    ensure_ap_session(kingdom)
+                    # auto AP session only if DP exists
+                    if dp is not None and dp >= 1000:
+                        ensure_ap_session(kingdom)
 
                     if can_send(msg.channel, msg.guild):
                         await msg.channel.send(embed=build_spy_embed(row))
@@ -597,13 +721,12 @@ async def calc(ctx, *, kingdom: str = None):
     """
     Behavior:
       - !calc            -> prompts you to paste a spy report (default)
-      - !calc <kingdom>  -> uses latest saved report for that kingdom
-      - !calc db         -> uses latest saved report overall
+      - !calc <kingdom>  -> uses latest saved report for that kingdom (DP report)
+      - !calc db         -> uses latest saved report overall (DP report)
     """
     try:
         arg = (kingdom or "").strip()
 
-        # Explicit DB modes
         if arg.lower() in ("db", "last", "latest"):
             row = get_latest_spy_report_any()
             if not row:
@@ -618,14 +741,13 @@ async def calc(ctx, *, kingdom: str = None):
             real = fuzzy_kingdom(arg) or arg
             row = get_latest_spy_report_for_kingdom(real)
             if not row:
-                return await ctx.send(f"❌ No saved reports for **{real}**. Paste a spy report and try again.")
+                return await ctx.send(f"❌ No saved DP reports for **{real}**. Paste a spy report and try again.")
             dp = int(row["defense_power"])
             c = int(row["castles"] or 0)
             target = row["kingdom"] or real
             used = f"(from DB: {row['id']})"
             return await ctx.send(embed=build_calc_embed(target, dp, c, used))
 
-        # Default: prompt for pasted SR every time
         await ctx.send("📄 Paste the spy report you want to calculate against (you have 90 seconds).")
         try:
             msg = await bot.wait_for(
@@ -639,9 +761,7 @@ async def calc(ctx, *, kingdom: str = None):
         k, dp, c = parse_spy(msg.content)
         if not k or not dp:
             return await ctx.send("❌ Could not parse that spy report. Make sure it includes Target + Defensive Power.")
-        target = k
-        used = "(pasted)"
-        await ctx.send(embed=build_calc_embed(target, int(dp), int(c or 0), used))
+        await ctx.send(embed=build_calc_embed(k, int(dp), int(c or 0), "(pasted)"))
 
     except Exception as e:
         await ctx.send("⚠️ calc failed.")
@@ -651,7 +771,7 @@ async def calc(ctx, *, kingdom: str = None):
 async def spy(ctx, *, kingdom: str):
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
-        row = get_latest_spy_report_for_kingdom(real)
+        row = get_latest_report_for_kingdom_any(real)
         if not row:
             return await ctx.send(f"❌ No reports for **{real}**.")
         await ctx.send(embed=build_spy_embed(row))
@@ -691,10 +811,11 @@ async def spyhistory(ctx, *, kingdom: str):
 
         lines = []
         for r in rows:
-            dp = int(r.get("defense_power") or 0)
+            dp = r.get("defense_power")
+            dp_s = f"{int(dp):,} DP" if dp else "DP N/A"
             dt = r.get("created_at")
             dts = dt.strftime("%Y-%m-%d") if dt else "unknown-date"
-            lines.append(f"`#{r['id']}`: {dp:,} DP ({dts})")
+            lines.append(f"`#{r['id']}`: {dp_s} ({dts})")
 
         await ctx.send(f"📂 **History for {real}**:\n" + "\n".join(lines))
     except Exception as e:
@@ -711,7 +832,7 @@ async def ap(ctx, *, kingdom: str):
                 return await ctx.send("❌ No active session embed. Try `!apfix <kingdom>`.")
             await ctx.send(embed=emb, view=APView(real))
         else:
-            await ctx.send("❌ No spy report found for that kingdom.")
+            await ctx.send("❌ No DP spy report found for that kingdom.")
     except Exception as e:
         await ctx.send("⚠️ ap failed.")
         await send_error(ctx.guild, f"ap error: {e}")
@@ -739,71 +860,115 @@ async def apfix(ctx, *, kingdom: str):
             if emb:
                 await ctx.send(embed=emb, view=APView(real))
         else:
-            await ctx.send("❌ No valid spy report found.")
+            await ctx.send("❌ No valid DP spy report found.")
     except Exception as e:
         await ctx.send("⚠️ apfix failed.")
         await send_error(ctx.guild, f"apfix error: {e}")
 
 @bot.command()
-async def techindex(ctx):
-    """Index tech entries from ALL reports (raw if present, else gz)."""
-    try:
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, kingdom, raw, raw_gz, created_at FROM spy_reports WHERE kingdom IS NOT NULL;")
-            reports = cur.fetchall()
-            count = 0
-            for r in reports:
-                count += index_tech_from_report_row(cur, r)
-        await ctx.send(f"✅ Indexed {count} tech entries from all saved reports.")
-    except Exception as e:
-        await ctx.send("⚠️ techindex failed.")
-        await send_error(ctx.guild, f"techindex error: {e}")
-
-@bot.command()
 async def techpull(ctx, *, kingdom: str):
-    """Index tech entries from the LATEST spy report for a kingdom."""
+    """
+    Index tech from the most recent report that actually CONTAINS tech lines.
+    Searches backwards through up to 25 recent reports.
+    """
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
-        row = get_latest_spy_report_for_kingdom(real)
-        if not row:
-            return await ctx.send(f"❌ No reports for **{real}**.")
+        reports = get_recent_reports_for_kingdom(real, limit=25)
+        if not reports:
+            return await ctx.send(f"❌ No reports found for **{real}**.")
+
+        chosen = None
+        chosen_techs = None
+
+        for r in reports:
+            text = extract_report_text_for_row(r)
+            techs = parse_tech(text)
+            if techs:
+                chosen = r
+                chosen_techs = techs
+                break
+
+        if not chosen:
+            return await ctx.send(f"⚠️ No tech lines detected in the last {len(reports)} saved reports for **{real}**.\n"
+                                  f"Tip: paste a fresh full spy report that includes the tech section, then run `!techpull {real}` again.")
+
         with db_connect() as conn, conn.cursor() as cur:
-            count = index_tech_from_report_row(cur, row)
-        if count <= 0:
-            await ctx.send(f"⚠️ No tech lines detected in the latest report for **{real}**.")
-        else:
-            await ctx.send(f"✅ Indexed {count} tech entries from the latest report for **{real}**.")
+            hist_count, dedupe_updates = index_tech_from_report_row(cur, chosen)
+
+        await ctx.send(
+            f"✅ Tech pulled for **{real}** from report `#{chosen['id']}`.\n"
+            f"• Parsed tech lines: **{len(chosen_techs)}**\n"
+            f"• Added to history: **{hist_count}**\n"
+            f"• Updated best-tech list: **{dedupe_updates}**"
+        )
+
     except Exception as e:
         await ctx.send("⚠️ techpull failed.")
         await send_error(ctx.guild, f"techpull error: {e}")
 
 @bot.command()
+async def techindex(ctx):
+    """
+    Index tech for ALL saved reports into:
+      - tech_index (history)
+      - kingdom_tech (deduped best tech per kingdom)
+    """
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, kingdom, raw, raw_gz, created_at FROM spy_reports WHERE kingdom IS NOT NULL;")
+            reports = cur.fetchall()
+
+            total_hist = 0
+            total_updates = 0
+            scanned = 0
+            reports_with_tech = 0
+
+            for r in reports:
+                scanned += 1
+                hist_count, dedupe_updates = index_tech_from_report_row(cur, r)
+                if hist_count > 0:
+                    reports_with_tech += 1
+                total_hist += hist_count
+                total_updates += dedupe_updates
+
+        await ctx.send(
+            f"✅ Tech index complete.\n"
+            f"• Reports scanned: **{scanned}**\n"
+            f"• Reports with tech: **{reports_with_tech}**\n"
+            f"• Added to history: **{total_hist}**\n"
+            f"• Updated best-tech list: **{total_updates}**"
+        )
+    except Exception as e:
+        await ctx.send("⚠️ techindex failed.")
+        await send_error(ctx.guild, f"techindex error: {e}")
+
+@bot.command()
 async def tech(ctx, *, kingdom: str):
-    """Show top 15 tech entries (highest levels) for a kingdom."""
+    """Show top 15 tech entries (highest levels) for a kingdom from deduped best-tech list."""
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT tech_name, tech_level
-                FROM tech_index
+                SELECT tech_name, best_level
+                FROM kingdom_tech
                 WHERE kingdom=%s
-                ORDER BY tech_level DESC, tech_name ASC
+                ORDER BY best_level DESC, tech_name ASC
                 LIMIT 15;
             """, (real,))
             rows = cur.fetchall()
 
         if not rows:
-            return await ctx.send(f"❌ No tech found for **{real}**. Run `!techpull {real}` or `!techindex` first.")
+            return await ctx.send(f"❌ No tech found for **{real}**.\nRun `!techpull {real}` or `!techindex` first.")
 
-        txt = "\n".join([f"• {r['tech_name']}: Lv. {int(r['tech_level'] or 0)}" for r in rows])
-        await ctx.send(f"🧪 **Tech Index: {real}**\n{txt}")
+        txt = "\n".join([f"• {r['tech_name']}: lvl {int(r['best_level'] or 0)}" for r in rows])
+        await ctx.send(f"🧪 **Tech (Best Known): {real}**\n{txt}")
     except Exception as e:
         await ctx.send("⚠️ tech failed.")
         await send_error(ctx.guild, f"tech error: {e}")
 
 @bot.command()
 async def techtop(ctx, *, tech_name: str):
-    """Leaderboard for a tech across kingdoms. Example: !techtop Heavy Cavalry"""
+    """Leaderboard for a tech across kingdoms (uses deduped best-tech list)."""
     try:
         q = tech_name.strip()
         if not q:
@@ -811,30 +976,70 @@ async def techtop(ctx, *, tech_name: str):
 
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT kingdom, MAX(tech_level) AS best_level
-                FROM tech_index
+                SELECT kingdom, best_level
+                FROM kingdom_tech
                 WHERE tech_name ILIKE %s
-                GROUP BY kingdom
                 ORDER BY best_level DESC, kingdom ASC
                 LIMIT 10;
             """, (f"%{q}%",))
             rows = cur.fetchall()
 
         if not rows:
-            return await ctx.send(f"❌ No matches found for tech: **{q}** (index first with `!techindex`).")
+            return await ctx.send(f"❌ No matches found for tech: **{q}**.\nIndex first with `!techindex` or `!techpull <kingdom>`.")
 
         lines = []
-        rank = 1
-        for r in rows:
+        for i, r in enumerate(rows, start=1):
             kingdom = r.get("kingdom") or "Unknown"
             lvl = int(r.get("best_level") or 0)
-            lines.append(f"`#{rank}` **{kingdom}** — Lv. **{lvl}**")
-            rank += 1
+            lines.append(f"`#{i}` **{kingdom}** — lvl **{lvl}**")
 
         await ctx.send("🏆 **Top Kingdoms for:** `{}`\n{}".format(q, "\n".join(lines)))
     except Exception as e:
         await ctx.send("⚠️ techtop failed.")
         await send_error(ctx.guild, f"techtop error: {e}")
+
+@bot.command()
+async def techexport(ctx):
+    """
+    Export deduped tech list for all kingdoms as a CSV file for Excel/Power BI.
+    Columns: kingdom, tech_name, best_level, updated_at, source_report_id
+    """
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT kingdom, tech_name, best_level, updated_at, source_report_id
+                FROM kingdom_tech
+                ORDER BY kingdom ASC, tech_name ASC;
+            """)
+            rows = cur.fetchall()
+
+        if not rows:
+            return await ctx.send("❌ No tech data to export yet. Run `!techindex` first.")
+
+        out = io.StringIO()
+        out.write("kingdom,tech_name,best_level,updated_at,source_report_id\n")
+        for r in rows:
+            # Simple CSV escaping for commas/quotes
+            kingdom = (r.get("kingdom") or "").replace('"', '""')
+            tech_name = (r.get("tech_name") or "").replace('"', '""')
+            best_level = int(r.get("best_level") or 0)
+            updated_at = r.get("updated_at")
+            updated_at_s = updated_at.isoformat() if updated_at else ""
+            source_id = r.get("source_report_id") or ""
+
+            out.write(f"\"{kingdom}\",\"{tech_name}\",{best_level},\"{updated_at_s}\",{source_id}\n")
+
+        data = out.getvalue().encode("utf-8")
+        out.close()
+
+        filename = f"kg2_tech_export_{BOT_VERSION}.csv"
+        file = discord.File(fp=io.BytesIO(data), filename=filename)
+
+        await ctx.send("📎 Here’s the current deduped tech export (best known per kingdom):", file=file)
+
+    except Exception as e:
+        await ctx.send("⚠️ techexport failed.")
+        await send_error(ctx.guild, f"techexport error: {e}")
 
 def _is_admin(ctx: commands.Context) -> bool:
     try:
