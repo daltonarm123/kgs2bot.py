@@ -1,8 +1,8 @@
 # ---------- KG2 Recon Bot • FULL PATCHED BUILD ----------
 # Spy auto-capture (Postgres) • Combat Calc • AP Planner w/ Buttons • Spy History/ID
-# Tech capture/indexing (supports raw OR gz) • Scheduled self-restart
+# Tech capture/indexing (supports raw OR gz)
+# REMOVED: Scheduled self-restart / maintenance auto refresher (was causing spam)
 # FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
-# FIX: Scheduled Maintenance spam (loop starts only once per process + safety lock)
 
 import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time
 from math import ceil
@@ -17,14 +17,14 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ------------------- PATCH INFO (edit this each deploy) -------------------
-BOT_VERSION = "2026-01-20.5"
+BOT_VERSION = "2026-01-20.6"
 PATCH_NOTES = [
+    "Removed: Scheduled Maintenance auto-refresh (was spamming).",
     "Fixed: Restart announcement spam (on_ready reconnect guard + DB cooldown).",
     "Fixed: Missing APView (AP buttons now work; !ap / !apfix no longer crash).",
     "Fixed: Tech indexing works even when KEEP_RAW_TEXT=false (reads gz backup).",
     "Fixed: !techtop command completed (was truncated / syntax issue).",
     "Added: !techpull (index latest report tech) + !techindex (index all) + !tech (view top tech).",
-    "Fixed: Scheduled Maintenance spam (auto-restart loop starts once + announce cooldown).",
 ]
 # ------------------------------------------------------------------------
 
@@ -63,12 +63,6 @@ ap_lock = asyncio.Lock()
 # ---------- Announcement anti-spam ----------
 ANNOUNCED_READY_THIS_PROCESS = False
 ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
-
-# ---------- Scheduled Maintenance anti-spam / loop guard ----------
-AUTO_RESTART_STARTED_THIS_PROCESS = False
-auto_restart_guard_lock = asyncio.Lock()
-MAINTENANCE_ANNOUNCE_COOLDOWN_SECONDS = 60 * 60  # 1 hour
-_last_maintenance_announce_ts = 0
 
 # ---------- DB ----------
 def db_connect():
@@ -478,35 +472,6 @@ class APView(View):
         btn.callback = callback
         return btn
 
-# ---------- Tasks ----------
-@tasks.loop(hours=4)
-async def auto_restart():
-    """
-    IMPORTANT:
-    - This loop MUST be started only once per process.
-    - The message is rate-limited so it can't spam even if something goes wrong.
-    """
-    global _last_maintenance_announce_ts
-
-    # Announce (with cooldown)
-    now_ts = int(time.time())
-    if (now_ts - int(_last_maintenance_announce_ts)) >= MAINTENANCE_ANNOUNCE_COOLDOWN_SECONDS:
-        _last_maintenance_announce_ts = now_ts
-        for guild in bot.guilds:
-            ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
-            if ch and can_send(ch, guild):
-                try:
-                    await ch.send("🔄 **Scheduled Maintenance**: Bot is refreshing to stay optimal...")
-                except Exception:
-                    pass
-
-    logging.info("Scheduled 4-hour restart triggered.")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-@auto_restart.before_loop
-async def _before_auto_restart():
-    await bot.wait_until_ready()
-
 # ---------- Announcement dedupe helpers ----------
 def _meta_get(cur, key: str):
     cur.execute("SELECT v FROM bot_meta WHERE k=%s LIMIT 1;", (key,))
@@ -523,25 +488,13 @@ def _meta_set(cur, key: str, value: str):
 # ---------- Bot Events ----------
 @bot.event
 async def on_ready():
-    global ANNOUNCED_READY_THIS_PROCESS, AUTO_RESTART_STARTED_THIS_PROCESS
+    global ANNOUNCED_READY_THIS_PROCESS
 
     try:
         init_db()
         heal_sequences()
     except Exception as e:
         logging.error(f"DB init failed: {e}")
-
-    # ---- FIX: auto_restart loop spam ----
-    # Start exactly once per process (reconnect-safe).
-    async with auto_restart_guard_lock:
-        if not AUTO_RESTART_STARTED_THIS_PROCESS:
-            AUTO_RESTART_STARTED_THIS_PROCESS = True
-            if not auto_restart.is_running():
-                auto_restart.start()
-            logging.info("auto_restart loop started (once).")
-        else:
-            logging.info("on_ready reconnect - auto_restart already started.")
-    # -------------------------------------
 
     # ---- FIX: stop restart announcement spam ----
     # 1) If Discord reconnect triggers on_ready again in SAME process: do nothing.
