@@ -1,8 +1,9 @@
 # ---------- KG2 Recon Bot • FULL PATCHED BUILD ----------
 # Spy auto-capture (Postgres) • Combat Calc • AP Planner w/ Buttons • Spy History/ID
-# Tech capture/indexing (supports raw OR gz) • Scheduled self-restart • Patch announcements
+# Tech capture/indexing (supports raw OR gz) • Scheduled self-restart
+# FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
 
-import os, re, asyncio, difflib, hashlib, logging, gzip, sys
+import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time
 from math import ceil
 from datetime import datetime, timezone
 
@@ -15,13 +16,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ------------------- PATCH INFO (edit this each deploy) -------------------
-BOT_VERSION = "2026-01-20.3"
+BOT_VERSION = "2026-01-20.5"
 PATCH_NOTES = [
+    "Fixed: Restart announcement spam (on_ready reconnect guard + DB cooldown).",
     "Fixed: Missing APView (AP buttons now work; !ap / !apfix no longer crash).",
-    "Fixed: Tech indexing now works even when KEEP_RAW_TEXT=false (reads gz backup).",
-    "Fixed: Completed/ repaired !techtop command (was truncated + had syntax error).",
-    "Improved: Safer permission checks and better error handling around DB/restart posts.",
-    "Added: !techpull (index latest tech for a kingdom) + !techtop (leaderboard for a tech).",
+    "Fixed: Tech indexing works even when KEEP_RAW_TEXT=false (reads gz backup).",
+    "Fixed: !techtop command completed (was truncated / syntax issue).",
+    "Added: !techpull (index latest report tech) + !techindex (index all) + !tech (view top tech).",
 ]
 # ------------------------------------------------------------------------
 
@@ -37,7 +38,7 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL env var.")
 
-# If false, we still store gz bytes, but NOT the plain text raw column.
+# If false, store gz bytes but NOT plain-text raw column.
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
 
 # ---------- Constants ----------
@@ -56,6 +57,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- Locks ----------
 ap_lock = asyncio.Lock()
+
+# ---------- Announcement anti-spam ----------
+ANNOUNCED_READY_THIS_PROCESS = False
+ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
 
 # ---------- DB ----------
 def db_connect():
@@ -100,6 +105,14 @@ def init_db():
             captured_at TIMESTAMPTZ,
             report_id INTEGER REFERENCES spy_reports(id),
             UNIQUE(kingdom, tech_name, tech_level, report_id)
+        );
+        """)
+        # NEW: meta table to dedupe announcements across restarts
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_meta (
+            k TEXT PRIMARY KEY,
+            v TEXT,
+            updated_at TIMESTAMPTZ
         );
         """)
 
@@ -154,9 +167,6 @@ def parse_spy(text: str):
 def parse_tech(text: str):
     techs = []
     for line in text.splitlines():
-        # Matches:
-        # "Heavy Cavalry Lv 12"
-        # "Heavy Cavalry Lv. 12"
         m = re.search(r"([\w\s\-\(\)\+\/]+?)\s+Lv\.?\s*(\d+)", line, re.IGNORECASE)
         if m:
             name, level = m.groups()
@@ -168,6 +178,8 @@ def compress_report(text: str) -> bytes:
 
 def decompress_report(raw_gz: bytes) -> str:
     try:
+        if isinstance(raw_gz, memoryview):
+            raw_gz = raw_gz.tobytes()
         return gzip.decompress(raw_gz).decode("utf-8", errors="replace")
     except Exception:
         return ""
@@ -191,19 +203,41 @@ def can_send(channel: discord.abc.GuildChannel, guild: discord.Guild) -> bool:
     except Exception:
         return True
 
-def safe_chunks(text: str, limit: int = 1900):
-    # Discord hard limit is 2000; use 1900 buffer for formatting
+async def send_error(guild: discord.Guild, msg: str):
+    try:
+        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        if ch and can_send(ch, guild):
+            await ch.send(f"⚠️ ERROR LOG:\n```py\n{msg}\n```")
+    except Exception:
+        pass
+    logging.error(msg)
+
+def extract_report_text_for_row(row) -> str:
+    raw = row.get("raw")
+    if raw:
+        return raw
+    raw_gz = row.get("raw_gz")
+    if raw_gz:
+        return decompress_report(raw_gz)
+    return ""
+
+def index_tech_from_report_row(cur, row) -> int:
+    text = extract_report_text_for_row(row)
     if not text:
-        return []
-    out, buf = [], ""
-    for line in text.splitlines(True):
-        if len(buf) + len(line) > limit:
-            out.append(buf)
-            buf = ""
-        buf += line
-    if buf:
-        out.append(buf)
-    return out
+        return 0
+    techs = parse_tech(text)
+    if not techs:
+        return 0
+
+    count = 0
+    for name, lvl in techs:
+        cur.execute("""
+            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING;
+        """, (row.get("kingdom"), name, lvl, row.get("created_at") or now_utc(), row.get("id")))
+        count += 1
+    return count
 
 def fuzzy_kingdom(query: str):
     if not query:
@@ -312,51 +346,13 @@ def build_ap_embed(kingdom: str):
     embed.add_field(name="Hits Applied", value=str(hits), inline=True)
     embed.add_field(name="Castles", value=str(castles), inline=True)
     embed.add_field(name="HC Needed (est.)", value=f"{ceil(current_dp / HEAVY_CAVALRY_AP):,}", inline=True)
-
     if row.get("last_hit"):
         embed.set_footer(text=f"Last hit by {row['last_hit']} • Captured {row.get('captured_at')}")
     else:
         embed.set_footer(text=f"Captured {row.get('captured_at')}")
     return embed
 
-async def send_error(guild: discord.Guild, msg: str):
-    try:
-        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
-        if ch and can_send(ch, guild):
-            await ch.send(f"⚠️ ERROR LOG:\n```py\n{msg}\n```")
-    except Exception:
-        pass
-    logging.error(msg)
-
-def extract_report_text_for_row(row) -> str:
-    raw = row.get("raw")
-    if raw:
-        return raw
-    raw_gz = row.get("raw_gz")
-    if raw_gz:
-        return decompress_report(raw_gz)
-    return ""
-
-def index_tech_from_report_row(cur, row) -> int:
-    text = extract_report_text_for_row(row)
-    if not text:
-        return 0
-
-    techs = parse_tech(text)
-    if not techs:
-        return 0
-
-    count = 0
-    for name, lvl in techs:
-        cur.execute("""
-            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING;
-        """, (row.get("kingdom"), name, lvl, row.get("created_at") or now_utc(), row.get("id")))
-        count += 1
-    return count
-
-# ---------- AP View (FIXED: was missing) ----------
+# ---------- AP View ----------
 class APView(View):
     def __init__(self, kingdom: str, timeout: float = 600):
         super().__init__(timeout=timeout)
@@ -364,7 +360,6 @@ class APView(View):
 
         for label, red in AP_REDUCTIONS:
             self.add_item(self._make_hit_button(label, red))
-
         self.add_item(self._make_reset_button())
         self.add_item(self._make_rebuild_button())
 
@@ -375,7 +370,7 @@ class APView(View):
                 async with ap_lock:
                     with db_connect() as conn, conn.cursor() as cur:
                         cur.execute("""
-                            SELECT id, base_dp, current_dp, hits
+                            SELECT id, current_dp, hits
                             FROM dp_sessions
                             WHERE kingdom=%s
                             ORDER BY captured_at DESC NULLS LAST, id DESC
@@ -403,8 +398,6 @@ class APView(View):
                         await interaction.message.edit(embed=embed, view=self)
                     except Exception:
                         await interaction.followup.send(embed=embed, view=self)
-                else:
-                    await interaction.followup.send("❌ Session missing after update. Try `!apfix <kingdom>`.")
             except Exception as e:
                 await interaction.followup.send("⚠️ Failed to apply hit.")
                 if interaction.guild:
@@ -477,11 +470,6 @@ class APView(View):
         btn.callback = callback
         return btn
 
-    async def on_timeout(self):
-        for item in self.children:
-            if isinstance(item, Button):
-                item.disabled = True
-
 # ---------- Tasks ----------
 @tasks.loop(hours=4)
 async def auto_restart():
@@ -493,12 +481,26 @@ async def auto_restart():
                 await ch.send("🔄 **Scheduled Maintenance**: Bot is refreshing to stay optimal...")
             except Exception:
                 pass
-
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+# ---------- Announcement dedupe helpers ----------
+def _meta_get(cur, key: str):
+    cur.execute("SELECT v FROM bot_meta WHERE k=%s LIMIT 1;", (key,))
+    row = cur.fetchone()
+    return row["v"] if row else None
+
+def _meta_set(cur, key: str, value: str):
+    cur.execute("""
+        INSERT INTO bot_meta (k, v, updated_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=EXCLUDED.updated_at;
+    """, (key, value, now_utc()))
 
 # ---------- Bot Events ----------
 @bot.event
 async def on_ready():
+    global ANNOUNCED_READY_THIS_PROCESS
+
     try:
         init_db()
         heal_sequences()
@@ -507,6 +509,31 @@ async def on_ready():
 
     if not auto_restart.is_running():
         auto_restart.start()
+
+    # ---- FIX: stop restart announcement spam ----
+    # 1) If Discord reconnect triggers on_ready again in SAME process: do nothing.
+    if ANNOUNCED_READY_THIS_PROCESS:
+        logging.info("on_ready called again (same process) - announcement suppressed.")
+        return
+    ANNOUNCED_READY_THIS_PROCESS = True
+
+    # 2) If Render is restarting the process repeatedly: DB cooldown blocks repeated posts.
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            last_ver = _meta_get(cur, "announce_last_ver")
+            last_ts = _meta_get(cur, "announce_last_ts")
+            now_ts = int(time.time())
+            last_ts_int = int(last_ts) if last_ts and str(last_ts).isdigit() else 0
+
+            if last_ver == BOT_VERSION and (now_ts - last_ts_int) < ANNOUNCE_COOLDOWN_SECONDS:
+                logging.info("Announcement suppressed (same version + cooldown).")
+                return
+
+            _meta_set(cur, "announce_last_ver", BOT_VERSION)
+            _meta_set(cur, "announce_last_ts", str(now_ts))
+    except Exception as e:
+        logging.error(f"Announcement dedupe DB write failed: {e}")
+    # --------------------------------------------
 
     patch_lines = "\n".join([f"• {x}" for x in PATCH_NOTES])
     for guild in bot.guilds:
@@ -624,7 +651,7 @@ async def spy(ctx, *, kingdom: str):
 async def spyid(ctx, report_id: int):
     try:
         with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT * FROM spy_reports WHERE id=%s;", (report_id,))
+            cur.execute("SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz FROM spy_reports WHERE id=%s;", (report_id,))
             row = cur.fetchone()
         if not row:
             return await ctx.send(f"❌ ID {report_id} not found.")
@@ -652,8 +679,8 @@ async def spyhistory(ctx, *, kingdom: str):
 
         lines = []
         for r in rows:
-            dp = int(r["defense_power"] or 0)
-            dt = r["created_at"]
+            dp = int(r.get("defense_power") or 0)
+            dt = r.get("created_at")
             dts = dt.strftime("%Y-%m-%d") if dt else "unknown-date"
             lines.append(f"`#{r['id']}`: {dp:,} DP ({dts})")
 
@@ -707,19 +734,14 @@ async def apfix(ctx, *, kingdom: str):
 
 @bot.command()
 async def techindex(ctx):
-    """
-    Index tech entries from ALL reports.
-    Works whether KEEP_RAW_TEXT is true or false (uses raw if present, else raw_gz).
-    """
+    """Index tech entries from ALL reports (raw if present, else gz)."""
     try:
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id, kingdom, raw, raw_gz, created_at FROM spy_reports WHERE kingdom IS NOT NULL;")
             reports = cur.fetchall()
-
             count = 0
             for r in reports:
                 count += index_tech_from_report_row(cur, r)
-
         await ctx.send(f"✅ Indexed {count} tech entries from all saved reports.")
     except Exception as e:
         await ctx.send("⚠️ techindex failed.")
@@ -727,18 +749,14 @@ async def techindex(ctx):
 
 @bot.command()
 async def techpull(ctx, *, kingdom: str):
-    """
-    Index tech entries from the LATEST spy report for a kingdom.
-    """
+    """Index tech entries from the LATEST spy report for a kingdom."""
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
         row = get_latest_spy_report_for_kingdom(real)
         if not row:
             return await ctx.send(f"❌ No reports for **{real}**.")
-
         with db_connect() as conn, conn.cursor() as cur:
             count = index_tech_from_report_row(cur, row)
-
         if count <= 0:
             await ctx.send(f"⚠️ No tech lines detected in the latest report for **{real}**.")
         else:
@@ -749,9 +767,7 @@ async def techpull(ctx, *, kingdom: str):
 
 @bot.command()
 async def tech(ctx, *, kingdom: str):
-    """
-    Show top 15 tech entries (highest levels) for a kingdom from the tech_index.
-    """
+    """Show top 15 tech entries (highest levels) for a kingdom."""
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
         with db_connect() as conn, conn.cursor() as cur:
@@ -775,11 +791,7 @@ async def tech(ctx, *, kingdom: str):
 
 @bot.command()
 async def techtop(ctx, *, tech_name: str):
-    """
-    Leaderboard for a tech across kingdoms.
-    Example: !techtop Heavy Cavalry
-    Uses ILIKE match on tech_name.
-    """
+    """Leaderboard for a tech across kingdoms. Example: !techtop Heavy Cavalry"""
     try:
         q = tech_name.strip()
         if not q:
@@ -807,47 +819,10 @@ async def techtop(ctx, *, tech_name: str):
             lines.append(f"`#{rank}` **{kingdom}** — Lv. **{lvl}**")
             rank += 1
 
-        msg = f"🏆 **Top Kingdoms for:** `{q}`\n" + "\n".join(lines)
-        await ctx.send(msg)
+        await ctx.send("🏆 **Top Kingdoms for:** `{}`\n{}".format(q, "\n".join(lines)))
     except Exception as e:
         await ctx.send("⚠️ techtop failed.")
         await send_error(ctx.guild, f"techtop error: {e}")
-
-# OPTIONAL helper (doesn't replace anything): search tech names in index
-@bot.command()
-async def techsearch(ctx, *, query: str):
-    """
-    Find matching tech names you can use with !techtop.
-    Example: !techsearch cavalry
-    """
-    try:
-        q = query.strip()
-        if not q:
-            return await ctx.send("❌ Provide a search string. Example: `!techsearch cavalry`")
-
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT tech_name, COUNT(*) AS entries, MAX(tech_level) AS best
-                FROM tech_index
-                WHERE tech_name ILIKE %s
-                GROUP BY tech_name
-                ORDER BY best DESC, entries DESC, tech_name ASC
-                LIMIT 20;
-            """, (f"%{q}%",))
-            rows = cur.fetchall()
-
-        if not rows:
-            return await ctx.send(f"❌ No tech names found matching: **{q}**")
-
-        out = "🔎 **Tech matches:**\n" + "\n".join(
-            [f"• `{r['tech_name']}` (best Lv {int(r['best'] or 0)}, entries {int(r['entries'] or 0)})" for r in rows]
-        )
-
-        for chunk in safe_chunks(out):
-            await ctx.send(chunk)
-    except Exception as e:
-        await ctx.send("⚠️ techsearch failed.")
-        await send_error(ctx.guild, f"techsearch error: {e}")
 
 # ---------- START BOT ----------
 bot.run(TOKEN)
