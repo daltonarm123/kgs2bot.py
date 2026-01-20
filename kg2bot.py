@@ -3,13 +3,15 @@
 # Tech capture/indexing (supports raw OR gz)
 # REMOVED: Scheduled self-restart / maintenance auto refresher (was causing spam)
 # FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
+# ADD: !refresh (admin-only manual restart)
+# FIX: !calc now prompts for SR paste by default (DB used only when you specify a kingdom or "db")
 
 import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time
 from math import ceil
 from datetime import datetime, timezone
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord.ui import View, Button
 from dotenv import load_dotenv
 
@@ -17,8 +19,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ------------------- PATCH INFO (edit this each deploy) -------------------
-BOT_VERSION = "2026-01-20.6"
+BOT_VERSION = "2026-01-20.7"
 PATCH_NOTES = [
+    "Fixed: !calc now prompts for a pasted spy report by default (no more auto-DB calc).",
+    "Added: !calc db (use latest saved report) + !calc <kingdom> (use latest for that kingdom).",
+    "Added: !refresh (admin-only manual restart).",
     "Removed: Scheduled Maintenance auto-refresh (was spamming).",
     "Fixed: Restart announcement spam (on_ready reconnect guard + DB cooldown).",
     "Fixed: Missing APView (AP buttons now work; !ap / !apfix no longer crash).",
@@ -324,6 +329,23 @@ def build_spy_embed(row):
     embed.set_footer(text=f"ID {row['id']} • Captured {row.get('created_at')}")
     return embed
 
+def build_calc_embed(target: str, dp: int, castles: int, used: str):
+    adj = ceil(dp * (1 + castle_bonus(castles)))
+    embed = discord.Embed(title="⚔️ Combat Calculator", color=0x5865F2)
+    embed.add_field(name="Target", value=f"{target} {used}", inline=False)
+    embed.add_field(name="Base DP", value=f"{dp:,}", inline=True)
+    embed.add_field(name="Adjusted DP", value=f"{adj:,}", inline=True)
+    embed.add_field(name="Castles", value=str(castles), inline=True)
+
+    for label, red in AP_REDUCTIONS:
+        rem = ceil(adj * (1 - red))
+        embed.add_field(
+            name=f"{label} (-{int(red*100)}%)",
+            value=f"DP: {rem:,}\nHC: {ceil(rem/HEAVY_CAVALRY_AP):,}",
+            inline=False
+        )
+    return embed
+
 def build_ap_embed(kingdom: str):
     with db_connect() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -497,13 +519,12 @@ async def on_ready():
         logging.error(f"DB init failed: {e}")
 
     # ---- FIX: stop restart announcement spam ----
-    # 1) If Discord reconnect triggers on_ready again in SAME process: do nothing.
     if ANNOUNCED_READY_THIS_PROCESS:
         logging.info("on_ready called again (same process) - announcement suppressed.")
         return
     ANNOUNCED_READY_THIS_PROCESS = True
 
-    # 2) If Render is restarting the process repeatedly: DB cooldown blocks repeated posts.
+    # DB cooldown blocks repeated posts across process restarts
     try:
         with db_connect() as conn, conn.cursor() as cur:
             last_ver = _meta_get(cur, "announce_last_ver")
@@ -519,7 +540,6 @@ async def on_ready():
             _meta_set(cur, "announce_last_ts", str(now_ts))
     except Exception as e:
         logging.error(f"Announcement dedupe DB write failed: {e}")
-    # --------------------------------------------
 
     patch_lines = "\n".join([f"• {x}" for x in PATCH_NOTES])
     for guild in bot.guilds:
@@ -574,49 +594,55 @@ async def on_message(msg: discord.Message):
 # ---------- Commands ----------
 @bot.command()
 async def calc(ctx, *, kingdom: str = None):
+    """
+    Behavior:
+      - !calc            -> prompts you to paste a spy report (default)
+      - !calc <kingdom>  -> uses latest saved report for that kingdom
+      - !calc db         -> uses latest saved report overall
+    """
     try:
-        if kingdom:
-            real = fuzzy_kingdom(kingdom) or kingdom
-            row = get_latest_spy_report_for_kingdom(real)
-        else:
-            row = get_latest_spy_report_any()
+        arg = (kingdom or "").strip()
 
-        if not row:
-            await ctx.send("📄 No report found. Paste one:")
-            try:
-                msg = await bot.wait_for(
-                    "message",
-                    timeout=60,
-                    check=lambda m: m.author == ctx.author and m.channel == ctx.channel
-                )
-            except asyncio.TimeoutError:
-                return await ctx.send("⏰ Timed out.")
-            k, dp, c = parse_spy(msg.content)
-            if not k or not dp:
-                return await ctx.send("❌ Parse error.")
-            target, used = k, "(pasted)"
-        else:
+        # Explicit DB modes
+        if arg.lower() in ("db", "last", "latest"):
+            row = get_latest_spy_report_any()
+            if not row:
+                return await ctx.send("❌ No saved spy reports in DB yet.")
             dp = int(row["defense_power"])
             c = int(row["castles"] or 0)
-            target = row["kingdom"]
+            target = row["kingdom"] or "Unknown"
             used = f"(from DB: {row['id']})"
+            return await ctx.send(embed=build_calc_embed(target, dp, c, used))
 
-        adj = ceil(dp * (1 + castle_bonus(c)))
-        embed = discord.Embed(title="⚔️ Combat Calculator", color=0x5865F2)
-        embed.add_field(name="Target", value=f"{target} {used}", inline=False)
-        embed.add_field(name="Base DP", value=f"{dp:,}", inline=True)
-        embed.add_field(name="Adjusted DP", value=f"{adj:,}", inline=True)
-        embed.add_field(name="Castles", value=str(c), inline=True)
+        if arg:
+            real = fuzzy_kingdom(arg) or arg
+            row = get_latest_spy_report_for_kingdom(real)
+            if not row:
+                return await ctx.send(f"❌ No saved reports for **{real}**. Paste a spy report and try again.")
+            dp = int(row["defense_power"])
+            c = int(row["castles"] or 0)
+            target = row["kingdom"] or real
+            used = f"(from DB: {row['id']})"
+            return await ctx.send(embed=build_calc_embed(target, dp, c, used))
 
-        for label, red in AP_REDUCTIONS:
-            rem = ceil(adj * (1 - red))
-            embed.add_field(
-                name=f"{label} (-{int(red*100)}%)",
-                value=f"DP: {rem:,}\nHC: {ceil(rem/HEAVY_CAVALRY_AP):,}",
-                inline=False
+        # Default: prompt for pasted SR every time
+        await ctx.send("📄 Paste the spy report you want to calculate against (you have 90 seconds).")
+        try:
+            msg = await bot.wait_for(
+                "message",
+                timeout=90,
+                check=lambda m: m.author == ctx.author and m.channel == ctx.channel
             )
+        except asyncio.TimeoutError:
+            return await ctx.send("⏰ Timed out. Run `!calc` again.")
 
-        await ctx.send(embed=embed)
+        k, dp, c = parse_spy(msg.content)
+        if not k or not dp:
+            return await ctx.send("❌ Could not parse that spy report. Make sure it includes Target + Defensive Power.")
+        target = k
+        used = "(pasted)"
+        await ctx.send(embed=build_calc_embed(target, int(dp), int(c or 0), used))
+
     except Exception as e:
         await ctx.send("⚠️ calc failed.")
         await send_error(ctx.guild, f"calc error: {e}")
@@ -809,6 +835,42 @@ async def techtop(ctx, *, tech_name: str):
     except Exception as e:
         await ctx.send("⚠️ techtop failed.")
         await send_error(ctx.guild, f"techtop error: {e}")
+
+def _is_admin(ctx: commands.Context) -> bool:
+    try:
+        if ctx.guild and ctx.author and getattr(ctx.author, "guild_permissions", None):
+            return bool(ctx.author.guild_permissions.administrator)
+    except Exception:
+        pass
+    return False
+
+@bot.command(name="refresh")
+async def refresh(ctx):
+    """Admin-only manual restart (Render will restart the service)."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+
+        try:
+            await ctx.send("🔄 Refreshing bot now… (manual restart)")
+        except Exception:
+            pass
+
+        if ctx.guild:
+            try:
+                ch = discord.utils.get(ctx.guild.text_channels, name=ERROR_CHANNEL_NAME)
+                if ch and can_send(ch, ctx.guild):
+                    await ch.send(f"🔄 Manual refresh requested by **{ctx.author.display_name}**")
+            except Exception:
+                pass
+
+        await asyncio.sleep(1.0)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    except Exception as e:
+        await ctx.send("⚠️ Refresh failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"refresh error: {e}")
 
 # ---------- START BOT ----------
 bot.run(TOKEN)
