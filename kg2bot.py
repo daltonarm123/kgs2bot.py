@@ -3,9 +3,9 @@
 # Tech capture/indexing (supports raw OR gz) • Per-kingdom deduped tech table + CSV export
 # FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
 # FIX: !calc prompts for paste by default, DB optional
-# FIX: tech parsing supports KG2 format: "lvl 5" / "lv 5" and backward-searching techpull
+# FIX: Tech parsing reads ONLY the tech section (prevents settlement/building/unit/stat pollution)
+# ADD: !techreset (admin-only) to clear deduped tech and rebuild
 # ADD: !refresh (admin-only) restart
-# ADD: !techexport creates CSV of each kingdom + all deduped research
 
 import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time, io
 from math import ceil
@@ -20,15 +20,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-01-20.9"
+BOT_VERSION = "2026-01-20.10"
 PATCH_NOTES = [
-    "Fixed: Tech parsing for KG2 format (lvl/lv/level).",
-    "Fixed: Reports save even if DP missing when tech lines exist.",
-    "Fixed: !techpull searches backwards through recent reports until tech is found.",
-    "Added: kingdom_tech table (deduped: best level per kingdom+tech).",
-    "Added: !techexport CSV (kingdom + tech list) for Excel/PowerBI.",
-    "Added: !refresh (admin-only manual restart).",
-    "Kept: Restart announcement dedupe + AP planner + spy history/ID + calc prompt.",
+    "Fixed: Tech parsing now reads ONLY 'technology information' section (no settlements/buildings/stats).",
+    "Fixed: Units like Heavy Cavalry excluded from research list.",
+    "Added: !techreset (admin-only) to clear polluted tech list and rebuild cleanly.",
+    "Kept: techpull searches backwards to find a report that contains tech.",
+    "Kept: deduped best-tech table + techexport CSV + refresh command.",
 ]
 # -------------------------------------------------
 
@@ -103,7 +101,7 @@ def init_db():
         );
         """)
 
-        # Raw tech lines per report (history)
+        # History: tech lines per report
         cur.execute("""
         CREATE TABLE IF NOT EXISTS tech_index (
             id SERIAL PRIMARY KEY,
@@ -116,7 +114,7 @@ def init_db():
         );
         """)
 
-        # NEW: deduped “best tech per kingdom”
+        # Deduped best tech per kingdom
         cur.execute("""
         CREATE TABLE IF NOT EXISTS kingdom_tech (
             kingdom TEXT NOT NULL,
@@ -128,7 +126,7 @@ def init_db():
         );
         """)
 
-        # meta table for restart announcement dedupe
+        # Restart announcement dedupe
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_meta (
             k TEXT PRIMARY KEY,
@@ -187,36 +185,84 @@ def parse_spy(text: str):
 
 def parse_tech(text: str):
     """
-    KG2 tech section uses:
-      "Improved Tools lvl 5"
-      "Something lv 12"
-    We support: lv / lvl / level / Lv / Lv.
+    Extract research ONLY from the explicit tech section:
+
+      The following technology information was also discovered:
+      Improved Tools lvl 5
+      ...
+
+    Prevents pollution from settlements/buildings/resources/units/etc.
     """
     techs = []
-    for line in text.splitlines():
-        s = line.strip()
-        if not s:
+    in_tech = False
+
+    # Hard blocklist (not research). You said Heavy Cavalry is a unit => exclude.
+    blocked_prefixes = (
+        # units / troop stats
+        "heavy cavalry", "light cavalry", "archers", "pikemen", "peasants", "knights",
+        "spies sent", "spies lost", "population", "elites",
+        # resources / misc stats
+        "horses", "blue gems", "green gems", "gold", "food", "wood", "stone", "land",
+        "networth", "honour", "ranking", "number of castles", "approximate defensive power",
+        # settlement/building lines
+        "current level", "buildings built", "housing", "barn", "granary", "stables", "inn", "mason",
+    )
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            # usually section ends at blank line
+            if in_tech:
+                break
             continue
 
-        s = s.lstrip("•-*—– ").strip()
+        ll = line.lower().strip()
 
-        # Name + lvl/lv/level + number
+        # Enter tech section
+        if "the following technology information was also discovered" in ll:
+            in_tech = True
+            continue
+
+        if not in_tech:
+            continue
+
+        # Stop when the report moves on to another major section
+        if any(x in ll for x in (
+            "the following recent market transactions",
+            "our spies also found the following information",
+            "the following information about the",
+        )):
+            break
+        # Also stop at a header-like line that ends with ":" (new section)
+        if ll.endswith(":") and "technology information" not in ll:
+            break
+
+        # Normalize bullets
+        s = line.lstrip("•-*—– ").strip()
+        s_ll = s.lower()
+
+        # Ignore obvious non-research items
+        if any(s_ll.startswith(p) for p in blocked_prefixes):
+            continue
+
+        # Match: "Tech Name lvl 5" / "lv 5" / "level 5"
         m = re.match(r"^(.+?)\s+(?:lv\.?|lvl\.?|level)\s*(\d{1,3})\s*$", s, re.IGNORECASE)
-        if m:
-            name = m.group(1).strip()
-            lvl = int(m.group(2))
-            if 1 <= lvl <= 300 and len(name) >= 3:
-                techs.append((name, lvl))
+        if not m:
             continue
 
-        # Name: 12  OR  Name - 12
-        m = re.match(r"^(.+?)\s*[:\-–—]\s*(\d{1,3})\s*$", s)
-        if m:
-            name = m.group(1).strip()
-            lvl = int(m.group(2))
-            if 1 <= lvl <= 300 and len(name) >= 3:
-                techs.append((name, lvl))
+        name = m.group(1).strip()
+        lvl = int(m.group(2))
+
+        if not (1 <= lvl <= 300):
             continue
+        if len(name) < 3:
+            continue
+
+        # Extra guard: avoid numeric-ish or weird headers
+        if name.lower().startswith(("target", "subject", "received")):
+            continue
+
+        techs.append((name, lvl))
 
     return techs
 
@@ -278,7 +324,6 @@ def fuzzy_kingdom(query: str):
     return match[0] if match else None
 
 def get_latest_spy_report_for_kingdom(kingdom: str):
-    """DP-valid report (used by AP sessions)"""
     if not kingdom:
         return None
     with db_connect() as conn, conn.cursor() as cur:
@@ -292,7 +337,6 @@ def get_latest_spy_report_for_kingdom(kingdom: str):
         return cur.fetchone()
 
 def get_latest_report_for_kingdom_any(kingdom: str):
-    """Any report (DP or not)"""
     if not kingdom:
         return None
     with db_connect() as conn, conn.cursor() as cur:
@@ -427,9 +471,6 @@ def build_ap_embed(kingdom: str):
 
 # ---------- Tech Indexing (dedupe) ----------
 def upsert_kingdom_tech(cur, kingdom: str, tech_name: str, level: int, report_id: int, captured_at):
-    """
-    Deduped: keep best (highest) level for kingdom+tech_name.
-    """
     if not kingdom or not tech_name or not level:
         return False
 
@@ -455,12 +496,6 @@ def upsert_kingdom_tech(cur, kingdom: str, tech_name: str, level: int, report_id
     return False
 
 def index_tech_from_report_row(cur, row) -> tuple[int, int]:
-    """
-    Index tech from a report:
-      - tech_index (history): ON CONFLICT DO NOTHING
-      - kingdom_tech (dedupe): keep max level per tech
-    Returns: (history_count, dedupe_updates)
-    """
     text = extract_report_text_for_row(row)
     if not text:
         return (0, 0)
@@ -589,7 +624,7 @@ class APView(View):
                 async with ap_lock:
                     ok = rebuild_ap_session(self.kingdom)
                 if not ok:
-                    await interaction.followup.send("❌ Could not rebuild (no valid spy report found).")
+                    await interaction.followup.send("❌ Could not rebuild (no valid DP spy report found).")
                     return
                 embed = build_ap_embed(self.kingdom)
                 if embed:
@@ -630,13 +665,11 @@ async def on_ready():
     except Exception as e:
         logging.error(f"DB init failed: {e}")
 
-    # suppress reconnect spam in same process
     if ANNOUNCED_READY_THIS_PROCESS:
         logging.info("on_ready called again (same process) - announcement suppressed.")
         return
     ANNOUNCED_READY_THIS_PROCESS = True
 
-    # suppress rapid restarts via DB cooldown
     try:
         with db_connect() as conn, conn.cursor() as cur:
             last_ver = _meta_get(cur, "announce_last_ver")
@@ -675,9 +708,9 @@ async def on_message(msg: discord.Message):
         kingdom, dp, castles = parse_spy(msg.content)
         techs = parse_tech(msg.content)
 
-        # Save if we have a target AND either:
-        # - DP looks valid, OR
-        # - tech lines exist (even if DP missing)
+        # Save if target exists AND either:
+        # - DP exists (normal report) OR
+        # - tech section exists (even if DP missing)
         should_save = bool(kingdom) and (
             (dp is not None and dp >= 1000) or
             (techs and len(techs) >= 1)
@@ -701,7 +734,6 @@ async def on_message(msg: discord.Message):
                     """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
                     row = cur.fetchone()
 
-                    # auto AP session only if DP exists
                     if dp is not None and dp >= 1000:
                         ensure_ap_session(kingdom)
 
@@ -719,10 +751,9 @@ async def on_message(msg: discord.Message):
 @bot.command()
 async def calc(ctx, *, kingdom: str = None):
     """
-    Behavior:
-      - !calc            -> prompts you to paste a spy report (default)
-      - !calc <kingdom>  -> uses latest saved report for that kingdom (DP report)
-      - !calc db         -> uses latest saved report overall (DP report)
+    - !calc            -> prompts paste (default)
+    - !calc <kingdom>  -> uses latest DP report for that kingdom (DB)
+    - !calc db         -> uses latest DP report overall (DB)
     """
     try:
         arg = (kingdom or "").strip()
@@ -730,7 +761,7 @@ async def calc(ctx, *, kingdom: str = None):
         if arg.lower() in ("db", "last", "latest"):
             row = get_latest_spy_report_any()
             if not row:
-                return await ctx.send("❌ No saved spy reports in DB yet.")
+                return await ctx.send("❌ No saved DP spy reports in DB yet.")
             dp = int(row["defense_power"])
             c = int(row["castles"] or 0)
             target = row["kingdom"] or "Unknown"
@@ -741,7 +772,7 @@ async def calc(ctx, *, kingdom: str = None):
             real = fuzzy_kingdom(arg) or arg
             row = get_latest_spy_report_for_kingdom(real)
             if not row:
-                return await ctx.send(f"❌ No saved DP reports for **{real}**. Paste a spy report and try again.")
+                return await ctx.send(f"❌ No saved DP reports for **{real}**. Paste a full spy report and try again.")
             dp = int(row["defense_power"])
             c = int(row["castles"] or 0)
             target = row["kingdom"] or real
@@ -838,19 +869,6 @@ async def ap(ctx, *, kingdom: str):
         await send_error(ctx.guild, f"ap error: {e}")
 
 @bot.command()
-async def apstatus(ctx, *, kingdom: str):
-    try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        emb = build_ap_embed(real)
-        if emb:
-            await ctx.send(embed=emb)
-        else:
-            await ctx.send("❌ No active session.")
-    except Exception as e:
-        await ctx.send("⚠️ apstatus failed.")
-        await send_error(ctx.guild, f"apstatus error: {e}")
-
-@bot.command()
 async def apfix(ctx, *, kingdom: str):
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
@@ -867,13 +885,10 @@ async def apfix(ctx, *, kingdom: str):
 
 @bot.command()
 async def techpull(ctx, *, kingdom: str):
-    """
-    Index tech from the most recent report that actually CONTAINS tech lines.
-    Searches backwards through up to 25 recent reports.
-    """
+    """Index tech from the most recent report that actually CONTAINS a tech section."""
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
-        reports = get_recent_reports_for_kingdom(real, limit=25)
+        reports = get_recent_reports_for_kingdom(real, limit=30)
         if not reports:
             return await ctx.send(f"❌ No reports found for **{real}**.")
 
@@ -889,15 +904,17 @@ async def techpull(ctx, *, kingdom: str):
                 break
 
         if not chosen:
-            return await ctx.send(f"⚠️ No tech lines detected in the last {len(reports)} saved reports for **{real}**.\n"
-                                  f"Tip: paste a fresh full spy report that includes the tech section, then run `!techpull {real}` again.")
+            return await ctx.send(
+                f"⚠️ No tech section detected in the last {len(reports)} saved reports for **{real}**.\n"
+                f"Tip: paste a full spy report that includes the tech section, then run `!techpull {real}` again."
+            )
 
         with db_connect() as conn, conn.cursor() as cur:
             hist_count, dedupe_updates = index_tech_from_report_row(cur, chosen)
 
         await ctx.send(
             f"✅ Tech pulled for **{real}** from report `#{chosen['id']}`.\n"
-            f"• Parsed tech lines: **{len(chosen_techs)}**\n"
+            f"• Parsed research lines: **{len(chosen_techs)}**\n"
             f"• Added to history: **{hist_count}**\n"
             f"• Updated best-tech list: **{dedupe_updates}**"
         )
@@ -908,11 +925,7 @@ async def techpull(ctx, *, kingdom: str):
 
 @bot.command()
 async def techindex(ctx):
-    """
-    Index tech for ALL saved reports into:
-      - tech_index (history)
-      - kingdom_tech (deduped best tech per kingdom)
-    """
+    """Index tech for ALL saved reports into history + deduped best-tech list."""
     try:
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id, kingdom, raw, raw_gz, created_at FROM spy_reports WHERE kingdom IS NOT NULL;")
@@ -944,7 +957,7 @@ async def techindex(ctx):
 
 @bot.command()
 async def tech(ctx, *, kingdom: str):
-    """Show top 15 tech entries (highest levels) for a kingdom from deduped best-tech list."""
+    """Show top 15 deduped research entries for a kingdom."""
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
         with db_connect() as conn, conn.cursor() as cur:
@@ -958,52 +971,17 @@ async def tech(ctx, *, kingdom: str):
             rows = cur.fetchall()
 
         if not rows:
-            return await ctx.send(f"❌ No tech found for **{real}**.\nRun `!techpull {real}` or `!techindex` first.")
+            return await ctx.send(f"❌ No research found for **{real}**.\nRun `!techpull {real}` or `!techindex` first.")
 
         txt = "\n".join([f"• {r['tech_name']}: lvl {int(r['best_level'] or 0)}" for r in rows])
-        await ctx.send(f"🧪 **Tech (Best Known): {real}**\n{txt}")
+        await ctx.send(f"🧪 **Research (Best Known): {real}**\n{txt}")
     except Exception as e:
         await ctx.send("⚠️ tech failed.")
         await send_error(ctx.guild, f"tech error: {e}")
 
 @bot.command()
-async def techtop(ctx, *, tech_name: str):
-    """Leaderboard for a tech across kingdoms (uses deduped best-tech list)."""
-    try:
-        q = tech_name.strip()
-        if not q:
-            return await ctx.send("❌ Provide a tech name. Example: `!techtop Heavy Cavalry`")
-
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT kingdom, best_level
-                FROM kingdom_tech
-                WHERE tech_name ILIKE %s
-                ORDER BY best_level DESC, kingdom ASC
-                LIMIT 10;
-            """, (f"%{q}%",))
-            rows = cur.fetchall()
-
-        if not rows:
-            return await ctx.send(f"❌ No matches found for tech: **{q}**.\nIndex first with `!techindex` or `!techpull <kingdom>`.")
-
-        lines = []
-        for i, r in enumerate(rows, start=1):
-            kingdom = r.get("kingdom") or "Unknown"
-            lvl = int(r.get("best_level") or 0)
-            lines.append(f"`#{i}` **{kingdom}** — lvl **{lvl}**")
-
-        await ctx.send("🏆 **Top Kingdoms for:** `{}`\n{}".format(q, "\n".join(lines)))
-    except Exception as e:
-        await ctx.send("⚠️ techtop failed.")
-        await send_error(ctx.guild, f"techtop error: {e}")
-
-@bot.command()
 async def techexport(ctx):
-    """
-    Export deduped tech list for all kingdoms as a CSV file for Excel/Power BI.
-    Columns: kingdom, tech_name, best_level, updated_at, source_report_id
-    """
+    """Export deduped research list for all kingdoms as CSV."""
     try:
         with db_connect() as conn, conn.cursor() as cur:
             cur.execute("""
@@ -1014,28 +992,25 @@ async def techexport(ctx):
             rows = cur.fetchall()
 
         if not rows:
-            return await ctx.send("❌ No tech data to export yet. Run `!techindex` first.")
+            return await ctx.send("❌ No research data to export yet. Run `!techindex` first.")
 
         out = io.StringIO()
         out.write("kingdom,tech_name,best_level,updated_at,source_report_id\n")
         for r in rows:
-            # Simple CSV escaping for commas/quotes
             kingdom = (r.get("kingdom") or "").replace('"', '""')
             tech_name = (r.get("tech_name") or "").replace('"', '""')
             best_level = int(r.get("best_level") or 0)
             updated_at = r.get("updated_at")
             updated_at_s = updated_at.isoformat() if updated_at else ""
             source_id = r.get("source_report_id") or ""
-
             out.write(f"\"{kingdom}\",\"{tech_name}\",{best_level},\"{updated_at_s}\",{source_id}\n")
 
         data = out.getvalue().encode("utf-8")
         out.close()
 
-        filename = f"kg2_tech_export_{BOT_VERSION}.csv"
+        filename = f"kg2_research_export_{BOT_VERSION}.csv"
         file = discord.File(fp=io.BytesIO(data), filename=filename)
-
-        await ctx.send("📎 Here’s the current deduped tech export (best known per kingdom):", file=file)
+        await ctx.send("📎 Research export (best known per kingdom):", file=file)
 
     except Exception as e:
         await ctx.send("⚠️ techexport failed.")
@@ -1048,6 +1023,30 @@ def _is_admin(ctx: commands.Context) -> bool:
     except Exception:
         pass
     return False
+
+@bot.command()
+async def techreset(ctx, *, kingdom: str = None):
+    """
+    Admin-only: clears deduped research list (kingdom_tech) so you can rebuild cleanly.
+      - !techreset         -> clears ALL kingdoms
+      - !techreset beef    -> clears just Beef
+    After running, do: !techindex  (or !techpull <kingdom>)
+    """
+    if not _is_admin(ctx):
+        return await ctx.send("❌ Admin only.")
+
+    try:
+        with db_connect() as conn, conn.cursor() as cur:
+            if kingdom:
+                real = fuzzy_kingdom(kingdom) or kingdom
+                cur.execute("DELETE FROM kingdom_tech WHERE kingdom=%s;", (real,))
+                await ctx.send(f"✅ Cleared research list for **{real}**. Now run `!techpull {real}` or `!techindex`.")
+            else:
+                cur.execute("DELETE FROM kingdom_tech;")
+                await ctx.send("✅ Cleared research list for **ALL kingdoms**. Now run `!techindex`.")
+    except Exception as e:
+        await ctx.send("⚠️ techreset failed.")
+        await send_error(ctx.guild, f"techreset error: {e}")
 
 @bot.command(name="refresh")
 async def refresh(ctx):
