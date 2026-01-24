@@ -4,6 +4,7 @@
 # FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
 # FIX: !calc prompts for paste by default, DB optional
 # FIX: Tech parsing reads ONLY the tech section (prevents settlement/building/unit/stat pollution)
+# FIX: Tech auto-indexes immediately on paste (and repairs on duplicate)
 # ADD: !techreset (admin-only) to clear deduped tech and rebuild
 # ADD: !refresh (admin-only) restart
 
@@ -20,10 +21,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-01-20.10"
+BOT_VERSION = "2026-01-20.11"
 PATCH_NOTES = [
     "Fixed: Tech parsing now reads ONLY 'technology information' section (no settlements/buildings/stats).",
     "Fixed: Units like Heavy Cavalry excluded from research list.",
+    "Fixed: Tech now auto-indexes immediately when spy reports are pasted (and repairs on duplicate).",
     "Added: !techreset (admin-only) to clear polluted tech list and rebuild cleanly.",
     "Kept: techpull searches backwards to find a report that contains tech.",
     "Kept: deduped best-tech table + techexport CSV + refresh command.",
@@ -523,6 +525,28 @@ def index_tech_from_report_row(cur, row) -> tuple[int, int]:
 
     return (history_count, dedupe_updates)
 
+# ✅ NEW: index tech from already-parsed tech list (used on paste + duplicates)
+def index_tech_from_parsed(cur, kingdom: str, report_id: int, captured_at, techs: list[tuple[str, int]]) -> tuple[int, int]:
+    if not kingdom or not report_id or not techs:
+        return (0, 0)
+
+    history_count = 0
+    dedupe_updates = 0
+    captured_at = captured_at or now_utc()
+
+    for name, lvl in techs:
+        cur.execute("""
+            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING;
+        """, (kingdom, name, lvl, captured_at, report_id))
+        history_count += 1
+
+        if upsert_kingdom_tech(cur, kingdom, name, lvl, report_id, captured_at):
+            dedupe_updates += 1
+
+    return (history_count, dedupe_updates)
+
 # ---------- AP View ----------
 class APView(View):
     def __init__(self, kingdom: str, timeout: float = 600):
@@ -734,12 +758,20 @@ async def on_message(msg: discord.Message):
                     """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
                     row = cur.fetchone()
 
+                    # ✅ TECH AUTO-INDEX ON PASTE (NEW)
+                    if techs:
+                        index_tech_from_parsed(cur, kingdom, row["id"], row.get("created_at") or ts, techs)
+
                     if dp is not None and dp >= 1000:
                         ensure_ap_session(kingdom)
 
                     if can_send(msg.channel, msg.guild):
                         await msg.channel.send(embed=build_spy_embed(row))
                 else:
+                    # ✅ DUPLICATE “REPAIR MODE” (NEW)
+                    if techs:
+                        index_tech_from_parsed(cur, kingdom, exists["id"], ts, techs)
+
                     if can_send(msg.channel, msg.guild):
                         await msg.channel.send("✅ Duplicate spy report detected.")
     except Exception as e:
