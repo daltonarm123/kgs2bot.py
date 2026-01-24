@@ -5,6 +5,9 @@
 # FIX: !calc prompts for paste by default, DB optional
 # FIX: Tech parsing reads ONLY the tech section (prevents settlement/building/unit/stat pollution)
 # FIX: Tech auto-indexes immediately on paste (and repairs on duplicate)
+# ADD: SR troop snapshots (home troops)
+# ADD: !troops (latest troop snapshot)
+# ADD: !troopdelta (loss/gain estimator between last two SRs)
 # ADD: !techreset (admin-only) to clear deduped tech and rebuild
 # ADD: !refresh (admin-only) restart
 
@@ -21,14 +24,15 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-01-20.11"
+BOT_VERSION = "2026-01-24.1"
 PATCH_NOTES = [
-    "Fixed: Tech parsing now reads ONLY 'technology information' section (no settlements/buildings/stats).",
+    "Fixed: Tech parsing reads ONLY 'technology information' section (no settlements/buildings/stats).",
     "Fixed: Units like Heavy Cavalry excluded from research list.",
-    "Fixed: Tech now auto-indexes immediately when spy reports are pasted (and repairs on duplicate).",
+    "Fixed: Tech auto-indexes immediately on paste (and repairs on duplicate).",
+    "Added: SR troop snapshots (captures ALL home troops).",
+    "Added: !troops (latest SR troop snapshot).",
+    "Added: !troopdelta (est. troop losses/gains between last two SRs).",
     "Added: !techreset (admin-only) to clear polluted tech list and rebuild cleanly.",
-    "Kept: techpull searches backwards to find a report that contains tech.",
-    "Kept: deduped best-tech table + techexport CSV + refresh command.",
 ]
 # -------------------------------------------------
 
@@ -128,6 +132,19 @@ def init_db():
         );
         """)
 
+        # NEW: troop snapshots per SR (home troops)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS troop_snapshots (
+            id SERIAL PRIMARY KEY,
+            kingdom TEXT NOT NULL,
+            report_id INTEGER REFERENCES spy_reports(id),
+            captured_at TIMESTAMPTZ NOT NULL,
+            unit_name TEXT NOT NULL,
+            unit_count INTEGER NOT NULL,
+            UNIQUE(report_id, unit_name)
+        );
+        """)
+
         # Restart announcement dedupe
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_meta (
@@ -153,7 +170,7 @@ def init_db():
 
 def heal_sequences():
     with db_connect() as conn, conn.cursor() as cur:
-        for table in ["spy_reports", "dp_sessions", "tech_index"]:
+        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots"]:
             cur.execute(
                 f"SELECT setval(pg_get_serial_sequence('{table}','id'), "
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
@@ -185,6 +202,71 @@ def parse_spy(text: str):
                 castles = int(m.group())
     return kingdom, dp, castles
 
+def parse_sr_troops(text: str) -> dict:
+    """
+    Extract ALL home troop counts from SR:
+
+    Our spies also found the following information about the kingdom's troops:
+    Pikemen: 55131
+    Elites: 226
+    ...
+    Approximate defensive power*: 369522
+
+    Returns {unit_name: count}
+    """
+    troops = {}
+    in_troops = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if in_troops:
+                # often ends here, but not always; we'll keep scanning until we hit DP or next section
+                continue
+            continue
+
+        ll = line.lower()
+
+        if "our spies also found the following information about the kingdom's troops" in ll:
+            in_troops = True
+            continue
+
+        if not in_troops:
+            continue
+
+        # Stop conditions
+        if "approximate defensive power" in ll:
+            break
+        if any(x in ll for x in (
+            "the following recent market transactions",
+            "the following technology information",
+            "our spies also found the following information about the kingdom's resources",
+            "the following information was found regarding troop movements",
+        )):
+            break
+
+        # Example: "Pikemen: 55131"
+        m = re.match(r"^(.+?):\s*([\d,]+)\s*$", line)
+        if not m:
+            continue
+
+        name = m.group(1).strip()
+        val = int(m.group(2).replace(",", ""))
+
+        # ignore population lines (not a unit)
+        if name.lower().startswith("population"):
+            continue
+
+        # simple sanity checks
+        if len(name) < 2:
+            continue
+        if val < 0:
+            continue
+
+        troops[name] = val
+
+    return troops
+
 def parse_tech(text: str):
     """
     Extract research ONLY from the explicit tech section:
@@ -198,7 +280,6 @@ def parse_tech(text: str):
     techs = []
     in_tech = False
 
-    # Hard blocklist (not research). You said Heavy Cavalry is a unit => exclude.
     blocked_prefixes = (
         # units / troop stats
         "heavy cavalry", "light cavalry", "archers", "pikemen", "peasants", "knights",
@@ -213,14 +294,12 @@ def parse_tech(text: str):
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
-            # usually section ends at blank line
             if in_tech:
                 break
             continue
 
         ll = line.lower().strip()
 
-        # Enter tech section
         if "the following technology information was also discovered" in ll:
             in_tech = True
             continue
@@ -228,26 +307,22 @@ def parse_tech(text: str):
         if not in_tech:
             continue
 
-        # Stop when the report moves on to another major section
         if any(x in ll for x in (
             "the following recent market transactions",
             "our spies also found the following information",
             "the following information about the",
         )):
             break
-        # Also stop at a header-like line that ends with ":" (new section)
+
         if ll.endswith(":") and "technology information" not in ll:
             break
 
-        # Normalize bullets
         s = line.lstrip("•-*—– ").strip()
         s_ll = s.lower()
 
-        # Ignore obvious non-research items
         if any(s_ll.startswith(p) for p in blocked_prefixes):
             continue
 
-        # Match: "Tech Name lvl 5" / "lv 5" / "level 5"
         m = re.match(r"^(.+?)\s+(?:lv\.?|lvl\.?|level)\s*(\d{1,3})\s*$", s, re.IGNORECASE)
         if not m:
             continue
@@ -259,8 +334,6 @@ def parse_tech(text: str):
             continue
         if len(name) < 3:
             continue
-
-        # Extra guard: avoid numeric-ish or weird headers
         if name.lower().startswith(("target", "subject", "received")):
             continue
 
@@ -497,36 +570,7 @@ def upsert_kingdom_tech(cur, kingdom: str, tech_name: str, level: int, report_id
 
     return False
 
-def index_tech_from_report_row(cur, row) -> tuple[int, int]:
-    text = extract_report_text_for_row(row)
-    if not text:
-        return (0, 0)
-
-    techs = parse_tech(text)
-    if not techs:
-        return (0, 0)
-
-    history_count = 0
-    dedupe_updates = 0
-    captured_at = row.get("created_at") or now_utc()
-    kingdom = row.get("kingdom")
-    report_id = row.get("id")
-
-    for name, lvl in techs:
-        cur.execute("""
-            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING;
-        """, (kingdom, name, lvl, captured_at, report_id))
-        history_count += 1
-
-        if upsert_kingdom_tech(cur, kingdom, name, lvl, report_id, captured_at):
-            dedupe_updates += 1
-
-    return (history_count, dedupe_updates)
-
-# ✅ NEW: index tech from already-parsed tech list (used on paste + duplicates)
-def index_tech_from_parsed(cur, kingdom: str, report_id: int, captured_at, techs: list[tuple[str, int]]) -> tuple[int, int]:
+def index_tech_from_parsed(cur, kingdom: str, report_id: int, captured_at, techs):
     if not kingdom or not report_id or not techs:
         return (0, 0)
 
@@ -546,6 +590,85 @@ def index_tech_from_parsed(cur, kingdom: str, report_id: int, captured_at, techs
             dedupe_updates += 1
 
     return (history_count, dedupe_updates)
+
+# ---------- Troop Snapshot (SR) ----------
+def upsert_troop_snapshot(cur, kingdom: str, report_id: int, captured_at, troops: dict):
+    """
+    Save ALL SR troop counts as snapshot rows.
+    """
+    if not kingdom or not report_id or not troops:
+        return 0
+
+    captured_at = captured_at or now_utc()
+    inserted = 0
+
+    for unit_name, unit_count in troops.items():
+        cur.execute("""
+            INSERT INTO troop_snapshots (kingdom, report_id, captured_at, unit_name, unit_count)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (report_id, unit_name) DO NOTHING;
+        """, (kingdom, report_id, captured_at, unit_name, int(unit_count)))
+        inserted += 1
+
+    return inserted
+
+def get_latest_troop_snapshot_units(kingdom: str):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT report_id, captured_at
+            FROM troop_snapshots
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC, report_id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        head = cur.fetchone()
+        if not head:
+            return None, None, {}
+
+        report_id = int(head["report_id"])
+        captured_at = head["captured_at"]
+
+        cur.execute("""
+            SELECT unit_name, unit_count
+            FROM troop_snapshots
+            WHERE kingdom=%s AND report_id=%s
+            ORDER BY unit_name ASC;
+        """, (kingdom, report_id))
+        rows = cur.fetchall()
+
+    troops = {r["unit_name"]: int(r["unit_count"]) for r in rows}
+    return report_id, captured_at, troops
+
+def get_last_two_troop_snapshots(kingdom: str):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT report_id, captured_at
+            FROM troop_snapshots
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC, report_id DESC
+            LIMIT 2;
+        """, (kingdom,))
+        heads = cur.fetchall()
+
+        if not heads or len(heads) < 2:
+            return None
+
+        newest = heads[0]
+        prev = heads[1]
+
+        def load(report_id: int):
+            cur.execute("""
+                SELECT unit_name, unit_count
+                FROM troop_snapshots
+                WHERE kingdom=%s AND report_id=%s;
+            """, (kingdom, report_id))
+            rows = cur.fetchall()
+            return {r["unit_name"]: int(r["unit_count"]) for r in rows}
+
+        return {
+            "new": {"report_id": int(newest["report_id"]), "captured_at": newest["captured_at"], "troops": load(int(newest["report_id"]))},
+            "old": {"report_id": int(prev["report_id"]), "captured_at": prev["captured_at"], "troops": load(int(prev["report_id"]))},
+        }
 
 # ---------- AP View ----------
 class APView(View):
@@ -732,12 +855,17 @@ async def on_message(msg: discord.Message):
         kingdom, dp, castles = parse_spy(msg.content)
         techs = parse_tech(msg.content)
 
+        # NEW: troop snapshot from SR
+        sr_troops = parse_sr_troops(msg.content)
+
         # Save if target exists AND either:
         # - DP exists (normal report) OR
         # - tech section exists (even if DP missing)
+        # - troops section exists (home troops snapshot)
         should_save = bool(kingdom) and (
             (dp is not None and dp >= 1000) or
-            (techs and len(techs) >= 1)
+            (techs and len(techs) >= 1) or
+            (sr_troops and len(sr_troops) >= 1)
         )
 
         if should_save:
@@ -758,9 +886,13 @@ async def on_message(msg: discord.Message):
                     """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
                     row = cur.fetchone()
 
-                    # ✅ TECH AUTO-INDEX ON PASTE (NEW)
+                    # ✅ TECH AUTO-INDEX ON PASTE
                     if techs:
                         index_tech_from_parsed(cur, kingdom, row["id"], row.get("created_at") or ts, techs)
+
+                    # ✅ TROOP SNAPSHOT ON PASTE
+                    if sr_troops:
+                        upsert_troop_snapshot(cur, kingdom, row["id"], row.get("created_at") or ts, sr_troops)
 
                     if dp is not None and dp >= 1000:
                         ensure_ap_session(kingdom)
@@ -768,9 +900,11 @@ async def on_message(msg: discord.Message):
                     if can_send(msg.channel, msg.guild):
                         await msg.channel.send(embed=build_spy_embed(row))
                 else:
-                    # ✅ DUPLICATE “REPAIR MODE” (NEW)
+                    # ✅ DUPLICATE “REPAIR MODE”
                     if techs:
                         index_tech_from_parsed(cur, kingdom, exists["id"], ts, techs)
+                    if sr_troops:
+                        upsert_troop_snapshot(cur, kingdom, exists["id"], ts, sr_troops)
 
                     if can_send(msg.channel, msg.guild):
                         await msg.channel.send("✅ Duplicate spy report detected.")
@@ -831,61 +965,6 @@ async def calc(ctx, *, kingdom: str = None):
         await send_error(ctx.guild, f"calc error: {e}")
 
 @bot.command()
-async def spy(ctx, *, kingdom: str):
-    try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        row = get_latest_report_for_kingdom_any(real)
-        if not row:
-            return await ctx.send(f"❌ No reports for **{real}**.")
-        await ctx.send(embed=build_spy_embed(row))
-    except Exception as e:
-        await ctx.send("⚠️ spy failed.")
-        await send_error(ctx.guild, f"spy error: {e}")
-
-@bot.command()
-async def spyid(ctx, report_id: int):
-    try:
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz FROM spy_reports WHERE id=%s;", (report_id,))
-            row = cur.fetchone()
-        if not row:
-            return await ctx.send(f"❌ ID {report_id} not found.")
-        await ctx.send(embed=build_spy_embed(row))
-    except Exception as e:
-        await ctx.send("⚠️ spyid failed.")
-        await send_error(ctx.guild, f"spyid error: {e}")
-
-@bot.command()
-async def spyhistory(ctx, *, kingdom: str):
-    try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, defense_power, created_at
-                FROM spy_reports
-                WHERE kingdom=%s
-                ORDER BY created_at DESC NULLS LAST, id DESC
-                LIMIT 5;
-            """, (real,))
-            rows = cur.fetchall()
-
-        if not rows:
-            return await ctx.send(f"❌ No history for **{real}**.")
-
-        lines = []
-        for r in rows:
-            dp = r.get("defense_power")
-            dp_s = f"{int(dp):,} DP" if dp else "DP N/A"
-            dt = r.get("created_at")
-            dts = dt.strftime("%Y-%m-%d") if dt else "unknown-date"
-            lines.append(f"`#{r['id']}`: {dp_s} ({dts})")
-
-        await ctx.send(f"📂 **History for {real}**:\n" + "\n".join(lines))
-    except Exception as e:
-        await ctx.send("⚠️ spyhistory failed.")
-        await send_error(ctx.guild, f"spyhistory error: {e}")
-
-@bot.command()
 async def ap(ctx, *, kingdom: str):
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
@@ -916,137 +995,86 @@ async def apfix(ctx, *, kingdom: str):
         await send_error(ctx.guild, f"apfix error: {e}")
 
 @bot.command()
-async def techpull(ctx, *, kingdom: str):
-    """Index tech from the most recent report that actually CONTAINS a tech section."""
+async def troops(ctx, *, kingdom: str):
+    """Show latest SR troop snapshot (home troops) for a kingdom."""
     try:
         real = fuzzy_kingdom(kingdom) or kingdom
-        reports = get_recent_reports_for_kingdom(real, limit=30)
-        if not reports:
-            return await ctx.send(f"❌ No reports found for **{real}**.")
+        report_id, captured_at, troops = get_latest_troop_snapshot_units(real)
+        if not report_id:
+            return await ctx.send(f"❌ No troop snapshots saved for **{real}** yet. Paste an SR first.")
 
-        chosen = None
-        chosen_techs = None
+        # show top units by count
+        items = sorted(troops.items(), key=lambda x: x[1], reverse=True)
+        lines = [f"• {name}: {cnt:,}" for name, cnt in items[:25]]
+        more = len(items) - len(lines)
+        if more > 0:
+            lines.append(f"… +{more} more")
 
-        for r in reports:
-            text = extract_report_text_for_row(r)
-            techs = parse_tech(text)
-            if techs:
-                chosen = r
-                chosen_techs = techs
-                break
+        await ctx.send(
+            f"🏰 **Troops (Home) • {real}**\n"
+            f"From SR `#{report_id}` • {captured_at}\n" +
+            "\n".join(lines)
+        )
+    except Exception as e:
+        await ctx.send("⚠️ troops failed.")
+        await send_error(ctx.guild, f"troops error: {e}")
 
-        if not chosen:
+@bot.command()
+async def troopdelta(ctx, *, kingdom: str):
+    """
+    Estimate troop losses/gains between the last two SR snapshots for a kingdom.
+    This is your "troop lost after a hit" estimator (SR-before vs SR-after).
+    """
+    try:
+        real = fuzzy_kingdom(kingdom) or kingdom
+        pair = get_last_two_troop_snapshots(real)
+        if not pair:
+            return await ctx.send(f"❌ Need at least **2** SR troop snapshots for **{real}**. Paste two SRs first.")
+
+        new = pair["new"]
+        old = pair["old"]
+
+        new_t = new["troops"]
+        old_t = old["troops"]
+
+        units = sorted(set(new_t.keys()) | set(old_t.keys()))
+        deltas = []
+        for u in units:
+            a = int(old_t.get(u, 0))
+            b = int(new_t.get(u, 0))
+            d = b - a
+            if d != 0:
+                deltas.append((u, d))
+
+        if not deltas:
             return await ctx.send(
-                f"⚠️ No tech section detected in the last {len(reports)} saved reports for **{real}**.\n"
-                f"Tip: paste a full spy report that includes the tech section, then run `!techpull {real}` again."
+                f"✅ **No troop count changes detected** for **{real}** between SR `#{old['report_id']}` and `#{new['report_id']}`."
             )
 
-        with db_connect() as conn, conn.cursor() as cur:
-            hist_count, dedupe_updates = index_tech_from_report_row(cur, chosen)
+        # Losses first (negative), then gains
+        losses = sorted([x for x in deltas if x[1] < 0], key=lambda x: x[1])  # most negative first
+        gains = sorted([x for x in deltas if x[1] > 0], key=lambda x: x[1], reverse=True)
+
+        lines = []
+        if losses:
+            lines.append("📉 **Estimated Losses (SR diff)**")
+            for u, d in losses[:20]:
+                lines.append(f"• {u}: {-d:,}")
+        if gains:
+            lines.append("\n📈 **Estimated Gains (trained/returned/etc.)**")
+            for u, d in gains[:20]:
+                lines.append(f"• {u}: {d:,}")
 
         await ctx.send(
-            f"✅ Tech pulled for **{real}** from report `#{chosen['id']}`.\n"
-            f"• Parsed research lines: **{len(chosen_techs)}**\n"
-            f"• Added to history: **{hist_count}**\n"
-            f"• Updated best-tech list: **{dedupe_updates}**"
+            f"🧮 **Troop Delta • {real}**\n"
+            f"Old SR `#{old['report_id']}` • {old['captured_at']}\n"
+            f"New SR `#{new['report_id']}` • {new['captured_at']}\n\n" +
+            "\n".join(lines)
         )
 
     except Exception as e:
-        await ctx.send("⚠️ techpull failed.")
-        await send_error(ctx.guild, f"techpull error: {e}")
-
-@bot.command()
-async def techindex(ctx):
-    """Index tech for ALL saved reports into history + deduped best-tech list."""
-    try:
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id, kingdom, raw, raw_gz, created_at FROM spy_reports WHERE kingdom IS NOT NULL;")
-            reports = cur.fetchall()
-
-            total_hist = 0
-            total_updates = 0
-            scanned = 0
-            reports_with_tech = 0
-
-            for r in reports:
-                scanned += 1
-                hist_count, dedupe_updates = index_tech_from_report_row(cur, r)
-                if hist_count > 0:
-                    reports_with_tech += 1
-                total_hist += hist_count
-                total_updates += dedupe_updates
-
-        await ctx.send(
-            f"✅ Tech index complete.\n"
-            f"• Reports scanned: **{scanned}**\n"
-            f"• Reports with tech: **{reports_with_tech}**\n"
-            f"• Added to history: **{total_hist}**\n"
-            f"• Updated best-tech list: **{total_updates}**"
-        )
-    except Exception as e:
-        await ctx.send("⚠️ techindex failed.")
-        await send_error(ctx.guild, f"techindex error: {e}")
-
-@bot.command()
-async def tech(ctx, *, kingdom: str):
-    """Show top 15 deduped research entries for a kingdom."""
-    try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT tech_name, best_level
-                FROM kingdom_tech
-                WHERE kingdom=%s
-                ORDER BY best_level DESC, tech_name ASC
-                LIMIT 15;
-            """, (real,))
-            rows = cur.fetchall()
-
-        if not rows:
-            return await ctx.send(f"❌ No research found for **{real}**.\nRun `!techpull {real}` or `!techindex` first.")
-
-        txt = "\n".join([f"• {r['tech_name']}: lvl {int(r['best_level'] or 0)}" for r in rows])
-        await ctx.send(f"🧪 **Research (Best Known): {real}**\n{txt}")
-    except Exception as e:
-        await ctx.send("⚠️ tech failed.")
-        await send_error(ctx.guild, f"tech error: {e}")
-
-@bot.command()
-async def techexport(ctx):
-    """Export deduped research list for all kingdoms as CSV."""
-    try:
-        with db_connect() as conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT kingdom, tech_name, best_level, updated_at, source_report_id
-                FROM kingdom_tech
-                ORDER BY kingdom ASC, tech_name ASC;
-            """)
-            rows = cur.fetchall()
-
-        if not rows:
-            return await ctx.send("❌ No research data to export yet. Run `!techindex` first.")
-
-        out = io.StringIO()
-        out.write("kingdom,tech_name,best_level,updated_at,source_report_id\n")
-        for r in rows:
-            kingdom = (r.get("kingdom") or "").replace('"', '""')
-            tech_name = (r.get("tech_name") or "").replace('"', '""')
-            best_level = int(r.get("best_level") or 0)
-            updated_at = r.get("updated_at")
-            updated_at_s = updated_at.isoformat() if updated_at else ""
-            source_id = r.get("source_report_id") or ""
-            out.write(f"\"{kingdom}\",\"{tech_name}\",{best_level},\"{updated_at_s}\",{source_id}\n")
-
-        data = out.getvalue().encode("utf-8")
-        out.close()
-
-        filename = f"kg2_research_export_{BOT_VERSION}.csv"
-        file = discord.File(fp=io.BytesIO(data), filename=filename)
-        await ctx.send("📎 Research export (best known per kingdom):", file=file)
-
-    except Exception as e:
-        await ctx.send("⚠️ techexport failed.")
-        await send_error(ctx.guild, f"techexport error: {e}")
+        await ctx.send("⚠️ troopdelta failed.")
+        await send_error(ctx.guild, f"troopdelta error: {e}")
 
 def _is_admin(ctx: commands.Context) -> bool:
     try:
@@ -1110,3 +1138,5 @@ async def refresh(ctx):
 
 # ---------- START BOT ----------
 bot.run(TOKEN)
+
+    
