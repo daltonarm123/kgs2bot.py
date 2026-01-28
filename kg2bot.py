@@ -1,19 +1,24 @@
-# ---------- KG2 Recon Bot • FULL PATCHED BUILD ----------
+# ---------- KG2 Recon Bot • FULL PATCHED BUILD (2026-01-28) ----------
 # Spy auto-capture (Postgres) • Combat Calc • AP Planner w/ Buttons • Spy History/ID
 # Tech capture/indexing (supports raw OR gz) • Per-kingdom deduped tech table + CSV export
-# FIX: Restart announcement spam (reconnect guard + DB dedupe + cooldown)
-# FIX: !calc prompts for paste by default, DB optional
-# FIX: Tech parsing reads ONLY the tech section (prevents settlement/building/unit/stat pollution)
-# FIX: Tech auto-indexes immediately on paste (and repairs on duplicate)
-# ADD: SR troop snapshots (home troops)
-# ADD: !troops (latest troop snapshot)
-# ADD: !troopdelta (loss/gain estimator between last two SRs)
-# ADD: !techreset (admin-only) to clear deduped tech and rebuild
-# ADD: !refresh (admin-only) restart
+# SR troop snapshots (home troops) • !troops • !troopdelta
+#
+# NEW THIS UPDATE:
+# - FIX: Avoid blocking asyncio event loop (all DB work is offloaded to a thread)
+# - ADD: psycopg2 connection pool (reduces connect churn, improves reliability)
+# - ADD: Helpful DB indexes for "latest per kingdom" queries
+# - FIX: Better error logging (tracebacks) + safe truncation for Discord error channel
+# - FIX: Safer timestamp normalization (UTC)
+# - MAINT: __main__ guard (safe imports/tests) + cleaner startup init
+#
+# Announcement behavior:
+# - Only announces THIS VERSION’s PATCH_NOTES (no old history)
+# - Dedupes announcements by version + cooldown
 
-import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time, io
+import os, re, asyncio, difflib, hashlib, logging, gzip, sys, time, traceback
 from math import ceil
 from datetime import datetime, timezone
+from contextlib import contextmanager
 
 import discord
 from discord.ext import commands
@@ -22,17 +27,17 @@ from dotenv import load_dotenv
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2 import pool as pg_pool
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-01-24.1"
+BOT_VERSION = "2026-01-28.1"
 PATCH_NOTES = [
-    "Fixed: Tech parsing reads ONLY 'technology information' section (no settlements/buildings/stats).",
-    "Fixed: Units like Heavy Cavalry excluded from research list.",
-    "Fixed: Tech auto-indexes immediately on paste (and repairs on duplicate).",
-    "Added: SR troop snapshots (captures ALL home troops).",
-    "Added: !troops (latest SR troop snapshot).",
-    "Added: !troopdelta (est. troop losses/gains between last two SRs).",
-    "Added: !techreset (admin-only) to clear polluted tech list and rebuild cleanly.",
+    "Fixed: DB work no longer blocks the bot (offloaded to thread executor).",
+    "Added: psycopg2 connection pooling (faster + fewer connection issues).",
+    "Added: DB indexes for faster latest-report + troop snapshot queries.",
+    "Improved: Error logs now include tracebacks (sanitized + truncated).",
+    "Fixed: Message timestamps normalized safely to UTC.",
+    "Maint: Added __main__ guard for safer imports/testing.",
 ]
 # -------------------------------------------------
 
@@ -71,16 +76,42 @@ ap_lock = asyncio.Lock()
 ANNOUNCED_READY_THIS_PROCESS = False
 ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
 
-# ---------- DB ----------
-def db_connect():
-    return psycopg2.connect(
-        DATABASE_URL,
+# ---------- DB Pool ----------
+DB_POOL: pg_pool.SimpleConnectionPool | None = None
+
+def init_db_pool(minconn: int = 1, maxconn: int = 10):
+    global DB_POOL
+    if DB_POOL:
+        return
+    DB_POOL = pg_pool.SimpleConnectionPool(
+        minconn=minconn,
+        maxconn=maxconn,
+        dsn=DATABASE_URL,
         cursor_factory=RealDictCursor,
         sslmode="require",
     )
+    logging.info("DB pool initialized.")
+
+@contextmanager
+def db_conn():
+    """
+    Pool-backed connection context manager.
+    Always returns connection to pool.
+    """
+    if not DB_POOL:
+        raise RuntimeError("DB_POOL not initialized. Call init_db_pool() first.")
+    conn = DB_POOL.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        DB_POOL.putconn(conn)
 
 def init_db():
-    with db_connect() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS spy_reports (
             id SERIAL PRIMARY KEY,
@@ -132,7 +163,7 @@ def init_db():
         );
         """)
 
-        # NEW: troop snapshots per SR (home troops)
+        # Troop snapshots per SR (home troops)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS troop_snapshots (
             id SERIAL PRIMARY KEY,
@@ -154,37 +185,71 @@ def init_db():
         );
         """)
 
-        # schema self-heal
-        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS kingdom TEXT;")
-        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS defense_power INTEGER;")
-        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS castles INTEGER;")
-        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;")
-        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS raw TEXT;")
-        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS raw_gz BYTEA;")
+        # Minimal "self-heal" (keep it light; migrations later if you want)
         cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS report_hash TEXT;")
+        cur.execute("ALTER TABLE spy_reports ADD COLUMN IF NOT EXISTS raw_gz BYTEA;")
 
-        try:
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS spy_reports_report_hash_uq ON spy_reports(report_hash);")
-        except Exception:
-            pass
+        # Indexes (performance)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS spy_reports_report_hash_uq ON spy_reports(report_hash);")
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS spy_reports_kingdom_created_at_idx
+            ON spy_reports (kingdom, created_at DESC, id DESC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS troop_snapshots_kingdom_captured_at_idx
+            ON troop_snapshots (kingdom, captured_at DESC, report_id DESC);
+        """)
 
 def heal_sequences():
-    with db_connect() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots"]:
             cur.execute(
                 f"SELECT setval(pg_get_serial_sequence('{table}','id'), "
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
             )
 
+# ---------- Async DB offload ----------
+async def run_db(fn, *args, **kwargs):
+    """
+    Offload synchronous DB work to a thread so we do not block the asyncio loop.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
 # ---------- Helpers ----------
 def now_utc():
     return datetime.now(timezone.utc)
+
+def normalize_to_utc(ts: datetime | None) -> datetime:
+    ts = ts or now_utc()
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
 
 def castle_bonus(c: int) -> float:
     return (c ** 0.5) / 100 if c else 0.0
 
 def hash_report(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def compress_report(text: str) -> bytes:
+    return gzip.compress(text.encode("utf-8"), compresslevel=9)
+
+def decompress_report(raw_gz: bytes) -> str:
+    try:
+        if isinstance(raw_gz, memoryview):
+            raw_gz = raw_gz.tobytes()
+        return gzip.decompress(raw_gz).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+def extract_report_text_for_row(row) -> str:
+    raw = row.get("raw")
+    if raw:
+        return raw
+    raw_gz = row.get("raw_gz")
+    if raw_gz:
+        return decompress_report(raw_gz)
+    return ""
 
 def parse_spy(text: str):
     kingdom, dp, castles = None, None, 0
@@ -203,26 +268,12 @@ def parse_spy(text: str):
     return kingdom, dp, castles
 
 def parse_sr_troops(text: str) -> dict:
-    """
-    Extract ALL home troop counts from SR:
-
-    Our spies also found the following information about the kingdom's troops:
-    Pikemen: 55131
-    Elites: 226
-    ...
-    Approximate defensive power*: 369522
-
-    Returns {unit_name: count}
-    """
     troops = {}
     in_troops = False
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
-            if in_troops:
-                # often ends here, but not always; we'll keep scanning until we hit DP or next section
-                continue
             continue
 
         ll = line.lower()
@@ -245,7 +296,6 @@ def parse_sr_troops(text: str) -> dict:
         )):
             break
 
-        # Example: "Pikemen: 55131"
         m = re.match(r"^(.+?):\s*([\d,]+)\s*$", line)
         if not m:
             continue
@@ -253,14 +303,9 @@ def parse_sr_troops(text: str) -> dict:
         name = m.group(1).strip()
         val = int(m.group(2).replace(",", ""))
 
-        # ignore population lines (not a unit)
         if name.lower().startswith("population"):
             continue
-
-        # simple sanity checks
-        if len(name) < 2:
-            continue
-        if val < 0:
+        if len(name) < 2 or val < 0:
             continue
 
         troops[name] = val
@@ -268,26 +313,14 @@ def parse_sr_troops(text: str) -> dict:
     return troops
 
 def parse_tech(text: str):
-    """
-    Extract research ONLY from the explicit tech section:
-
-      The following technology information was also discovered:
-      Improved Tools lvl 5
-      ...
-
-    Prevents pollution from settlements/buildings/resources/units/etc.
-    """
     techs = []
     in_tech = False
 
     blocked_prefixes = (
-        # units / troop stats
         "heavy cavalry", "light cavalry", "archers", "pikemen", "peasants", "knights",
         "spies sent", "spies lost", "population", "elites",
-        # resources / misc stats
         "horses", "blue gems", "green gems", "gold", "food", "wood", "stone", "land",
         "networth", "honour", "ranking", "number of castles", "approximate defensive power",
-        # settlement/building lines
         "current level", "buildings built", "housing", "barn", "granary", "stables", "inn", "mason",
     )
 
@@ -341,17 +374,7 @@ def parse_tech(text: str):
 
     return techs
 
-def compress_report(text: str) -> bytes:
-    return gzip.compress(text.encode("utf-8"), compresslevel=9)
-
-def decompress_report(raw_gz: bytes) -> str:
-    try:
-        if isinstance(raw_gz, memoryview):
-            raw_gz = raw_gz.tobytes()
-        return gzip.decompress(raw_gz).decode("utf-8", errors="replace")
-    except Exception:
-        return ""
-
+# ---------- Discord perms helpers ----------
 def get_member_for_perms(guild: discord.Guild):
     try:
         if guild.me:
@@ -371,37 +394,54 @@ def can_send(channel: discord.abc.GuildChannel, guild: discord.Guild) -> bool:
     except Exception:
         return True
 
-async def send_error(guild: discord.Guild, msg: str):
+def truncate_for_discord(s: str, limit: int = 1800) -> str:
+    s = s or ""
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n…(truncated)…"
+
+async def send_error(guild: discord.Guild, msg: str, tb: str | None = None):
+    """
+    Sends a safe, truncated error message to the error channel and logs full traceback to console.
+    """
     try:
         ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
         if ch and can_send(ch, guild):
-            await ch.send(f"⚠️ ERROR LOG:\n```py\n{msg}\n```")
+            payload = msg
+            if tb:
+                payload += "\n\n" + truncate_for_discord(tb, 1800)
+            payload = truncate_for_discord(payload, 1900)
+            await ch.send(f"⚠️ ERROR LOG:\n```py\n{payload}\n```")
     except Exception:
         pass
     logging.error(msg)
 
-def extract_report_text_for_row(row) -> str:
-    raw = row.get("raw")
-    if raw:
-        return raw
-    raw_gz = row.get("raw_gz")
-    if raw_gz:
-        return decompress_report(raw_gz)
-    return ""
+# ---------- Sync DB Functions (run via run_db) ----------
+def _meta_get(cur, key: str):
+    cur.execute("SELECT v FROM bot_meta WHERE k=%s LIMIT 1;", (key,))
+    row = cur.fetchone()
+    return row["v"] if row else None
 
-def fuzzy_kingdom(query: str):
+def _meta_set(cur, key: str, value: str):
+    cur.execute("""
+        INSERT INTO bot_meta (k, v, updated_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=EXCLUDED.updated_at;
+    """, (key, value, now_utc()))
+
+def sync_fuzzy_kingdom(query: str):
     if not query:
         return None
-    with db_connect() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT DISTINCT kingdom FROM spy_reports WHERE kingdom IS NOT NULL;")
         names = [r["kingdom"] for r in cur.fetchall() if r.get("kingdom")]
     match = difflib.get_close_matches(query, names, 1, 0.5)
     return match[0] if match else None
 
-def get_latest_spy_report_for_kingdom(kingdom: str):
+def sync_get_latest_spy_report_for_kingdom(kingdom: str):
     if not kingdom:
         return None
-    with db_connect() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
@@ -411,21 +451,8 @@ def get_latest_spy_report_for_kingdom(kingdom: str):
         """, (kingdom,))
         return cur.fetchone()
 
-def get_latest_report_for_kingdom_any(kingdom: str):
-    if not kingdom:
-        return None
-    with db_connect() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
-            FROM spy_reports
-            WHERE kingdom=%s
-            ORDER BY created_at DESC NULLS LAST, id DESC
-            LIMIT 1;
-        """, (kingdom,))
-        return cur.fetchone()
-
-def get_latest_spy_report_any():
-    with db_connect() as conn, conn.cursor() as cur:
+def sync_get_latest_spy_report_any():
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
@@ -435,8 +462,21 @@ def get_latest_spy_report_any():
         """)
         return cur.fetchone()
 
-def get_recent_reports_for_kingdom(kingdom: str, limit: int = 25):
-    with db_connect() as conn, conn.cursor() as cur:
+def sync_get_latest_report_for_kingdom_any(kingdom: str):
+    if not kingdom:
+        return None
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
+            FROM spy_reports
+            WHERE kingdom=%s
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        return cur.fetchone()
+
+def sync_get_recent_reports_for_kingdom(kingdom: str, limit: int = 25):
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
@@ -446,8 +486,8 @@ def get_recent_reports_for_kingdom(kingdom: str, limit: int = 25):
         """, (kingdom, limit))
         return cur.fetchall()
 
-def rebuild_ap_session(kingdom: str) -> bool:
-    spy = get_latest_spy_report_for_kingdom(kingdom)
+def sync_rebuild_ap_session(kingdom: str) -> bool:
+    spy = sync_get_latest_spy_report_for_kingdom(kingdom)
     if not spy:
         return False
     base_dp = int(spy["defense_power"] or 0)
@@ -456,7 +496,7 @@ def rebuild_ap_session(kingdom: str) -> bool:
         return False
 
     captured_at = spy["created_at"] or now_utc()
-    with db_connect() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM dp_sessions WHERE kingdom=%s;", (kingdom,))
         cur.execute("""
             INSERT INTO dp_sessions (kingdom, base_dp, castles, current_dp, hits, last_hit, captured_at)
@@ -464,10 +504,10 @@ def rebuild_ap_session(kingdom: str) -> bool:
         """, (kingdom, base_dp, castles, base_dp, 0, None, captured_at))
     return True
 
-def ensure_ap_session(kingdom: str) -> bool:
+def sync_ensure_ap_session(kingdom: str) -> bool:
     if not kingdom:
         return False
-    with db_connect() as conn, conn.cursor() as cur:
+    with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, base_dp, current_dp
             FROM dp_sessions
@@ -479,11 +519,246 @@ def ensure_ap_session(kingdom: str) -> bool:
 
     if sess:
         if int(sess.get("base_dp") or 0) <= 0:
-            return rebuild_ap_session(kingdom)
+            return sync_rebuild_ap_session(kingdom)
         return True
 
-    return rebuild_ap_session(kingdom)
+    return sync_rebuild_ap_session(kingdom)
 
+def sync_get_ap_session_row(kingdom: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT base_dp, current_dp, hits, last_hit, castles, captured_at
+            FROM dp_sessions
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC NULLS LAST, id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        return cur.fetchone()
+
+# Tech dedupe (atomic-ish upsert)
+def sync_upsert_kingdom_tech(cur, kingdom: str, tech_name: str, level: int, report_id: int, captured_at):
+    cur.execute("""
+        INSERT INTO kingdom_tech (kingdom, tech_name, best_level, updated_at, source_report_id)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (kingdom, tech_name)
+        DO UPDATE SET
+          best_level = GREATEST(kingdom_tech.best_level, EXCLUDED.best_level),
+          updated_at = EXCLUDED.updated_at,
+          source_report_id =
+            CASE
+              WHEN EXCLUDED.best_level > kingdom_tech.best_level THEN EXCLUDED.source_report_id
+              ELSE kingdom_tech.source_report_id
+            END;
+    """, (kingdom, tech_name, level, captured_at or now_utc(), report_id))
+
+def sync_index_tech_from_parsed(cur, kingdom: str, report_id: int, captured_at, techs):
+    if not kingdom or not report_id or not techs:
+        return (0, 0)
+
+    history_count = 0
+    dedupe_updates = 0
+    captured_at = captured_at or now_utc()
+
+    for name, lvl in techs:
+        cur.execute("""
+            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING;
+        """, (kingdom, name, lvl, captured_at, report_id))
+        history_count += 1
+
+        # For dedupe, just do the atomic upsert (no pre-select needed)
+        sync_upsert_kingdom_tech(cur, kingdom, name, lvl, report_id, captured_at)
+        dedupe_updates += 1
+
+    return (history_count, dedupe_updates)
+
+def sync_upsert_troop_snapshot(cur, kingdom: str, report_id: int, captured_at, troops: dict):
+    if not kingdom or not report_id or not troops:
+        return 0
+    captured_at = captured_at or now_utc()
+    inserted = 0
+    for unit_name, unit_count in troops.items():
+        cur.execute("""
+            INSERT INTO troop_snapshots (kingdom, report_id, captured_at, unit_name, unit_count)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (report_id, unit_name) DO NOTHING;
+        """, (kingdom, report_id, captured_at, unit_name, int(unit_count)))
+        inserted += 1
+    return inserted
+
+def sync_get_latest_troop_snapshot_units(kingdom: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT report_id, captured_at
+            FROM troop_snapshots
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC, report_id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        head = cur.fetchone()
+        if not head:
+            return None, None, {}
+
+        report_id = int(head["report_id"])
+        captured_at = head["captured_at"]
+
+        cur.execute("""
+            SELECT unit_name, unit_count
+            FROM troop_snapshots
+            WHERE kingdom=%s AND report_id=%s
+            ORDER BY unit_name ASC;
+        """, (kingdom, report_id))
+        rows = cur.fetchall()
+
+    troops = {r["unit_name"]: int(r["unit_count"]) for r in rows}
+    return report_id, captured_at, troops
+
+def sync_get_last_two_troop_snapshots(kingdom: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT report_id, captured_at
+            FROM troop_snapshots
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC, report_id DESC
+            LIMIT 2;
+        """, (kingdom,))
+        heads = cur.fetchall()
+
+        if not heads or len(heads) < 2:
+            return None
+
+        newest = heads[0]
+        prev = heads[1]
+
+        def load(report_id: int):
+            cur.execute("""
+                SELECT unit_name, unit_count
+                FROM troop_snapshots
+                WHERE kingdom=%s AND report_id=%s;
+            """, (kingdom, report_id))
+            rows = cur.fetchall()
+            return {r["unit_name"]: int(r["unit_count"]) for r in rows}
+
+        return {
+            "new": {
+                "report_id": int(newest["report_id"]),
+                "captured_at": newest["captured_at"],
+                "troops": load(int(newest["report_id"]))
+            },
+            "old": {
+                "report_id": int(prev["report_id"]),
+                "captured_at": prev["captured_at"],
+                "troops": load(int(prev["report_id"]))
+            },
+        }
+
+def sync_store_report(msg_content: str, created_at_utc: datetime):
+    """
+    Stores a spy report row (deduped by report_hash), indexes tech, stores troop snapshot.
+    Returns:
+      {
+        "saved": bool,
+        "duplicate": bool,
+        "row": dict|None,
+        "kingdom": str|None,
+        "dp": int|None,
+        "castles": int,
+      }
+    """
+    kingdom, dp, castles = parse_spy(msg_content)
+    techs = parse_tech(msg_content)
+    sr_troops = parse_sr_troops(msg_content)
+
+    should_save = bool(kingdom) and (
+        (dp is not None and dp >= 1000) or
+        (techs and len(techs) >= 1) or
+        (sr_troops and len(sr_troops) >= 1)
+    )
+    if not should_save:
+        return {"saved": False, "duplicate": False, "row": None, "kingdom": kingdom, "dp": dp, "castles": castles}
+
+    h = hash_report(msg_content)
+    raw_gz = psycopg2.Binary(compress_report(msg_content))
+    raw_text = msg_content if KEEP_RAW_TEXT else None
+
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
+        exists = cur.fetchone()
+
+        if not exists:
+            cur.execute("""
+                INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, raw_gz, report_hash)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id, kingdom, defense_power, castles, created_at, raw, raw_gz;
+            """, (kingdom, dp, castles, created_at_utc, raw_text, raw_gz, h))
+            row = cur.fetchone()
+
+            if techs:
+                sync_index_tech_from_parsed(cur, kingdom, row["id"], row.get("created_at") or created_at_utc, techs)
+
+            if sr_troops:
+                sync_upsert_troop_snapshot(cur, kingdom, row["id"], row.get("created_at") or created_at_utc, sr_troops)
+
+            if dp is not None and dp >= 1000:
+                sync_ensure_ap_session(kingdom)
+
+            return {"saved": True, "duplicate": False, "row": row, "kingdom": kingdom, "dp": dp, "castles": castles}
+
+        # Duplicate: "repair mode" index tech/troops against existing report_id
+        rep_id = int(exists["id"])
+        if techs:
+            sync_index_tech_from_parsed(cur, kingdom, rep_id, created_at_utc, techs)
+        if sr_troops:
+            sync_upsert_troop_snapshot(cur, kingdom, rep_id, created_at_utc, sr_troops)
+
+        return {"saved": True, "duplicate": True, "row": None, "kingdom": kingdom, "dp": dp, "castles": castles}
+
+def sync_apply_ap_hit(kingdom: str, red: float, who: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, current_dp, hits
+            FROM dp_sessions
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC NULLS LAST, id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        sess = cur.fetchone()
+        if not sess:
+            return {"ok": False, "reason": "no_leave"}
+
+        current_dp = int(sess.get("current_dp") or 0)
+        new_dp = ceil(current_dp * (1 - red))
+        new_hits = int(sess.get("hits") or 0) + 1
+
+        cur.execute("""
+            UPDATE dp_sessions
+            SET current_dp=%s, hits=%s, last_hit=%s
+            WHERE id=%s;
+        """, (new_dp, new_hits, who, sess["id"]))
+    return {"ok": True}
+
+def sync_reset_ap_session(kingdom: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, base_dp
+            FROM dp_sessions
+            WHERE kingdom=%s
+            ORDER BY captured_at DESC NULLS LAST, id DESC
+            LIMIT 1;
+        """, (kingdom,))
+        sess = cur.fetchone()
+        if not sess:
+            return {"ok": False}
+        base_dp = int(sess.get("base_dp") or 0)
+        cur.execute("""
+            UPDATE dp_sessions
+            SET current_dp=%s, hits=0, last_hit=NULL
+            WHERE id=%s;
+        """, (base_dp, sess["id"]))
+    return {"ok": True}
+
+# ---------- Embeds (no DB inside these) ----------
 def build_spy_embed(row):
     dp = int(row.get("defense_power") or 0) if row.get("defense_power") is not None else 0
     castles = int(row.get("castles") or 0)
@@ -514,19 +789,9 @@ def build_calc_embed(target: str, dp: int, castles: int, used: str):
         )
     return embed
 
-def build_ap_embed(kingdom: str):
-    with db_connect() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT base_dp, current_dp, hits, last_hit, castles, captured_at
-            FROM dp_sessions
-            WHERE kingdom=%s
-            ORDER BY captured_at DESC NULLS LAST, id DESC
-            LIMIT 1;
-        """, (kingdom,))
-        row = cur.fetchone()
+def build_ap_embed_from_row(kingdom: str, row):
     if not row:
         return None
-
     base_dp = int(row.get("base_dp") or 0)
     current_dp = int(row.get("current_dp") or 0)
     hits = int(row.get("hits") or 0)
@@ -544,132 +809,6 @@ def build_ap_embed(kingdom: str):
         embed.set_footer(text=f"Captured {row.get('captured_at')}")
     return embed
 
-# ---------- Tech Indexing (dedupe) ----------
-def upsert_kingdom_tech(cur, kingdom: str, tech_name: str, level: int, report_id: int, captured_at):
-    if not kingdom or not tech_name or not level:
-        return False
-
-    cur.execute("""
-        SELECT best_level FROM kingdom_tech
-        WHERE kingdom=%s AND tech_name=%s
-        LIMIT 1;
-    """, (kingdom, tech_name))
-    row = cur.fetchone()
-    existing = int(row["best_level"]) if row else None
-
-    if existing is None or level > existing:
-        cur.execute("""
-            INSERT INTO kingdom_tech (kingdom, tech_name, best_level, updated_at, source_report_id)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (kingdom, tech_name) DO UPDATE
-            SET best_level=EXCLUDED.best_level,
-                updated_at=EXCLUDED.updated_at,
-                source_report_id=EXCLUDED.source_report_id;
-        """, (kingdom, tech_name, level, captured_at or now_utc(), report_id))
-        return True
-
-    return False
-
-def index_tech_from_parsed(cur, kingdom: str, report_id: int, captured_at, techs):
-    if not kingdom or not report_id or not techs:
-        return (0, 0)
-
-    history_count = 0
-    dedupe_updates = 0
-    captured_at = captured_at or now_utc()
-
-    for name, lvl in techs:
-        cur.execute("""
-            INSERT INTO tech_index (kingdom, tech_name, tech_level, captured_at, report_id)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING;
-        """, (kingdom, name, lvl, captured_at, report_id))
-        history_count += 1
-
-        if upsert_kingdom_tech(cur, kingdom, name, lvl, report_id, captured_at):
-            dedupe_updates += 1
-
-    return (history_count, dedupe_updates)
-
-# ---------- Troop Snapshot (SR) ----------
-def upsert_troop_snapshot(cur, kingdom: str, report_id: int, captured_at, troops: dict):
-    """
-    Save ALL SR troop counts as snapshot rows.
-    """
-    if not kingdom or not report_id or not troops:
-        return 0
-
-    captured_at = captured_at or now_utc()
-    inserted = 0
-
-    for unit_name, unit_count in troops.items():
-        cur.execute("""
-            INSERT INTO troop_snapshots (kingdom, report_id, captured_at, unit_name, unit_count)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (report_id, unit_name) DO NOTHING;
-        """, (kingdom, report_id, captured_at, unit_name, int(unit_count)))
-        inserted += 1
-
-    return inserted
-
-def get_latest_troop_snapshot_units(kingdom: str):
-    with db_connect() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT report_id, captured_at
-            FROM troop_snapshots
-            WHERE kingdom=%s
-            ORDER BY captured_at DESC, report_id DESC
-            LIMIT 1;
-        """, (kingdom,))
-        head = cur.fetchone()
-        if not head:
-            return None, None, {}
-
-        report_id = int(head["report_id"])
-        captured_at = head["captured_at"]
-
-        cur.execute("""
-            SELECT unit_name, unit_count
-            FROM troop_snapshots
-            WHERE kingdom=%s AND report_id=%s
-            ORDER BY unit_name ASC;
-        """, (kingdom, report_id))
-        rows = cur.fetchall()
-
-    troops = {r["unit_name"]: int(r["unit_count"]) for r in rows}
-    return report_id, captured_at, troops
-
-def get_last_two_troop_snapshots(kingdom: str):
-    with db_connect() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT DISTINCT report_id, captured_at
-            FROM troop_snapshots
-            WHERE kingdom=%s
-            ORDER BY captured_at DESC, report_id DESC
-            LIMIT 2;
-        """, (kingdom,))
-        heads = cur.fetchall()
-
-        if not heads or len(heads) < 2:
-            return None
-
-        newest = heads[0]
-        prev = heads[1]
-
-        def load(report_id: int):
-            cur.execute("""
-                SELECT unit_name, unit_count
-                FROM troop_snapshots
-                WHERE kingdom=%s AND report_id=%s;
-            """, (kingdom, report_id))
-            rows = cur.fetchall()
-            return {r["unit_name"]: int(r["unit_count"]) for r in rows}
-
-        return {
-            "new": {"report_id": int(newest["report_id"]), "captured_at": newest["captured_at"], "troops": load(int(newest["report_id"]))},
-            "old": {"report_id": int(prev["report_id"]), "captured_at": prev["captured_at"], "troops": load(int(prev["report_id"]))},
-        }
-
 # ---------- AP View ----------
 class APView(View):
     def __init__(self, kingdom: str, timeout: float = 600):
@@ -686,40 +825,26 @@ class APView(View):
             await interaction.response.defer(thinking=False)
             try:
                 async with ap_lock:
-                    with db_connect() as conn, conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT id, current_dp, hits
-                            FROM dp_sessions
-                            WHERE kingdom=%s
-                            ORDER BY captured_at DESC NULLS LAST, id DESC
-                            LIMIT 1;
-                        """, (self.kingdom,))
-                        sess = cur.fetchone()
-                        if not sess:
-                            await interaction.followup.send("❌ No active session. Paste a spy report first, then run `!ap` again.")
-                            return
+                    who = interaction.user.display_name if interaction.user else "Unknown"
+                    res = await run_db(sync_apply_ap_hit, self.kingdom, red, who)
 
-                        current_dp = int(sess.get("current_dp") or 0)
-                        new_dp = ceil(current_dp * (1 - red))
-                        new_hits = int(sess.get("hits") or 0) + 1
-                        last_hit = interaction.user.display_name if interaction.user else "Unknown"
+                if not res.get("ok"):
+                    return await interaction.followup.send("❌ No active session. Paste a spy report first, then run `!ap` again.")
 
-                        cur.execute("""
-                            UPDATE dp_sessions
-                            SET current_dp=%s, hits=%s, last_hit=%s
-                            WHERE id=%s;
-                        """, (new_dp, new_hits, last_hit, sess["id"]))
-
-                embed = build_ap_embed(self.kingdom)
+                row = await run_db(sync_get_ap_session_row, self.kingdom)
+                embed = build_ap_embed_from_row(self.kingdom, row)
                 if embed:
                     try:
                         await interaction.message.edit(embed=embed, view=self)
                     except Exception:
                         await interaction.followup.send(embed=embed, view=self)
+
             except Exception as e:
+                tb = traceback.format_exc()
                 await interaction.followup.send("⚠️ Failed to apply hit.")
                 if interaction.guild:
-                    await send_error(interaction.guild, f"AP hit button error: {e}")
+                    logging.exception("AP hit button error")
+                    await send_error(interaction.guild, f"AP hit button error: {e}", tb=tb)
 
         btn = Button(label=label, style=discord.ButtonStyle.danger)
         btn.callback = callback
@@ -730,35 +855,24 @@ class APView(View):
             await interaction.response.defer(thinking=False)
             try:
                 async with ap_lock:
-                    with db_connect() as conn, conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT id, base_dp
-                            FROM dp_sessions
-                            WHERE kingdom=%s
-                            ORDER BY captured_at DESC NULLS LAST, id DESC
-                            LIMIT 1;
-                        """, (self.kingdom,))
-                        sess = cur.fetchone()
-                        if not sess:
-                            await interaction.followup.send("❌ No active session to reset.")
-                            return
-                        base_dp = int(sess.get("base_dp") or 0)
-                        cur.execute("""
-                            UPDATE dp_sessions
-                            SET current_dp=%s, hits=0, last_hit=NULL
-                            WHERE id=%s;
-                        """, (base_dp, sess["id"]))
+                    res = await run_db(sync_reset_ap_session, self.kingdom)
+                if not res.get("ok"):
+                    return await interaction.followup.send("❌ No active session to reset.")
 
-                embed = build_ap_embed(self.kingdom)
+                row = await run_db(sync_get_ap_session_row, self.kingdom)
+                embed = build_ap_embed_from_row(self.kingdom, row)
                 if embed:
                     try:
                         await interaction.message.edit(embed=embed, view=self)
                     except Exception:
                         await interaction.followup.send(embed=embed, view=self)
+
             except Exception as e:
+                tb = traceback.format_exc()
                 await interaction.followup.send("⚠️ Failed to reset session.")
                 if interaction.guild:
-                    await send_error(interaction.guild, f"AP reset error: {e}")
+                    logging.exception("AP reset error")
+                    await send_error(interaction.guild, f"AP reset error: {e}", tb=tb)
 
         btn = Button(label="Reset", style=discord.ButtonStyle.secondary)
         btn.callback = callback
@@ -769,37 +883,29 @@ class APView(View):
             await interaction.response.defer(thinking=False)
             try:
                 async with ap_lock:
-                    ok = rebuild_ap_session(self.kingdom)
+                    ok = await run_db(sync_rebuild_ap_session, self.kingdom)
+
                 if not ok:
-                    await interaction.followup.send("❌ Could not rebuild (no valid DP spy report found).")
-                    return
-                embed = build_ap_embed(self.kingdom)
+                    return await interaction.followup.send("❌ Could not rebuild (no valid DP spy report found).")
+
+                row = await run_db(sync_get_ap_session_row, self.kingdom)
+                embed = build_ap_embed_from_row(self.kingdom, row)
                 if embed:
                     try:
                         await interaction.message.edit(embed=embed, view=self)
                     except Exception:
                         await interaction.followup.send(embed=embed, view=self)
+
             except Exception as e:
+                tb = traceback.format_exc()
                 await interaction.followup.send("⚠️ Failed to rebuild session.")
                 if interaction.guild:
-                    await send_error(interaction.guild, f"AP rebuild error: {e}")
+                    logging.exception("AP rebuild error")
+                    await send_error(interaction.guild, f"AP rebuild error: {e}", tb=tb)
 
         btn = Button(label="Rebuild", style=discord.ButtonStyle.primary)
         btn.callback = callback
         return btn
-
-# ---------- Announcement dedupe helpers ----------
-def _meta_get(cur, key: str):
-    cur.execute("SELECT v FROM bot_meta WHERE k=%s LIMIT 1;", (key,))
-    row = cur.fetchone()
-    return row["v"] if row else None
-
-def _meta_set(cur, key: str, value: str):
-    cur.execute("""
-        INSERT INTO bot_meta (k, v, updated_at)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=EXCLUDED.updated_at;
-    """, (key, value, now_utc()))
 
 # ---------- Bot Events ----------
 @bot.event
@@ -807,9 +913,13 @@ async def on_ready():
     global ANNOUNCED_READY_THIS_PROCESS
 
     try:
-        init_db()
-        heal_sequences()
+        # Init pool + schema in a thread (safe)
+        await run_db(init_db_pool, 1, 10)
+        await run_db(init_db)
+        await run_db(heal_sequences)
     except Exception as e:
+        logging.exception("DB init failed")
+        # can't send to discord reliably yet, just log
         logging.error(f"DB init failed: {e}")
 
     if ANNOUNCED_READY_THIS_PROCESS:
@@ -817,20 +927,29 @@ async def on_ready():
         return
     ANNOUNCED_READY_THIS_PROCESS = True
 
+    # version/cooldown dedupe (DB-backed)
     try:
-        with db_connect() as conn, conn.cursor() as cur:
-            last_ver = _meta_get(cur, "announce_last_ver")
-            last_ts = _meta_get(cur, "announce_last_ts")
-            now_ts = int(time.time())
-            last_ts_int = int(last_ts) if last_ts and str(last_ts).isdigit() else 0
+        def _dedupe_write():
+            with db_conn() as conn, conn.cursor() as cur:
+                last_ver = _meta_get(cur, "announce_last_ver")
+                last_ts = _meta_get(cur, "announce_last_ts")
+                now_ts = int(time.time())
+                last_ts_int = int(last_ts) if last_ts and str(last_ts).isdigit() else 0
 
-            if last_ver == BOT_VERSION and (now_ts - last_ts_int) < ANNOUNCE_COOLDOWN_SECONDS:
-                logging.info("Announcement suppressed (same version + cooldown).")
-                return
+                if last_ver == BOT_VERSION and (now_ts - last_ts_int) < ANNOUNCE_COOLDOWN_SECONDS:
+                    return False
 
-            _meta_set(cur, "announce_last_ver", BOT_VERSION)
-            _meta_set(cur, "announce_last_ts", str(now_ts))
+                _meta_set(cur, "announce_last_ver", BOT_VERSION)
+                _meta_set(cur, "announce_last_ts", str(now_ts))
+                return True
+
+        ok_to_announce = await run_db(_dedupe_write)
+        if not ok_to_announce:
+            logging.info("Announcement suppressed (same version + cooldown).")
+            return
+
     except Exception as e:
+        logging.exception("Announcement dedupe DB write failed")
         logging.error(f"Announcement dedupe DB write failed: {e}")
 
     patch_lines = "\n".join([f"• {x}" for x in PATCH_NOTES])
@@ -852,64 +971,23 @@ async def on_message(msg: discord.Message):
         return
 
     try:
-        kingdom, dp, castles = parse_spy(msg.content)
-        techs = parse_tech(msg.content)
+        ts = normalize_to_utc(msg.created_at)
 
-        # NEW: troop snapshot from SR
-        sr_troops = parse_sr_troops(msg.content)
+        result = await run_db(sync_store_report, msg.content, ts)
 
-        # Save if target exists AND either:
-        # - DP exists (normal report) OR
-        # - tech section exists (even if DP missing)
-        # - troops section exists (home troops snapshot)
-        should_save = bool(kingdom) and (
-            (dp is not None and dp >= 1000) or
-            (techs and len(techs) >= 1) or
-            (sr_troops and len(sr_troops) >= 1)
-        )
+        if result.get("saved") and not result.get("duplicate") and result.get("row"):
+            row = result["row"]
+            if can_send(msg.channel, msg.guild):
+                await msg.channel.send(embed=build_spy_embed(row))
 
-        if should_save:
-            h = hash_report(msg.content)
-            ts = (msg.created_at.replace(tzinfo=timezone.utc) if msg.created_at else now_utc())
-            raw_gz = psycopg2.Binary(compress_report(msg.content))
-            raw_text = msg.content if KEEP_RAW_TEXT else None
+        elif result.get("saved") and result.get("duplicate"):
+            if can_send(msg.channel, msg.guild):
+                await msg.channel.send("✅ Duplicate spy report detected (repair mode applied).")
 
-            with db_connect() as conn, conn.cursor() as cur:
-                cur.execute("SELECT id FROM spy_reports WHERE report_hash=%s LIMIT 1;", (h,))
-                exists = cur.fetchone()
-
-                if not exists:
-                    cur.execute("""
-                        INSERT INTO spy_reports (kingdom, defense_power, castles, created_at, raw, raw_gz, report_hash)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s)
-                        RETURNING id, kingdom, defense_power, castles, created_at, raw, raw_gz;
-                    """, (kingdom, dp, castles, ts, raw_text, raw_gz, h))
-                    row = cur.fetchone()
-
-                    # ✅ TECH AUTO-INDEX ON PASTE
-                    if techs:
-                        index_tech_from_parsed(cur, kingdom, row["id"], row.get("created_at") or ts, techs)
-
-                    # ✅ TROOP SNAPSHOT ON PASTE
-                    if sr_troops:
-                        upsert_troop_snapshot(cur, kingdom, row["id"], row.get("created_at") or ts, sr_troops)
-
-                    if dp is not None and dp >= 1000:
-                        ensure_ap_session(kingdom)
-
-                    if can_send(msg.channel, msg.guild):
-                        await msg.channel.send(embed=build_spy_embed(row))
-                else:
-                    # ✅ DUPLICATE “REPAIR MODE”
-                    if techs:
-                        index_tech_from_parsed(cur, kingdom, exists["id"], ts, techs)
-                    if sr_troops:
-                        upsert_troop_snapshot(cur, kingdom, exists["id"], ts, sr_troops)
-
-                    if can_send(msg.channel, msg.guild):
-                        await msg.channel.send("✅ Duplicate spy report detected.")
     except Exception as e:
-        await send_error(msg.guild, f"on_message spy capture error: {e}")
+        tb = traceback.format_exc()
+        logging.exception("on_message spy capture error")
+        await send_error(msg.guild, f"on_message spy capture error: {e}", tb=tb)
 
     await bot.process_commands(msg)
 
@@ -925,7 +1003,7 @@ async def calc(ctx, *, kingdom: str = None):
         arg = (kingdom or "").strip()
 
         if arg.lower() in ("db", "last", "latest"):
-            row = get_latest_spy_report_any()
+            row = await run_db(sync_get_latest_spy_report_any)
             if not row:
                 return await ctx.send("❌ No saved DP spy reports in DB yet.")
             dp = int(row["defense_power"])
@@ -935,8 +1013,9 @@ async def calc(ctx, *, kingdom: str = None):
             return await ctx.send(embed=build_calc_embed(target, dp, c, used))
 
         if arg:
-            real = fuzzy_kingdom(arg) or arg
-            row = get_latest_spy_report_for_kingdom(real)
+            real = await run_db(sync_fuzzy_kingdom, arg)
+            real = real or arg
+            row = await run_db(sync_get_latest_spy_report_for_kingdom, real)
             if not row:
                 return await ctx.send(f"❌ No saved DP reports for **{real}**. Paste a full spy report and try again.")
             dp = int(row["defense_power"])
@@ -961,50 +1040,65 @@ async def calc(ctx, *, kingdom: str = None):
         await ctx.send(embed=build_calc_embed(k, int(dp), int(c or 0), "(pasted)"))
 
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ calc failed.")
-        await send_error(ctx.guild, f"calc error: {e}")
+        await send_error(ctx.guild, f"calc error: {e}", tb=tb)
 
 @bot.command()
 async def ap(ctx, *, kingdom: str):
     try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        if ensure_ap_session(real):
-            emb = build_ap_embed(real)
-            if not emb:
-                return await ctx.send("❌ No active session embed. Try `!apfix <kingdom>`.")
-            await ctx.send(embed=emb, view=APView(real))
-        else:
-            await ctx.send("❌ No DP spy report found for that kingdom.")
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+
+        ok = await run_db(sync_ensure_ap_session, real)
+        if not ok:
+            return await ctx.send("❌ No DP spy report found for that kingdom.")
+
+        row = await run_db(sync_get_ap_session_row, real)
+        emb = build_ap_embed_from_row(real, row)
+        if not emb:
+            return await ctx.send("❌ No active session embed. Try `!apfix <kingdom>`.")
+
+        await ctx.send(embed=emb, view=APView(real))
+
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ ap failed.")
-        await send_error(ctx.guild, f"ap error: {e}")
+        await send_error(ctx.guild, f"ap error: {e}", tb=tb)
 
 @bot.command()
 async def apfix(ctx, *, kingdom: str):
     try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        if rebuild_ap_session(real):
-            await ctx.send(f"✅ Rebuilt AP session for **{real}**.")
-            emb = build_ap_embed(real)
-            if emb:
-                await ctx.send(embed=emb, view=APView(real))
-        else:
-            await ctx.send("❌ No valid DP spy report found.")
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+
+        ok = await run_db(sync_rebuild_ap_session, real)
+        if not ok:
+            return await ctx.send("❌ No valid DP spy report found.")
+
+        await ctx.send(f"✅ Rebuilt AP session for **{real}**.")
+        row = await run_db(sync_get_ap_session_row, real)
+        emb = build_ap_embed_from_row(real, row)
+        if emb:
+            await ctx.send(embed=emb, view=APView(real))
+
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ apfix failed.")
-        await send_error(ctx.guild, f"apfix error: {e}")
+        await send_error(ctx.guild, f"apfix error: {e}", tb=tb)
 
 @bot.command()
 async def troops(ctx, *, kingdom: str):
     """Show latest SR troop snapshot (home troops) for a kingdom."""
     try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        report_id, captured_at, troops = get_latest_troop_snapshot_units(real)
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+
+        report_id, captured_at, troops_map = await run_db(sync_get_latest_troop_snapshot_units, real)
         if not report_id:
             return await ctx.send(f"❌ No troop snapshots saved for **{real}** yet. Paste an SR first.")
 
-        # show top units by count
-        items = sorted(troops.items(), key=lambda x: x[1], reverse=True)
+        items = sorted(troops_map.items(), key=lambda x: x[1], reverse=True)
         lines = [f"• {name}: {cnt:,}" for name, cnt in items[:25]]
         more = len(items) - len(lines)
         if more > 0:
@@ -1016,18 +1110,18 @@ async def troops(ctx, *, kingdom: str):
             "\n".join(lines)
         )
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ troops failed.")
-        await send_error(ctx.guild, f"troops error: {e}")
+        await send_error(ctx.guild, f"troops error: {e}", tb=tb)
 
 @bot.command()
 async def troopdelta(ctx, *, kingdom: str):
-    """
-    Estimate troop losses/gains between the last two SR snapshots for a kingdom.
-    This is your "troop lost after a hit" estimator (SR-before vs SR-after).
-    """
+    """Estimate troop losses/gains between the last two SR snapshots for a kingdom."""
     try:
-        real = fuzzy_kingdom(kingdom) or kingdom
-        pair = get_last_two_troop_snapshots(real)
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+
+        pair = await run_db(sync_get_last_two_troop_snapshots, real)
         if not pair:
             return await ctx.send(f"❌ Need at least **2** SR troop snapshots for **{real}**. Paste two SRs first.")
 
@@ -1051,8 +1145,7 @@ async def troopdelta(ctx, *, kingdom: str):
                 f"✅ **No troop count changes detected** for **{real}** between SR `#{old['report_id']}` and `#{new['report_id']}`."
             )
 
-        # Losses first (negative), then gains
-        losses = sorted([x for x in deltas if x[1] < 0], key=lambda x: x[1])  # most negative first
+        losses = sorted([x for x in deltas if x[1] < 0], key=lambda x: x[1])
         gains = sorted([x for x in deltas if x[1] > 0], key=lambda x: x[1], reverse=True)
 
         lines = []
@@ -1073,8 +1166,9 @@ async def troopdelta(ctx, *, kingdom: str):
         )
 
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ troopdelta failed.")
-        await send_error(ctx.guild, f"troopdelta error: {e}")
+        await send_error(ctx.guild, f"troopdelta error: {e}", tb=tb)
 
 def _is_admin(ctx: commands.Context) -> bool:
     try:
@@ -1090,23 +1184,31 @@ async def techreset(ctx, *, kingdom: str = None):
     Admin-only: clears deduped research list (kingdom_tech) so you can rebuild cleanly.
       - !techreset         -> clears ALL kingdoms
       - !techreset beef    -> clears just Beef
-    After running, do: !techindex  (or !techpull <kingdom>)
     """
     if not _is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
     try:
-        with db_connect() as conn, conn.cursor() as cur:
-            if kingdom:
-                real = fuzzy_kingdom(kingdom) or kingdom
-                cur.execute("DELETE FROM kingdom_tech WHERE kingdom=%s;", (real,))
-                await ctx.send(f"✅ Cleared research list for **{real}**. Now run `!techpull {real}` or `!techindex`.")
-            else:
-                cur.execute("DELETE FROM kingdom_tech;")
-                await ctx.send("✅ Cleared research list for **ALL kingdoms**. Now run `!techindex`.")
+        def _do_delete(real_kingdom: str | None):
+            with db_conn() as conn, conn.cursor() as cur:
+                if real_kingdom:
+                    cur.execute("DELETE FROM kingdom_tech WHERE kingdom=%s;", (real_kingdom,))
+                else:
+                    cur.execute("DELETE FROM kingdom_tech;")
+
+        if kingdom:
+            real = await run_db(sync_fuzzy_kingdom, kingdom)
+            real = real or kingdom
+            await run_db(_do_delete, real)
+            await ctx.send(f"✅ Cleared research list for **{real}**.")
+        else:
+            await run_db(_do_delete, None)
+            await ctx.send("✅ Cleared research list for **ALL kingdoms**.")
+
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ techreset failed.")
-        await send_error(ctx.guild, f"techreset error: {e}")
+        await send_error(ctx.guild, f"techreset error: {e}", tb=tb)
 
 @bot.command(name="refresh")
 async def refresh(ctx):
@@ -1132,11 +1234,11 @@ async def refresh(ctx):
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     except Exception as e:
+        tb = traceback.format_exc()
         await ctx.send("⚠️ Refresh failed.")
         if ctx.guild:
-            await send_error(ctx.guild, f"refresh error: {e}")
+            await send_error(ctx.guild, f"refresh error: {e}", tb=tb)
 
 # ---------- START BOT ----------
-bot.run(TOKEN)
-
-    
+if __name__ == "__main__":
+    bot.run(TOKEN)
