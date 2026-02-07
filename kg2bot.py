@@ -1050,27 +1050,27 @@ def sync_get_research_export_rows():
                 k.kingdom,
                 ls.latest_report_id,
                 ls.latest_report_at,
-                pt.tech_name,
-                pt.best_level,
-                pt.updated_at AS tech_updated_at,
-                pt.source_report_id,
+                kt.tech_name,
+                kt.best_level,
+                kt.updated_at AS tech_updated_at,
+                kt.source_report_id,
                 COALESCE(ti.hits, 0) AS indexed_hits
             FROM kingdoms k
             LEFT JOIN latest_spy ls
               ON ls.kingdom = k.kingdom
-            LEFT JOIN player_tech pt
-              ON pt.kingdom = k.kingdom
+            LEFT JOIN kingdom_tech kt
+              ON kt.kingdom = k.kingdom
             LEFT JOIN LATERAL (
                 SELECT COUNT(*) AS hits
                 FROM tech_index t
                 WHERE t.kingdom = k.kingdom
-                  AND pt.tech_name IS NOT NULL
-                  AND t.tech_name = pt.tech_name
+                  AND kt.tech_name IS NOT NULL
+                  AND t.tech_name = kt.tech_name
             ) ti ON TRUE
             ORDER BY
                 k.kingdom ASC,
-                pt.best_level DESC NULLS LAST,
-                pt.tech_name ASC NULLS LAST;
+                kt.best_level DESC NULLS LAST,
+                kt.tech_name ASC NULLS LAST;
         """)
         return cur.fetchall()
 
