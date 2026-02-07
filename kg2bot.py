@@ -111,6 +111,7 @@ ap_lock = asyncio.Lock()
 # ---------- Announcement anti-spam ----------
 ANNOUNCED_READY_THIS_PROCESS = False
 ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
+MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL = int(os.getenv("MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL", "0") or "0")
 
 
 # ---------- DB Pool ----------
@@ -371,6 +372,28 @@ def can_send(channel: discord.abc.GuildChannel, guild: discord.Guild) -> bool:
         return channel.permissions_for(member).send_messages
     except Exception:
         return True
+
+
+def can_read_history(channel: discord.abc.GuildChannel, guild: discord.Guild) -> bool:
+    try:
+        member = get_member_for_perms(guild)
+        if not member:
+            return True
+        perms = channel.permissions_for(member)
+        return bool(perms.view_channel and perms.read_message_history)
+    except Exception:
+        return False
+
+
+def looks_like_spy_report(text: str) -> bool:
+    ll = (text or "").lower()
+    if "target:" not in ll:
+        return False
+    return any(x in ll for x in (
+        "defensive power",
+        "the following technology information was also discovered",
+        "our spies also found the following information about the kingdom's troops",
+    ))
 
 
 def truncate_for_discord(s: str, limit: int = 1800) -> str:
@@ -1308,6 +1331,62 @@ async def on_message(msg: discord.Message):
     await bot.process_commands(msg)
 
 
+async def sync_ingest_history(days: int | None = None):
+    """
+    Pull spy reports from readable Discord channel history into DB.
+    This is safe to rerun because storage is deduped by report hash.
+    """
+    since = None
+    if days and int(days) > 0:
+        since = now_utc() - timedelta(days=int(days))
+
+    stats = {
+        "guilds": 0,
+        "channels_scanned": 0,
+        "messages_scanned": 0,
+        "messages_matched": 0,
+        "reports_saved": 0,
+        "duplicates": 0,
+    }
+
+    for guild in bot.guilds:
+        stats["guilds"] += 1
+        for channel in guild.text_channels:
+            if not can_read_history(channel, guild):
+                continue
+
+            stats["channels_scanned"] += 1
+
+            history_kwargs = {"limit": None}
+            if since:
+                history_kwargs["after"] = since
+            if MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL > 0:
+                history_kwargs["limit"] = MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL
+
+            try:
+                async for m in channel.history(**history_kwargs):
+                    if not m or m.author.bot:
+                        continue
+                    stats["messages_scanned"] += 1
+
+                    content = (m.content or "").strip()
+                    if not content or not looks_like_spy_report(content):
+                        continue
+
+                    stats["messages_matched"] += 1
+                    res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
+
+                    if res.get("saved") and not res.get("duplicate"):
+                        stats["reports_saved"] += 1
+                    elif res.get("duplicate"):
+                        stats["duplicates"] += 1
+            except Exception:
+                # Continue scanning remaining channels even if one fails.
+                logging.exception("History scan failed for %s (%s)", guild.name, channel.name)
+
+    return stats
+
+
 # ---------- Commands ----------
 @bot.command()
 async def calc(ctx, *, kingdom: str = None):
@@ -1464,15 +1543,23 @@ async def apstatus(ctx, *, kingdom: str):
 
 
 @bot.command()
-async def techindex(ctx):
-    """!techindex -> scans ALL saved spy reports and saves battle-related tech into tech_index + kingdom_tech."""
+async def techindex(ctx, days: int = None):
+    """!techindex [days] -> ingest Discord history into DB, then index battle tech from saved reports."""
     if not _is_admin(ctx):
         return await ctx.send("❌ Admin only.")
     try:
-        await ctx.send("🔧 Running `!techindex` across ALL saved reports…")
-        stats = await run_db(sync_techindex_all, None)
+        if days and int(days) > 0:
+            await ctx.send(f"🔎 Pulling reports from Discord history (last `{int(days)}` days), then rebuilding tech index…")
+        else:
+            await ctx.send("🔎 Pulling reports from Discord history (all readable channels), then rebuilding tech index…")
+
+        ingest = await sync_ingest_history(int(days) if days else None)
+        stats = await run_db(sync_techindex_all, int(days) if days else None)
         await ctx.send(
             "✅ **Tech index complete**\n"
+            f"Guilds scanned: `{ingest['guilds']}` • Channels scanned: `{ingest['channels_scanned']}`\n"
+            f"Messages scanned: `{ingest['messages_scanned']}` • Matched reports: `{ingest['messages_matched']}`\n"
+            f"New reports saved: `{ingest['reports_saved']}` • Duplicates seen: `{ingest['duplicates']}`\n"
             f"Reports scanned: `{stats['reports_scanned']}`\n"
             f"Reports with tech: `{stats['reports_with_tech']}`\n"
             f"Tech lines indexed: `{stats['tech_history_rows']}`\n"
