@@ -24,6 +24,7 @@
 # !tech <kingdom>         -> shows deduped battle-related tech for that kingdom (from player_tech view)
 # !techtop                -> shows 15 most common indexed trainings across all kingdoms (from tech_index)
 # !techpull <kingdom>     -> rescans ALL reports for that kingdom and rebuilds deduped best tech list
+# !techcsv                -> exports all indexed kingdom research to CSV (upload in Discord)
 # !backfill [days]        -> rescans DB reports (all or last N days) to ensure tech + troops are accounted for
 #
 # !troops <kingdom>       -> latest SR troop snapshot (top 25 units)
@@ -68,6 +69,7 @@ PATCH_NOTES = [
     "Fixed: !techindex / !techpull now rebuild tech_index + per-kingdom best-tech (player_tech view).",
     "Added: !apstatus (read-only AP planner).",
     "Added: !troops / !troopsdelta aliases + ensured SR snapshots accounted for on backfill.",
+    "Added: !techcsv to export all indexed kingdom research as CSV.",
     "Improved: DB pool + thread offload everywhere (no event-loop blocking).",
 ]
 # -------------------------------------------------
@@ -79,6 +81,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
+ADMIN_USER_IDS = {944024167081209867}
+ADMIN_USER_IDS.update(
+    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+)
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -1019,6 +1025,56 @@ def sync_get_techtop_common(limit: int = 15):
         return cur.fetchall()
 
 
+def sync_get_research_export_rows():
+    """
+    CSV export rows: one row per kingdom + best indexed research line.
+    Includes kingdoms that have spy reports but currently no indexed battle tech.
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            WITH kingdoms AS (
+                SELECT DISTINCT kingdom
+                FROM spy_reports
+                WHERE kingdom IS NOT NULL
+            ),
+            latest_spy AS (
+                SELECT DISTINCT ON (kingdom)
+                    kingdom,
+                    id AS latest_report_id,
+                    created_at AS latest_report_at
+                FROM spy_reports
+                WHERE kingdom IS NOT NULL
+                ORDER BY kingdom, created_at DESC NULLS LAST, id DESC
+            )
+            SELECT
+                k.kingdom,
+                ls.latest_report_id,
+                ls.latest_report_at,
+                pt.tech_name,
+                pt.best_level,
+                pt.updated_at AS tech_updated_at,
+                pt.source_report_id,
+                COALESCE(ti.hits, 0) AS indexed_hits
+            FROM kingdoms k
+            LEFT JOIN latest_spy ls
+              ON ls.kingdom = k.kingdom
+            LEFT JOIN player_tech pt
+              ON pt.kingdom = k.kingdom
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS hits
+                FROM tech_index t
+                WHERE t.kingdom = k.kingdom
+                  AND pt.tech_name IS NOT NULL
+                  AND t.tech_name = pt.tech_name
+            ) ti ON TRUE
+            ORDER BY
+                k.kingdom ASC,
+                pt.best_level DESC NULLS LAST,
+                pt.tech_name ASC NULLS LAST;
+        """)
+        return cur.fetchall()
+
+
 def sync_backfill(days: int | None = None):
     """
     Ensures:
@@ -1244,6 +1300,9 @@ class APView(View):
 # ---------- Admin helper ----------
 def _is_admin(ctx: commands.Context) -> bool:
     try:
+        uid = int(getattr(ctx.author, "id", 0) or 0)
+        if uid in ADMIN_USER_IDS:
+            return True
         if ctx.guild and ctx.author and getattr(ctx.author, "guild_permissions", None):
             return bool(ctx.author.guild_permissions.administrator)
     except Exception:
@@ -1616,6 +1675,59 @@ async def techtop(ctx):
         tb = traceback.format_exc()
         await ctx.send("⚠️ techtop failed.")
         await send_error(ctx.guild, f"techtop error: {e}", tb=tb)
+
+
+@bot.command()
+async def techcsv(ctx):
+    """!techcsv -> export indexed kingdom research to CSV and upload file."""
+    if not _is_admin(ctx):
+        return await ctx.send("❌ Admin only.")
+    try:
+        rows = await run_db(sync_get_research_export_rows)
+        if not rows:
+            return await ctx.send("❌ No spy reports found in DB yet.")
+
+        out = io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow([
+            "kingdom",
+            "latest_spy_report_id",
+            "latest_spy_at_utc",
+            "tech_name",
+            "best_level",
+            "tech_updated_at_utc",
+            "source_report_id",
+            "indexed_hits",
+        ])
+
+        for r in rows:
+            writer.writerow([
+                r.get("kingdom") or "",
+                r.get("latest_report_id") or "",
+                (r.get("latest_report_at").isoformat() if r.get("latest_report_at") else ""),
+                r.get("tech_name") or "",
+                r.get("best_level") if r.get("best_level") is not None else "",
+                (r.get("tech_updated_at").isoformat() if r.get("tech_updated_at") else ""),
+                r.get("source_report_id") or "",
+                int(r.get("indexed_hits") or 0),
+            ])
+
+        payload = out.getvalue().encode("utf-8")
+        out.close()
+
+        kingdoms = len({(r.get("kingdom") or "").strip().lower() for r in rows if r.get("kingdom")})
+        ts = now_utc().strftime("%Y%m%d_%H%M%S")
+        filename = f"kg2_research_export_{ts}.csv"
+
+        await ctx.send(
+            f"📄 Export ready: `{filename}`\n"
+            f"Kingdoms: `{kingdoms}` • Rows: `{len(rows)}`",
+            file=discord.File(fp=io.BytesIO(payload), filename=filename)
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ techcsv failed.")
+        await send_error(ctx.guild, f"techcsv error: {e}", tb=tb)
 
 
 @bot.command()
