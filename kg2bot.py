@@ -63,11 +63,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-11.2"
+BOT_VERSION = "2026-02-11.3"
 PATCH_NOTES = [
-    "Added: !spies <kingdom> command to show last 10 reports with Date, Sent, Lost, and Result.",
-    "Added: !spies send recommendation based on highest send among recent 'Complete Infiltration' reports (fallback to highest recent send).",
-    "Updated: Removed 'King' line from !spy and !spyid summary output to avoid 'King: N/A' clutter.",
+    "Bug fix: Corrected !spy/!spyid cavalry counter math to use enemy parsed pike count (4x enemy pike + 1), not recommended pike-to-send.",
 ]
 # -------------------------------------------------
 
@@ -311,6 +309,21 @@ def estimate_enemy_cavalry(troops: dict) -> int:
     return total
 
 
+def estimate_enemy_pikemen(troops: dict) -> int:
+    """
+    Estimate enemy pike by summing troop lines that contain 'pikemen' or 'pike'.
+    """
+    total = 0
+    for name, count in (troops or {}).items():
+        n = (name or "").lower()
+        if "pikemen" in n or "pike" in n:
+            try:
+                total += int(count or 0)
+            except Exception:
+                continue
+    return total
+
+
 def build_spy_text_report(row) -> tuple[str, str]:
     """
     Returns:
@@ -335,7 +348,8 @@ def build_spy_text_report(row) -> tuple[str, str]:
 
     enemy_cav = estimate_enemy_cavalry(troops)
     pike_to_send = (enemy_cav // 4) + 1 if enemy_cav > 0 else 0
-    cav_to_counter_pike = (4 * pike_to_send) + 1 if pike_to_send > 0 else 0
+    enemy_pike = estimate_enemy_pikemen(troops)
+    cav_to_counter_pike = (4 * enemy_pike) + 1 if enemy_pike > 0 else 0
 
     lines = [
         f"Kingdom: {kingdom}",
@@ -345,8 +359,9 @@ def build_spy_text_report(row) -> tuple[str, str]:
         f"DP: {fmt_int(dp)}",
         f"DP with Castles: {fmt_int(dp_with_castles)} (Castles: {castles})",
         f"Enemy Cav (parsed): {fmt_int(enemy_cav)}",
+        f"Enemy Pike (parsed): {fmt_int(enemy_pike)}",
         f"Pike to send (1/4 cav + 1): {fmt_int(pike_to_send)}",
-        f"Cav to counter pike (4x pike + 1): {fmt_int(cav_to_counter_pike)}",
+        f"Cav to counter enemy pike (4x enemy pike + 1): {fmt_int(cav_to_counter_pike)}",
         f"Report ID: {row.get('id')} | Captured: {row.get('created_at')}",
     ]
     return "\n".join(lines), text
