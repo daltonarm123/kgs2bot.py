@@ -287,7 +287,7 @@ def parse_spy_details(text: str) -> dict:
             continue
 
         if details["result"] is None:
-            if "result:" in ll:
+            if ll.startswith("result level:") or ll.startswith("result:"):
                 details["result"] = line.split(":", 1)[1].strip()
             elif "spy mission was successful" in ll or "spies were successful" in ll:
                 details["result"] = "Success"
