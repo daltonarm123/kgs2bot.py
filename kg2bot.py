@@ -651,7 +651,28 @@ def init_db():
         """)
 
         # player_tech compatibility: VIEW to kingdom_tech (so !tech reads from "player_tech")
-        cur.execute("DROP VIEW IF EXISTS player_tech;")
+        # Handle legacy schema where player_tech may be a TABLE.
+        cur.execute("SELECT to_regclass('player_tech')::text AS reg;")
+        reg = cur.fetchone()
+        reg_name = (reg or {}).get("reg")
+        if reg_name:
+            cur.execute(
+                """
+                SELECT c.relkind
+                FROM pg_class c
+                WHERE c.oid = to_regclass('player_tech');
+                """
+            )
+            rk_row = cur.fetchone() or {}
+            relkind = rk_row.get("relkind")
+            if relkind in ("r", "p"):
+                cur.execute("DROP TABLE IF EXISTS player_tech;")
+            elif relkind in ("v", "m"):
+                cur.execute("DROP VIEW IF EXISTS player_tech;")
+            else:
+                # Fallback for uncommon relation types.
+                cur.execute("DROP VIEW IF EXISTS player_tech;")
+                cur.execute("DROP TABLE IF EXISTS player_tech;")
         cur.execute("""
         CREATE VIEW player_tech AS
         SELECT kingdom, tech_name, best_level, updated_at, source_report_id
