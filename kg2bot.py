@@ -63,12 +63,11 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-11.1"
+BOT_VERSION = "2026-02-11.2"
 PATCH_NOTES = [
-    "Updated: !spy and !spyid now return structured KGBOT-9 output (king/alliance, spies sent/lost/result, net worth, DP with castles).",
-    "Added: Counter helper math in spy output (pike to send = 1/4 cav + 1, cav to counter pike = 4x pike + 1).",
-    "Added: Paste-ready TSV row in !spy/!spyid output for spreadsheet or calc workflows.",
-    "Added: Full raw spy report attached as spy_report_<id>.txt for copy/paste into external tools.",
+    "Added: !spies <kingdom> command to show last 10 reports with Date, Sent, Lost, and Result.",
+    "Added: !spies send recommendation based on highest send among recent 'Complete Infiltration' reports (fallback to highest recent send).",
+    "Updated: Removed 'King' line from !spy and !spyid summary output to avoid 'King: N/A' clutter.",
 ]
 # -------------------------------------------------
 
@@ -340,7 +339,6 @@ def build_spy_text_report(row) -> tuple[str, str]:
 
     lines = [
         f"Kingdom: {kingdom}",
-        f"King: {king_name}",
         f"Alliance: {alliance}",
         f"Spies Sent/Lost/Result: {fmt_int(spies_sent)} / {fmt_int(spies_lost)} / {spy_result}",
         f"Net Worth: {fmt_int(net_worth)}",
@@ -790,6 +788,18 @@ def sync_get_spy_history(kingdom: str, limit: int = 5):
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at
+            FROM spy_reports
+            WHERE kingdom=%s
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT %s;
+        """, (kingdom, int(limit)))
+        return cur.fetchall()
+
+
+def sync_get_spy_history_with_raw(kingdom: str, limit: int = 10):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, kingdom, created_at, raw, raw_gz
             FROM spy_reports
             WHERE kingdom=%s
             ORDER BY created_at DESC NULLS LAST, id DESC
@@ -1738,6 +1748,66 @@ async def spyhistory(ctx, *, kingdom: str):
         tb = traceback.format_exc()
         await ctx.send("⚠️ spyhistory failed.")
         await send_error(ctx.guild, f"spyhistory error: {e}", tb=tb)
+
+
+@bot.command()
+async def spies(ctx, *, kingdom: str):
+    """!spies <kingdom> -> last 10 reports with Date/Sent/Lost/Result + send recommendation."""
+    try:
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+        rows = await run_db(sync_get_spy_history_with_raw, real, 10)
+        if not rows:
+            return await ctx.send(f"❌ No saved reports for **{real}**.")
+
+        lines = []
+        successful_sends = []
+        any_sends = []
+
+        for r in rows:
+            text = extract_report_text_for_row(r)
+            d = parse_spy_details(text)
+            sent = d.get("spies_sent")
+            lost = d.get("spies_lost")
+            result = d.get("result") or "N/A"
+            ts = r.get("created_at")
+            ts_txt = str(ts).split(".")[0] if ts else "Unknown"
+
+            if sent is not None:
+                any_sends.append(int(sent))
+                if "complete infiltration" in str(result).lower():
+                    successful_sends.append(int(sent))
+
+            lines.append(
+                f"• `{ts_txt}` | Sent `{fmt_int(sent)}` | Lost `{fmt_int(lost)}` | Result `{result}`"
+            )
+
+        if successful_sends:
+            recommended = max(successful_sends)
+            rec_basis = "based on last 10 `Complete Infiltration` reports"
+        elif any_sends:
+            recommended = max(any_sends)
+            rec_basis = "based on highest send seen in last 10 reports (no complete infiltration found)"
+        else:
+            recommended = None
+            rec_basis = "no parsable sent values found"
+
+        rec_line = (
+            f"Recommended spies to send: `{fmt_int(recommended)}` ({rec_basis})"
+            if recommended is not None else
+            f"Recommended spies to send: `N/A` ({rec_basis})"
+        )
+
+        await ctx.send(
+            f"🕵️ **Spies History • {real}**\n"
+            f"{rec_line}\n\n"
+            + "\n".join(lines)
+        )
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ spies failed.")
+        await send_error(ctx.guild, f"spies error: {e}", tb=tb)
 
 
 @bot.command()
