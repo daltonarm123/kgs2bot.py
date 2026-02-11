@@ -63,9 +63,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-11.3"
+BOT_VERSION = "2026-02-11.4"
 PATCH_NOTES = [
-    "Bug fix: Corrected !spy/!spyid cavalry counter math to use enemy parsed pike count (4x enemy pike + 1), not recommended pike-to-send.",
+    "Bug fix: !spies recommendation now uses the most recent `Complete Infiltration` report's sent value (date-priority) instead of highest historical send.",
 ]
 # -------------------------------------------------
 
@@ -1776,8 +1776,8 @@ async def spies(ctx, *, kingdom: str):
             return await ctx.send(f"❌ No saved reports for **{real}**.")
 
         lines = []
-        successful_sends = []
-        any_sends = []
+        most_recent_complete_send = None
+        most_recent_any_send = None
 
         for r in rows:
             text = extract_report_text_for_row(r)
@@ -1789,20 +1789,23 @@ async def spies(ctx, *, kingdom: str):
             ts_txt = str(ts).split(".")[0] if ts else "Unknown"
 
             if sent is not None:
-                any_sends.append(int(sent))
-                if "complete infiltration" in str(result).lower():
-                    successful_sends.append(int(sent))
+                sent_int = int(sent)
+                if most_recent_any_send is None:
+                    most_recent_any_send = sent_int
+                if "complete infiltration" in str(result).lower() and most_recent_complete_send is None:
+                    # rows are newest -> oldest, so first complete is the most recent complete report
+                    most_recent_complete_send = sent_int
 
             lines.append(
                 f"• `{ts_txt}` | Sent `{fmt_int(sent)}` | Lost `{fmt_int(lost)}` | Result `{result}`"
             )
 
-        if successful_sends:
-            recommended = max(successful_sends)
-            rec_basis = "based on last 10 `Complete Infiltration` reports"
-        elif any_sends:
-            recommended = max(any_sends)
-            rec_basis = "based on highest send seen in last 10 reports (no complete infiltration found)"
+        if most_recent_complete_send is not None:
+            recommended = most_recent_complete_send
+            rec_basis = "based on the most recent `Complete Infiltration` report"
+        elif most_recent_any_send is not None:
+            recommended = most_recent_any_send
+            rec_basis = "based on the most recent report with parsable sent value (no complete infiltration found)"
         else:
             recommended = None
             rec_basis = "no parsable sent values found"
