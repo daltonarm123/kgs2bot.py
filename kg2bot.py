@@ -338,42 +338,6 @@ def build_spy_text_report(row) -> tuple[str, str]:
     pike_to_send = (enemy_cav // 4) + 1 if enemy_cav > 0 else 0
     cav_to_counter_pike = (4 * pike_to_send) + 1 if pike_to_send > 0 else 0
 
-    headers = [
-        "kingdom",
-        "king_name",
-        "alliance",
-        "spies_sent",
-        "spies_lost",
-        "result",
-        "net_worth",
-        "base_dp",
-        "castles",
-        "dp_with_castles",
-        "enemy_cav",
-        "pike_to_send",
-        "cav_to_counter_pike",
-        "report_id",
-        "captured_at_utc",
-    ]
-    row_values = [
-        kingdom,
-        king_name,
-        alliance,
-        "" if spies_sent is None else str(spies_sent),
-        "" if spies_lost is None else str(spies_lost),
-        spy_result,
-        "" if net_worth is None else str(net_worth),
-        str(dp),
-        str(castles),
-        str(dp_with_castles),
-        str(enemy_cav),
-        str(pike_to_send),
-        str(cav_to_counter_pike),
-        str(row.get("id") or ""),
-        str(row.get("created_at") or ""),
-    ]
-    tsv_block = "\t".join(headers) + "\n" + "\t".join(row_values)
-
     lines = [
         f"Kingdom: {kingdom}",
         f"King: {king_name}",
@@ -386,11 +350,6 @@ def build_spy_text_report(row) -> tuple[str, str]:
         f"Pike to send (1/4 cav + 1): {fmt_int(pike_to_send)}",
         f"Cav to counter pike (4x pike + 1): {fmt_int(cav_to_counter_pike)}",
         f"Report ID: {row.get('id')} | Captured: {row.get('created_at')}",
-        "",
-        "Paste Row (TSV):",
-        "```tsv",
-        tsv_block,
-        "```",
     ]
     return "\n".join(lines), text
 
@@ -579,6 +538,31 @@ def truncate_for_discord(s: str, limit: int = 1800) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "\n…(truncated)…"
+
+
+def split_for_discord(s: str, limit: int = 1900) -> list[str]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    if len(s) <= limit:
+        return [s]
+
+    chunks = []
+    cur = ""
+    for line in s.splitlines(True):
+        if len(cur) + len(line) <= limit:
+            cur += line
+            continue
+        if cur:
+            chunks.append(cur.rstrip("\n"))
+            cur = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        cur += line
+    if cur:
+        chunks.append(cur.rstrip("\n"))
+    return chunks
 
 
 async def send_error(guild: discord.Guild, msg: str, tb: str | None = None):
@@ -1702,11 +1686,9 @@ async def spy(ctx, *, kingdom: str):
             return await ctx.send(f"❌ No saved reports for **{real}**.")
         content, raw = build_spy_text_report(row)
         if raw:
-            file_bytes = io.BytesIO(raw.encode("utf-8", errors="replace"))
-            fname = f"spy_report_{int(row.get('id') or 0)}.txt"
-            await ctx.send(content=content, file=discord.File(file_bytes, filename=fname))
-        else:
-            await ctx.send(content=content)
+            for part in split_for_discord(raw, 1900):
+                await ctx.send(part)
+        await ctx.send(content=content)
     except Exception as e:
         tb = traceback.format_exc()
         await ctx.send("⚠️ spy failed.")
@@ -1722,11 +1704,9 @@ async def spyid(ctx, report_id: int):
             return await ctx.send("❌ No report found with that ID.")
         content, raw = build_spy_text_report(row)
         if raw:
-            file_bytes = io.BytesIO(raw.encode("utf-8", errors="replace"))
-            fname = f"spy_report_{int(row.get('id') or 0)}.txt"
-            await ctx.send(content=content, file=discord.File(file_bytes, filename=fname))
-        else:
-            await ctx.send(content=content)
+            for part in split_for_discord(raw, 1900):
+                await ctx.send(part)
+        await ctx.send(content=content)
     except Exception as e:
         tb = traceback.format_exc()
         await ctx.send("⚠️ spyid failed.")
