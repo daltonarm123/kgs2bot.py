@@ -63,14 +63,12 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-01-28.2"
+BOT_VERSION = "2026-02-11.1"
 PATCH_NOTES = [
-    "Added: Full command set restored (!spy, !spyid, !spyhistory, !techindex, !tech, !techtop, !techpull, !backfill).",
-    "Fixed: !techindex / !techpull now rebuild tech_index + per-kingdom best-tech (player_tech view).",
-    "Added: !apstatus (read-only AP planner).",
-    "Added: !troops / !troopsdelta aliases + ensured SR snapshots accounted for on backfill.",
-    "Added: !techcsv to export all indexed kingdom research as CSV.",
-    "Improved: DB pool + thread offload everywhere (no event-loop blocking).",
+    "Updated: !spy and !spyid now return structured KGBOT-9 output (king/alliance, spies sent/lost/result, net worth, DP with castles).",
+    "Added: Counter helper math in spy output (pike to send = 1/4 cav + 1, cav to counter pike = 4x pike + 1).",
+    "Added: Paste-ready TSV row in !spy/!spyid output for spreadsheet or calc workflows.",
+    "Added: Full raw spy report attached as spy_report_<id>.txt for copy/paste into external tools.",
 ]
 # -------------------------------------------------
 
@@ -197,6 +195,15 @@ def extract_report_text_for_row(row) -> str:
     return ""
 
 
+def fmt_int(value) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return "N/A"
+
+
 def hash_report(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -221,6 +228,171 @@ def parse_spy(text: str):
             if m:
                 castles = int(m.group())
     return kingdom, dp, castles
+
+
+def parse_first_int_from_value_line(line: str):
+    m = re.search(r":\s*([\d,]+)", line)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+
+def parse_spy_details(text: str) -> dict:
+    """
+    Pull extra fields for !spy presentation from a raw report.
+    Keeps parsing permissive because report wording can vary.
+    """
+    details = {
+        "target": None,
+        "king_name": None,
+        "alliance": None,
+        "spies_sent": None,
+        "spies_lost": None,
+        "result": None,
+        "net_worth": None,
+    }
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        ll = line.lower()
+
+        if ll.startswith("target:"):
+            details["target"] = line.split(":", 1)[1].strip()
+            continue
+        if ll.startswith("king:") or ll.startswith("king name:"):
+            details["king_name"] = line.split(":", 1)[1].strip()
+            continue
+        if ll.startswith("alliance:"):
+            details["alliance"] = line.split(":", 1)[1].strip()
+            continue
+        if "spies sent" in ll:
+            v = parse_first_int_from_value_line(line)
+            if v is not None:
+                details["spies_sent"] = v
+            continue
+        if "spies lost" in ll:
+            v = parse_first_int_from_value_line(line)
+            if v is not None:
+                details["spies_lost"] = v
+            continue
+        if "networth" in ll or "net worth" in ll:
+            v = parse_first_int_from_value_line(line)
+            if v is not None:
+                details["net_worth"] = v
+            continue
+
+        if details["result"] is None:
+            if "result:" in ll:
+                details["result"] = line.split(":", 1)[1].strip()
+            elif "spy mission was successful" in ll or "spies were successful" in ll:
+                details["result"] = "Success"
+            elif "spy mission failed" in ll or "spies were caught" in ll:
+                details["result"] = "Failed"
+
+    return details
+
+
+def estimate_enemy_cavalry(troops: dict) -> int:
+    """
+    Estimate "their cav" by summing troop lines that contain "cavalry".
+    """
+    total = 0
+    for name, count in (troops or {}).items():
+        n = (name or "").lower()
+        if "cavalry" in n:
+            try:
+                total += int(count or 0)
+            except Exception:
+                continue
+    return total
+
+
+def build_spy_text_report(row) -> tuple[str, str]:
+    """
+    Returns:
+    - human-readable summary text
+    - full raw report text (for .txt attachment)
+    """
+    text = extract_report_text_for_row(row)
+    details = parse_spy_details(text)
+    troops = parse_sr_troops(text)
+
+    kingdom = details.get("target") or row.get("kingdom") or "Unknown"
+    king_name = details.get("king_name") or "N/A"
+    alliance = details.get("alliance") or "N/A"
+    spies_sent = details.get("spies_sent")
+    spies_lost = details.get("spies_lost")
+    spy_result = details.get("result") or "N/A"
+    net_worth = details.get("net_worth")
+
+    dp = int(row.get("defense_power") or 0) if row.get("defense_power") is not None else 0
+    castles = int(row.get("castles") or 0)
+    dp_with_castles = ceil(dp * (1 + castle_bonus(castles))) if dp > 0 else 0
+
+    enemy_cav = estimate_enemy_cavalry(troops)
+    pike_to_send = (enemy_cav // 4) + 1 if enemy_cav > 0 else 0
+    cav_to_counter_pike = (4 * pike_to_send) + 1 if pike_to_send > 0 else 0
+
+    headers = [
+        "kingdom",
+        "king_name",
+        "alliance",
+        "spies_sent",
+        "spies_lost",
+        "result",
+        "net_worth",
+        "base_dp",
+        "castles",
+        "dp_with_castles",
+        "enemy_cav",
+        "pike_to_send",
+        "cav_to_counter_pike",
+        "report_id",
+        "captured_at_utc",
+    ]
+    row_values = [
+        kingdom,
+        king_name,
+        alliance,
+        "" if spies_sent is None else str(spies_sent),
+        "" if spies_lost is None else str(spies_lost),
+        spy_result,
+        "" if net_worth is None else str(net_worth),
+        str(dp),
+        str(castles),
+        str(dp_with_castles),
+        str(enemy_cav),
+        str(pike_to_send),
+        str(cav_to_counter_pike),
+        str(row.get("id") or ""),
+        str(row.get("created_at") or ""),
+    ]
+    tsv_block = "\t".join(headers) + "\n" + "\t".join(row_values)
+
+    lines = [
+        f"Kingdom: {kingdom}",
+        f"King: {king_name}",
+        f"Alliance: {alliance}",
+        f"Spies Sent/Lost/Result: {fmt_int(spies_sent)} / {fmt_int(spies_lost)} / {spy_result}",
+        f"Net Worth: {fmt_int(net_worth)}",
+        f"DP: {fmt_int(dp)}",
+        f"DP with Castles: {fmt_int(dp_with_castles)} (Castles: {castles})",
+        f"Enemy Cav (parsed): {fmt_int(enemy_cav)}",
+        f"Pike to send (1/4 cav + 1): {fmt_int(pike_to_send)}",
+        f"Cav to counter pike (4x pike + 1): {fmt_int(cav_to_counter_pike)}",
+        f"Report ID: {row.get('id')} | Captured: {row.get('created_at')}",
+        "",
+        "Paste Row (TSV):",
+        "```tsv",
+        tsv_block,
+        "```",
+    ]
+    return "\n".join(lines), text
 
 
 def parse_sr_troops(text: str) -> dict:
@@ -1507,7 +1679,13 @@ async def spy(ctx, *, kingdom: str):
         row = await run_db(sync_get_latest_spy_for_kingdom, real)
         if not row:
             return await ctx.send(f"❌ No saved reports for **{real}**.")
-        await ctx.send(embed=build_spy_embed(row))
+        content, raw = build_spy_text_report(row)
+        if raw:
+            file_bytes = io.BytesIO(raw.encode("utf-8", errors="replace"))
+            fname = f"spy_report_{int(row.get('id') or 0)}.txt"
+            await ctx.send(content=content, file=discord.File(file_bytes, filename=fname))
+        else:
+            await ctx.send(content=content)
     except Exception as e:
         tb = traceback.format_exc()
         await ctx.send("⚠️ spy failed.")
@@ -1521,7 +1699,13 @@ async def spyid(ctx, report_id: int):
         row = await run_db(sync_get_spy_by_id, int(report_id))
         if not row:
             return await ctx.send("❌ No report found with that ID.")
-        await ctx.send(embed=build_spy_embed(row))
+        content, raw = build_spy_text_report(row)
+        if raw:
+            file_bytes = io.BytesIO(raw.encode("utf-8", errors="replace"))
+            fname = f"spy_report_{int(row.get('id') or 0)}.txt"
+            await ctx.send(content=content, file=discord.File(file_bytes, filename=fname))
+        else:
+            await ctx.send(content=content)
     except Exception as e:
         tb = traceback.format_exc()
         await ctx.send("⚠️ spyid failed.")
