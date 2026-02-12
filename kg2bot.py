@@ -63,9 +63,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-11.5"
+BOT_VERSION = "2026-02-11.6"
 PATCH_NOTES = [
-    "Bug fix: KGBOT-29 parsing now reads DP/castles from values after ':' so formatted lines like [size=80]...Approximate defensive power*: 22200 no longer parse as 80.",
+    "Improved: Auto-captured spy reports now post a compact one-line save confirmation instead of a large embed to reduce channel clutter.",
 ]
 # -------------------------------------------------
 
@@ -1579,7 +1579,13 @@ async def on_message(msg: discord.Message):
         if result.get("saved") and not result.get("duplicate") and result.get("row"):
             row = result["row"]
             if can_send(msg.channel, msg.guild):
-                await msg.channel.send(embed=build_spy_embed(row))
+                dp = row.get("defense_power")
+                castles = int(row.get("castles") or 0)
+                kingdom = row.get("kingdom") or "Unknown"
+                dp_txt = f"{int(dp):,}" if dp else "N/A"
+                await msg.channel.send(
+                    f"✅ Spy report saved: ID `{row.get('id')}` • **{kingdom}** • DP `{dp_txt}` • Castles `{castles}`"
+                )
         elif result.get("saved") and result.get("duplicate"):
             if can_send(msg.channel, msg.guild):
                 await msg.channel.send("✅ Duplicate spy report detected (repair mode applied).")
