@@ -63,9 +63,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-11.4"
+BOT_VERSION = "2026-02-11.5"
 PATCH_NOTES = [
-    "Bug fix: !spies recommendation now uses the most recent `Complete Infiltration` report's sent value (date-priority) instead of highest historical send.",
+    "Bug fix: KGBOT-29 parsing now reads DP/castles from values after ':' so formatted lines like [size=80]...Approximate defensive power*: 22200 no longer parse as 80.",
 ]
 # -------------------------------------------------
 
@@ -217,13 +217,13 @@ def parse_spy(text: str):
         if ll.startswith("target:"):
             kingdom = line.split(":", 1)[1].strip()
         if "approximate defensive power" in ll or "defensive power" in ll:
-            m = re.search(r"\d+", line.replace(",", ""))
-            if m:
-                dp = int(m.group())
+            v = parse_first_int_from_value_line(line)
+            if v is not None:
+                dp = v
         if "number of castles" in ll:
-            m = re.search(r"\d+", line)
-            if m:
-                castles = int(m.group())
+            v = parse_first_int_from_value_line(line)
+            if v is not None:
+                castles = v
     return kingdom, dp, castles
 
 
