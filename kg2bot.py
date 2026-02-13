@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.8"
+BOT_VERSION = "2026-02-13.9"
 PATCH_NOTES = [
-    "Bug fix: !attackbackfill now scans both message and embed text, and saves attack reports without relying on strict pre-filters.",
+    "Bug fix: legacy attack_reports schema is auto-migrated (target_kingdom NOT NULL handled) and backfill now skips per-message failures instead of stopping channel scans.",
 ]
 # -------------------------------------------------
 
@@ -1020,11 +1020,13 @@ def init_db():
 
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
-            SELECT column_name
+            SELECT column_name, is_nullable
             FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'attack_reports';
         """)
-        attack_cols = {r["column_name"] for r in cur.fetchall()}
+        attack_col_rows = cur.fetchall()
+        attack_cols = {r["column_name"] for r in attack_col_rows}
+        attack_nullable = {r["column_name"]: (str(r.get("is_nullable") or "").upper() == "YES") for r in attack_col_rows}
 
         if "attacker" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN attacker TEXT;")
@@ -1050,6 +1052,17 @@ def init_db():
             cur.execute("ALTER TABLE attack_reports ADD COLUMN report_hash TEXT;")
 
         # Backfill from common legacy names if present.
+        if "target_kingdom" in attack_cols and "defender" in attack_cols:
+            cur.execute("""
+                UPDATE attack_reports
+                SET defender = COALESCE(defender, target_kingdom)
+                WHERE defender IS NULL AND target_kingdom IS NOT NULL;
+            """)
+        if "target_kingdom" in attack_cols and not attack_nullable.get("target_kingdom", True):
+            # Legacy schema had target_kingdom NOT NULL; our insert path doesn't always populate it.
+            # Relax this so !attackbackfill and live ingest can store all valid formats.
+            cur.execute("ALTER TABLE attack_reports ALTER COLUMN target_kingdom DROP NOT NULL;")
+
         if "result" in attack_cols and "attack_result" in attack_cols:
             cur.execute("""
                 UPDATE attack_reports
@@ -2154,6 +2167,7 @@ async def sync_ingest_history(days: int | None = None):
         "attack_duplicates": 0,
         "reports_forwarded": 0,
         "forward_failures": 0,
+        "ingest_errors": 0,
     }
 
     for guild in bot.guilds:
@@ -2181,33 +2195,37 @@ async def sync_ingest_history(days: int | None = None):
                         continue
 
                     for content in candidates:
-                        matched = False
+                        try:
+                            matched = False
 
-                        res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
-                        if res.get("saved"):
-                            matched = True
-                            if not res.get("duplicate"):
-                                stats["reports_saved"] += 1
-                            else:
-                                stats["duplicates"] += 1
+                            res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
+                            if res.get("saved"):
+                                matched = True
+                                if not res.get("duplicate"):
+                                    stats["reports_saved"] += 1
+                                else:
+                                    stats["duplicates"] += 1
 
-                        ares = await run_db(sync_store_attack_report, content, normalize_to_utc(m.created_at))
-                        if ares.get("saved"):
-                            matched = True
-                            if not ares.get("duplicate"):
-                                stats["attack_reports_saved"] += 1
-                            else:
-                                stats["attack_duplicates"] += 1
+                            ares = await run_db(sync_store_attack_report, content, normalize_to_utc(m.created_at))
+                            if ares.get("saved"):
+                                matched = True
+                                if not ares.get("duplicate"):
+                                    stats["attack_reports_saved"] += 1
+                                else:
+                                    stats["attack_duplicates"] += 1
 
-                        if matched:
-                            stats["messages_matched"] += 1
+                            if matched:
+                                stats["messages_matched"] += 1
 
-                        if looks_like_recon_report(content):
-                            fwd = await run_db(sync_recon_ingest_report, content)
-                            if fwd.get("ok"):
-                                stats["reports_forwarded"] += 1
-                            else:
-                                stats["forward_failures"] += 1
+                            if looks_like_recon_report(content):
+                                fwd = await run_db(sync_recon_ingest_report, content)
+                                if fwd.get("ok"):
+                                    stats["reports_forwarded"] += 1
+                                else:
+                                    stats["forward_failures"] += 1
+                        except Exception:
+                            stats["ingest_errors"] += 1
+                            logging.exception("Backfill ingest failed for message %s in #%s", getattr(m, "id", "unknown"), channel.name)
             except Exception:
                 # Continue scanning remaining channels even if one fails.
                 logging.exception("History scan failed for %s (%s)", guild.name, channel.name)
@@ -2800,7 +2818,8 @@ async def attackbackfill(ctx, days: int = None):
             f"Guilds scanned: `{stats['guilds']}` • Channels scanned: `{stats['channels_scanned']}`\n"
             f"Messages scanned: `{stats['messages_scanned']}` • Matched reports: `{stats['messages_matched']}`\n"
             f"Attack reports saved: `{stats['attack_reports_saved']}` • Attack duplicates: `{stats['attack_duplicates']}`\n"
-            f"Forwarded to recon-hub: `{stats['reports_forwarded']}` • Forward failures: `{stats['forward_failures']}`"
+            f"Forwarded to recon-hub: `{stats['reports_forwarded']}` • Forward failures: `{stats['forward_failures']}`\n"
+            f"Ingest errors: `{stats['ingest_errors']}`"
         )
     except Exception as e:
         tb = traceback.format_exc()
