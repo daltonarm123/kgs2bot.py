@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.9"
+BOT_VERSION = "2026-02-13.10"
 PATCH_NOTES = [
-    "Bug fix: legacy attack_reports schema is auto-migrated (target_kingdom NOT NULL handled) and backfill now skips per-message failures instead of stopping channel scans.",
+    "Bug fix: legacy attack_reports.raw_text NOT NULL is now handled and attack inserts always populate raw_text for backfill compatibility.",
 ]
 # -------------------------------------------------
 
@@ -1013,6 +1013,7 @@ def init_db():
             reported_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL,
             raw TEXT,
+            raw_text TEXT,
             raw_gz BYTEA,
             report_hash TEXT UNIQUE
         );
@@ -1046,6 +1047,8 @@ def init_db():
             cur.execute("ALTER TABLE attack_reports ADD COLUMN created_at TIMESTAMPTZ;")
         if "raw" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN raw TEXT;")
+        if "raw_text" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN raw_text TEXT;")
         if "raw_gz" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN raw_gz BYTEA;")
         if "report_hash" not in attack_cols:
@@ -1086,6 +1089,19 @@ def init_db():
                 UPDATE attack_reports
                 SET created_at = COALESCE(created_at, captured_at)
                 WHERE created_at IS NULL;
+            """)
+        if "raw_text" in attack_cols and "raw" in attack_cols:
+            cur.execute("""
+                UPDATE attack_reports
+                SET raw_text = COALESCE(raw_text, raw, '')
+                WHERE raw_text IS NULL;
+            """)
+        if "raw_text" in attack_cols and not attack_nullable.get("raw_text", True):
+            # Legacy schema may enforce NOT NULL; ensure existing rows satisfy it.
+            cur.execute("""
+                UPDATE attack_reports
+                SET raw_text = COALESCE(raw_text, '')
+                WHERE raw_text IS NULL;
             """)
         cur.execute("""
             UPDATE attack_reports
@@ -1557,6 +1573,7 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
     h = hash_report(msg_content)
     raw_gz = psycopg2.Binary(compress_report(msg_content))
     raw_text = msg_content if KEEP_RAW_TEXT else None
+    raw_text_compat = msg_content or ""
 
     settlements = d.get("settlements_lost") or []
     settlements_txt = " | ".join([str(x).strip() for x in settlements if str(x).strip()]) or None
@@ -1572,9 +1589,9 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
             INSERT INTO attack_reports (
                 attacker, defender, attack_result, land_taken,
                 settlements_lost_count, settlements_lost, reported_at, created_at,
-                raw, raw_gz, report_hash
+                raw, raw_text, raw_gz, report_hash
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id, attacker, defender, attack_result, land_taken,
                       settlements_lost_count, settlements_lost, reported_at, created_at;
             """,
@@ -1588,6 +1605,7 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
                 d.get("reported_at"),
                 created_at_utc,
                 raw_text,
+                raw_text_compat,
                 raw_gz,
                 h,
             ),
