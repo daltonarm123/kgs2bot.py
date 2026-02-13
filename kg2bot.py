@@ -16,6 +16,7 @@
 # !spy <kingdom>        -> latest saved spy report embed (kingdom)
 # !spyid <id>           -> saved spy report by DB id
 # !spyhistory <kingdom> -> last 5 report IDs + timestamps + DP/castles
+# !track [date]         -> daily attack-loss tracker + TSV export
 #
 # !ap <kingdom>       -> AP Planner with buttons (Minor/Victory/Major/Overwhelming + Reset + Rebuild)
 # !apstatus <kingdom> -> read-only AP status (no buttons)
@@ -67,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.1"
+BOT_VERSION = "2026-02-13.2"
 PATCH_NOTES = [
-    "Added: New spy reports now include a direct 'Open in calc' link on the website, and the calc can load that report and switch to other saved reports for the same kingdom.",
+    "Added: Attack reports are now auto-saved, and !track now shows daily hits, land lost, settlement losses, plus TSV export for spreadsheets.",
 ]
 # -------------------------------------------------
 
@@ -299,6 +300,119 @@ def parse_spy_details(text: str) -> dict:
             elif "spy mission failed" in ll or "spies were caught" in ll:
                 details["result"] = "Failed"
 
+    return details
+
+
+def parse_attack_details(text: str) -> dict:
+    """
+    Parse core fields from an attack report.
+    Kept permissive because report text varies between accounts/views.
+    """
+    details = {
+        "attacker": None,
+        "defender": None,
+        "result": None,
+        "land_taken": None,
+        "settlements_lost_count": 0,
+        "settlements_lost": [],
+        "reported_at": None,
+    }
+
+    lines = (text or "").splitlines()
+    for raw_line in lines:
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        ll = line.lower()
+
+        # Date line can contain wrappers like [mytime].../mytime
+        if ll.startswith("date:"):
+            m_dt = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", line)
+            if m_dt:
+                try:
+                    details["reported_at"] = datetime.strptime(
+                        m_dt.group(1), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+            continue
+
+        if ll.startswith("target:"):
+            details["defender"] = line.split(":", 1)[1].strip()
+            continue
+
+        if ll.startswith("attack result:") or ll.startswith("result:"):
+            details["result"] = line.split(":", 1)[1].strip()
+            continue
+
+        # Subject/Attack header: "... Attack Report: Attacker attacked Defender"
+        if "attack report:" in ll and "attacked" in ll:
+            right = line.split("attack report:", 1)[1].strip()
+            m_pair = re.match(r"(.+?)\s+attacked\s+(.+)$", right, re.IGNORECASE)
+            if m_pair:
+                details["attacker"] = details["attacker"] or m_pair.group(1).strip()
+                details["defender"] = details["defender"] or m_pair.group(2).strip()
+            continue
+
+        # Land parse
+        if details["land_taken"] is None and ("land" in ll or "acre" in ll):
+            m_land = re.search(r"([\d,]+)\s*acres?", line, re.IGNORECASE)
+            if m_land:
+                try:
+                    details["land_taken"] = int(m_land.group(1).replace(",", ""))
+                    continue
+                except Exception:
+                    pass
+            m_land2 = re.search(
+                r"(?:land|acres?)\s*(?:taken|gained|captured|conquered|lost|stolen)?\s*[:\-]?\s*([\d,]+)",
+                line,
+                re.IGNORECASE,
+            )
+            if m_land2:
+                try:
+                    details["land_taken"] = int(m_land2.group(1).replace(",", ""))
+                    continue
+                except Exception:
+                    pass
+
+        # Settlement movement/loss markers.
+        if any(k in ll for k in ("settlement", "town", "city")) and any(
+            k in ll for k in ("lost", "sacked", "captured", "taken", "took")
+        ):
+            name = None
+            m_name = re.search(r"(?:settlement|town|city)\s+([A-Za-z0-9][A-Za-z0-9 '\-]{1,48})", line, re.IGNORECASE)
+            if m_name:
+                name = m_name.group(1).strip()
+            if name:
+                details["settlements_lost"].append(name)
+            else:
+                details["settlements_lost"].append(line[:120])
+
+    # Fallback source for attacker/defender
+    if not details["attacker"]:
+        for raw_line in lines:
+            line = (raw_line or "").strip()
+            if line.lower().startswith("from:"):
+                details["attacker"] = line.split(":", 1)[1].strip()
+                break
+    if not details["defender"]:
+        for raw_line in lines:
+            line = (raw_line or "").strip()
+            if line.lower().startswith("to:"):
+                details["defender"] = line.split(":", 1)[1].strip()
+                break
+
+    # Dedup settlement entries preserving order.
+    seen = set()
+    uniq = []
+    for x in details["settlements_lost"]:
+        k = str(x).strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        uniq.append(str(x).strip())
+    details["settlements_lost"] = uniq
+    details["settlements_lost_count"] = len(uniq)
     return details
 
 
@@ -658,6 +772,22 @@ def split_for_discord(s: str, limit: int = 1900) -> list[str]:
     return chunks
 
 
+def parse_track_day_arg(arg: str | None) -> datetime:
+    """
+    Returns start-of-day UTC for !track.
+    Supports: None/today/yesterday/YYYY-MM-DD.
+    """
+    now = now_utc()
+    token = (arg or "").strip().lower()
+    if not token or token == "today":
+        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    if token == "yesterday":
+        d = now - timedelta(days=1)
+        return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    parsed = datetime.strptime(token, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return datetime(parsed.year, parsed.month, parsed.day, tzinfo=timezone.utc)
+
+
 async def send_error(guild: discord.Guild, msg: str, tb: str | None = None):
     """Send safe, truncated error logs to your error channel + log full stack to console."""
     try:
@@ -778,6 +908,23 @@ def init_db():
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS attack_reports (
+            id SERIAL PRIMARY KEY,
+            attacker TEXT,
+            defender TEXT,
+            attack_result TEXT,
+            land_taken INTEGER,
+            settlements_lost_count INTEGER NOT NULL DEFAULT 0,
+            settlements_lost TEXT,
+            reported_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL,
+            raw TEXT,
+            raw_gz BYTEA,
+            report_hash TEXT UNIQUE
+        );
+        """)
+
         # indices
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS spy_reports_report_hash_uq ON spy_reports(report_hash);")
         cur.execute("""
@@ -796,11 +943,19 @@ def init_db():
             CREATE INDEX IF NOT EXISTS tech_index_name_idx
             ON tech_index (tech_name);
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS attack_reports_created_at_idx
+            ON attack_reports (created_at DESC, id DESC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS attack_reports_defender_created_at_idx
+            ON attack_reports (defender, created_at DESC, id DESC);
+        """)
 
 
 def heal_sequences():
     with db_conn() as conn, conn.cursor() as cur:
-        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots"]:
+        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots", "attack_reports"]:
             cur.execute(
                 f"SELECT setval(pg_get_serial_sequence('{table}','id'), "
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
@@ -1204,6 +1359,92 @@ def sync_store_report(msg_content: str, created_at_utc: datetime):
                 sync_upsert_troop_snapshot(cur, kingdom, rep_id, created_at_utc, sr_troops)
 
         return {"saved": True, "duplicate": True, "row": None}
+
+
+def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
+    """
+    Stores attack report deduped by hash.
+    Tracks attacker/defender/result/land/settlement-loss signals for !track.
+    """
+    if not looks_like_attack_report(msg_content):
+        return {"saved": False}
+
+    d = parse_attack_details(msg_content)
+    h = hash_report(msg_content)
+    raw_gz = psycopg2.Binary(compress_report(msg_content))
+    raw_text = msg_content if KEEP_RAW_TEXT else None
+
+    settlements = d.get("settlements_lost") or []
+    settlements_txt = " | ".join([str(x).strip() for x in settlements if str(x).strip()]) or None
+
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM attack_reports WHERE report_hash=%s LIMIT 1;", (h,))
+        exists = cur.fetchone()
+        if exists:
+            return {"saved": True, "duplicate": True, "row": None}
+
+        cur.execute(
+            """
+            INSERT INTO attack_reports (
+                attacker, defender, attack_result, land_taken,
+                settlements_lost_count, settlements_lost, reported_at, created_at,
+                raw, raw_gz, report_hash
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id, attacker, defender, attack_result, land_taken,
+                      settlements_lost_count, settlements_lost, reported_at, created_at;
+            """,
+            (
+                d.get("attacker"),
+                d.get("defender"),
+                d.get("result"),
+                d.get("land_taken"),
+                int(d.get("settlements_lost_count") or 0),
+                settlements_txt,
+                d.get("reported_at"),
+                created_at_utc,
+                raw_text,
+                raw_gz,
+                h,
+            ),
+        )
+        row = cur.fetchone()
+        return {"saved": True, "duplicate": False, "row": row}
+
+
+def sync_get_attack_rows_for_day(day_start_utc: datetime, day_end_utc: datetime, kingdom: str | None = None):
+    with db_conn() as conn, conn.cursor() as cur:
+        if kingdom:
+            cur.execute(
+                """
+                SELECT id, attacker, defender, attack_result, land_taken,
+                       settlements_lost_count, settlements_lost,
+                       COALESCE(reported_at, created_at) AS happened_at
+                FROM attack_reports
+                WHERE COALESCE(reported_at, created_at) >= %s
+                  AND COALESCE(reported_at, created_at) < %s
+                  AND (
+                    LOWER(COALESCE(defender, '')) = LOWER(%s)
+                    OR LOWER(COALESCE(attacker, '')) = LOWER(%s)
+                  )
+                ORDER BY COALESCE(reported_at, created_at) DESC, id DESC;
+                """,
+                (day_start_utc, day_end_utc, kingdom, kingdom),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, attacker, defender, attack_result, land_taken,
+                       settlements_lost_count, settlements_lost,
+                       COALESCE(reported_at, created_at) AS happened_at
+                FROM attack_reports
+                WHERE COALESCE(reported_at, created_at) >= %s
+                  AND COALESCE(reported_at, created_at) < %s
+                ORDER BY COALESCE(reported_at, created_at) DESC, id DESC;
+                """,
+                (day_start_utc, day_end_utc),
+            )
+        return cur.fetchall()
 
 
 def sync_techindex_all(days: int | None = None):
@@ -1669,6 +1910,7 @@ async def on_message(msg: discord.Message):
     try:
         ts = normalize_to_utc(msg.created_at)
         result = await run_db(sync_store_report, msg.content, ts)
+        attack_result = await run_db(sync_store_attack_report, msg.content, ts)
         forwarded = None
 
         if looks_like_recon_report(msg.content):
@@ -1689,6 +1931,16 @@ async def on_message(msg: discord.Message):
         elif result.get("saved") and result.get("duplicate"):
             if can_send(msg.channel, msg.guild):
                 await msg.channel.send("✅ Duplicate spy report detected (repair mode applied).")
+
+        if attack_result.get("saved") and not attack_result.get("duplicate") and attack_result.get("row"):
+            row = attack_result["row"]
+            if can_send(msg.channel, msg.guild):
+                await msg.channel.send(
+                    f"Attack report saved: ID `{row.get('id')}` | "
+                    f"Defender `{row.get('defender') or 'Unknown'}` | "
+                    f"Land `{fmt_int(row.get('land_taken'))}` | "
+                    f"Settlement losses `{int(row.get('settlements_lost_count') or 0)}`"
+                )
 
         if forwarded and forwarded.get("ok"):
             data = forwarded.get("data") or {}
@@ -1727,6 +1979,8 @@ async def sync_ingest_history(days: int | None = None):
         "messages_matched": 0,
         "reports_saved": 0,
         "duplicates": 0,
+        "attack_reports_saved": 0,
+        "attack_duplicates": 0,
         "reports_forwarded": 0,
         "forward_failures": 0,
     }
@@ -1763,6 +2017,12 @@ async def sync_ingest_history(days: int | None = None):
                             stats["reports_saved"] += 1
                         elif res.get("duplicate"):
                             stats["duplicates"] += 1
+                    elif looks_like_attack_report(content):
+                        ares = await run_db(sync_store_attack_report, content, normalize_to_utc(m.created_at))
+                        if ares.get("saved") and not ares.get("duplicate"):
+                            stats["attack_reports_saved"] += 1
+                        elif ares.get("duplicate"):
+                            stats["attack_duplicates"] += 1
 
                     fwd = await run_db(sync_recon_ingest_report, content)
                     if fwd.get("ok"):
@@ -1954,6 +2214,144 @@ async def spies(ctx, *, kingdom: str):
         tb = traceback.format_exc()
         await ctx.send("⚠️ spies failed.")
         await send_error(ctx.guild, f"spies error: {e}", tb=tb)
+
+
+@bot.command()
+async def track(ctx, *, arg: str = None):
+    """
+    !track
+    !track today
+    !track yesterday
+    !track 2026-02-13
+    !track Galileo
+    !track Galileo 2026-02-13
+    """
+    try:
+        raw = (arg or "").strip()
+        kingdom = None
+        day_token = None
+
+        if raw:
+            parts = raw.split()
+            if len(parts) == 1:
+                p = parts[0].strip()
+                if p.lower() in ("today", "yesterday") or re.match(r"^\d{4}-\d{2}-\d{2}$", p):
+                    day_token = p
+                else:
+                    kingdom = p
+            elif len(parts) >= 2:
+                p1 = parts[0].strip()
+                p2 = parts[-1].strip()
+                if p1.lower() in ("today", "yesterday") or re.match(r"^\d{4}-\d{2}-\d{2}$", p1):
+                    day_token = p1
+                    kingdom = " ".join(parts[1:]).strip() or None
+                elif p2.lower() in ("today", "yesterday") or re.match(r"^\d{4}-\d{2}-\d{2}$", p2):
+                    day_token = p2
+                    kingdom = " ".join(parts[:-1]).strip() or None
+                else:
+                    kingdom = raw
+
+        day_start = parse_track_day_arg(day_token)
+        day_end = day_start + timedelta(days=1)
+
+        real_kingdom = None
+        if kingdom:
+            real_kingdom = await run_db(sync_fuzzy_kingdom, kingdom)
+            real_kingdom = real_kingdom or kingdom
+
+        rows = await run_db(sync_get_attack_rows_for_day, day_start, day_end, real_kingdom)
+        if not rows:
+            target_txt = f" for `{real_kingdom}`" if real_kingdom else ""
+            return await ctx.send(f"No attack reports found{target_txt} on `{day_start.date()}` (UTC).")
+
+        agg = {}
+        for r in rows:
+            defender = (r.get("defender") or "Unknown").strip() or "Unknown"
+            key = defender.lower()
+            if key not in agg:
+                agg[key] = {
+                    "defender": defender,
+                    "hits": 0,
+                    "land_lost": 0,
+                    "setty_lost": 0,
+                    "setty_notes": set(),
+                }
+            agg[key]["hits"] += 1
+            agg[key]["land_lost"] += int(r.get("land_taken") or 0)
+            agg[key]["setty_lost"] += int(r.get("settlements_lost_count") or 0)
+            note = (r.get("settlements_lost") or "").strip()
+            if note:
+                agg[key]["setty_notes"].add(note)
+
+        summary_rows = sorted(
+            agg.values(),
+            key=lambda x: (int(x["land_lost"]), int(x["setty_lost"]), int(x["hits"])),
+            reverse=True,
+        )
+        lines = []
+        for s in summary_rows[:25]:
+            extra = ""
+            if s["setty_notes"]:
+                sample = sorted(list(s["setty_notes"]))[0]
+                extra = f" | Setty: {sample}"
+            lines.append(
+                f"- {s['defender']} | Hits `{s['hits']}` | Land Lost `{fmt_int(s['land_lost'])}` | "
+                f"Setty Lost `{s['setty_lost']}`{extra}"
+            )
+
+        out = io.StringIO()
+        writer = csv.writer(out, delimiter="\t", lineterminator="\n")
+        writer.writerow([
+            "date_utc",
+            "report_id",
+            "attacker",
+            "defender",
+            "result",
+            "land_taken",
+            "settlements_lost_count",
+            "settlements_lost",
+        ])
+        for r in rows:
+            dt = r.get("happened_at")
+            writer.writerow([
+                dt.isoformat() if dt else "",
+                r.get("id") or "",
+                r.get("attacker") or "",
+                r.get("defender") or "",
+                r.get("attack_result") or "",
+                int(r.get("land_taken") or 0),
+                int(r.get("settlements_lost_count") or 0),
+                r.get("settlements_lost") or "",
+            ])
+        payload = out.getvalue()
+        out.close()
+
+        head = (
+            f"Daily Attack Track - {day_start.date()} (UTC)"
+            + (f" | Filter: `{real_kingdom}`" if real_kingdom else "")
+            + f"\nReports: `{len(rows)}` | Defenders hit: `{len(summary_rows)}`"
+        )
+        await ctx.send(head + "\n" + "\n".join(lines))
+
+        preview = payload.strip()
+        if len(preview) <= 1500:
+            await ctx.send(f"```tsv\n{preview}\n```")
+        else:
+            await ctx.send(
+                "```tsv\n"
+                + "\n".join(payload.splitlines()[:15])
+                + "\n... (truncated in chat; full TSV attached)\n```"
+            )
+
+        fname = f"kg2_track_{day_start.strftime('%Y%m%d')}.tsv"
+        await ctx.send(file=discord.File(fp=io.BytesIO(payload.encode("utf-8")), filename=fname))
+
+    except ValueError:
+        await ctx.send("Invalid date. Use `YYYY-MM-DD`, `today`, or `yesterday`.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("track failed.")
+        await send_error(ctx.guild, f"track error: {e}", tb=tb)
 
 
 @bot.command()
