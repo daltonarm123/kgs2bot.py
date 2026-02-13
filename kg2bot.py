@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.2"
+BOT_VERSION = "2026-02-13.3"
 PATCH_NOTES = [
-    "Added: Attack reports are now auto-saved, and !track now shows daily hits, land lost, settlement losses, plus TSV export for spreadsheets.",
+    "Added: !help command to show all available bot commands.",
 ]
 # -------------------------------------------------
 
@@ -112,6 +112,7 @@ AP_REDUCTIONS = [
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.remove_command("help")
 
 
 # ---------- Locks ----------
@@ -2687,6 +2688,45 @@ async def troopsdelta(ctx, *, kingdom: str):
 @bot.command(name="troopdelta")
 async def troopdelta_alias(ctx, *, kingdom: str):
     return await troopsdelta(ctx, kingdom=kingdom)
+
+
+@bot.command(name="help")
+async def help_cmd(ctx):
+    """!help -> list all available bot commands."""
+    try:
+        lines = [
+            "**KG2 Recon Bot Commands**",
+            "`!help` - Show this command list",
+            "`!calc` - Paste mode calculator (prompts for report)",
+            "`!calc <kingdom>` - Run calc from latest saved DP report for a kingdom",
+            "`!calc db` - Run calc from latest saved DP report overall",
+            "`!spy <kingdom>` - Show latest saved spy report summary",
+            "`!spyid <id>` - Show saved spy report by DB ID",
+            "`!spyhistory <kingdom>` - Show last 5 saved spy reports",
+            "`!spies <kingdom>` - Show last 10 spy reports + send recommendation",
+            "`!track` - Daily attack tracker for today (UTC) + TSV export",
+            "`!track yesterday` - Daily attack tracker for yesterday (UTC)",
+            "`!track YYYY-MM-DD` - Daily attack tracker for a specific date (UTC)",
+            "`!track <kingdom>` - Daily attack tracker filtered to a kingdom (UTC today)",
+            "`!ap <kingdom>` - AP planner with hit buttons",
+            "`!apstatus <kingdom>` - Read-only AP planner status",
+            "`!techindex [days]` - Admin: pull history + rebuild indexed battle tech",
+            "`!tech <kingdom>` - Show indexed battle tech for a kingdom",
+            "`!techtop` - Show most common indexed training names",
+            "`!techcsv` - Admin: export indexed tech CSV",
+            "`!techpull <kingdom>` - Rebuild indexed tech for one kingdom",
+            "`!backfill [days]` - Admin: reprocess saved reports for indexing",
+            "`!troops <kingdom>` - Latest saved troop snapshot",
+            "`!troopsdelta <kingdom>` - Troop delta from last two snapshots",
+            "`!troopdelta <kingdom>` - Alias of !troopsdelta",
+            "`!refresh` - Admin: restart bot process",
+        ]
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("help failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"help error: {e}", tb=tb)
 
 
 @bot.command(name="refresh")
