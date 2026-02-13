@@ -48,6 +48,9 @@ import difflib
 import hashlib
 import logging
 import traceback
+import urllib.request
+import urllib.error
+import urllib.parse
 from math import ceil
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
@@ -63,9 +66,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-11.6"
+BOT_VERSION = "2026-02-13.1"
 PATCH_NOTES = [
-    "Improved: Auto-captured spy reports now post a compact one-line save confirmation instead of a large embed to reduce channel clutter.",
+    "Added: New spy reports now include a direct 'Open in calc' link on the website, and the calc can load that report and switch to other saved reports for the same kingdom.",
 ]
 # -------------------------------------------------
 
@@ -76,6 +79,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
+RECON_INGEST_URL = os.getenv("RECON_INGEST_URL", "https://recon-hub.onrender.com/api/reports/spy").strip()
+RECON_INGEST_ENABLED = os.getenv("RECON_INGEST_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+RECON_INGEST_TIMEOUT = float(os.getenv("RECON_INGEST_TIMEOUT", "10"))
+RECON_CALC_BASE_URL = os.getenv("RECON_CALC_BASE_URL", "https://recon-hub.onrender.com/kg-calc.html").strip()
 ADMIN_USER_IDS = {944024167081209867}
 ADMIN_USER_IDS.update(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
@@ -544,6 +551,78 @@ def looks_like_spy_report(text: str) -> bool:
         "the following technology information was also discovered",
         "our spies also found the following information about the kingdom's troops",
     ))
+
+
+def looks_like_attack_report(text: str) -> bool:
+    ll = (text or "").lower()
+    if "attack report:" in ll and "attack result:" in ll:
+        return True
+    if "subject: attack report:" in ll and "attack result:" in ll:
+        return True
+    return False
+
+
+def looks_like_recon_report(text: str) -> bool:
+    return looks_like_spy_report(text) or looks_like_attack_report(text)
+
+
+def sync_recon_ingest_report(msg_content: str):
+    """
+    Forward a raw spy/attack report to recon-hub ingest API.
+    """
+    if not RECON_INGEST_ENABLED:
+        return {"ok": False, "disabled": True}
+    if not RECON_INGEST_URL:
+        return {"ok": False, "disabled": True, "reason": "missing RECON_INGEST_URL"}
+
+    payload = json.dumps({"raw_text": msg_content}).encode("utf-8")
+    req = urllib.request.Request(
+        RECON_INGEST_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=RECON_INGEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(body) if body else {}
+            except Exception:
+                data = {"raw": body}
+            return {"ok": True, "status": getattr(resp, "status", 200), "data": data}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return {"ok": False, "status": int(getattr(e, "code", 0) or 0), "error": body or str(e)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def build_calc_link_from_ingest_data(data: dict) -> str | None:
+    """
+    Build calc deep-link using recon-hub stored spy report id/kingdom.
+    """
+    try:
+        if not RECON_CALC_BASE_URL:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if str(data.get("report_type") or "").lower() != "spy":
+            return None
+        stored = data.get("stored") or {}
+        report_id = stored.get("id")
+        parsed = data.get("parsed") or {}
+        kingdom = parsed.get("target")
+        if report_id is None:
+            return None
+        q = f"?report_id={int(report_id)}"
+        if kingdom:
+            q += "&kingdom=" + urllib.parse.quote(str(kingdom))
+        return RECON_CALC_BASE_URL + q
+    except Exception:
+        return None
 
 
 def truncate_for_discord(s: str, limit: int = 1800) -> str:
@@ -1575,6 +1654,12 @@ async def on_message(msg: discord.Message):
     try:
         ts = normalize_to_utc(msg.created_at)
         result = await run_db(sync_store_report, msg.content, ts)
+        forwarded = None
+
+        if looks_like_recon_report(msg.content):
+            forwarded = await run_db(sync_recon_ingest_report, msg.content)
+            if not forwarded.get("ok"):
+                logging.warning("recon ingest failed (live): %s", forwarded)
 
         if result.get("saved") and not result.get("duplicate") and result.get("row"):
             row = result["row"]
@@ -1589,6 +1674,19 @@ async def on_message(msg: discord.Message):
         elif result.get("saved") and result.get("duplicate"):
             if can_send(msg.channel, msg.guild):
                 await msg.channel.send("✅ Duplicate spy report detected (repair mode applied).")
+
+        if forwarded and forwarded.get("ok"):
+            data = forwarded.get("data") or {}
+            if data.get("report_type") == "spy" and can_send(msg.channel, msg.guild):
+                calc_link = build_calc_link_from_ingest_data(data)
+                if calc_link:
+                    await msg.channel.send(f"🧮 Open in calc: {calc_link}")
+            if data.get("report_type") == "attack" and can_send(msg.channel, msg.guild):
+                auto_hit = bool(data.get("auto_known_hit_inserted"))
+                await msg.channel.send(
+                    f"✅ Attack report synced to recon-hub"
+                    f"{' • auto known-hit added' if auto_hit else ''}"
+                )
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -1614,6 +1712,8 @@ async def sync_ingest_history(days: int | None = None):
         "messages_matched": 0,
         "reports_saved": 0,
         "duplicates": 0,
+        "reports_forwarded": 0,
+        "forward_failures": 0,
     }
 
     for guild in bot.guilds:
@@ -1637,16 +1737,23 @@ async def sync_ingest_history(days: int | None = None):
                     stats["messages_scanned"] += 1
 
                     content = (m.content or "").strip()
-                    if not content or not looks_like_spy_report(content):
+                    if not content or not looks_like_recon_report(content):
                         continue
 
                     stats["messages_matched"] += 1
-                    res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
+                    if looks_like_spy_report(content):
+                        res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
 
-                    if res.get("saved") and not res.get("duplicate"):
-                        stats["reports_saved"] += 1
-                    elif res.get("duplicate"):
-                        stats["duplicates"] += 1
+                        if res.get("saved") and not res.get("duplicate"):
+                            stats["reports_saved"] += 1
+                        elif res.get("duplicate"):
+                            stats["duplicates"] += 1
+
+                    fwd = await run_db(sync_recon_ingest_report, content)
+                    if fwd.get("ok"):
+                        stats["reports_forwarded"] += 1
+                    else:
+                        stats["forward_failures"] += 1
             except Exception:
                 # Continue scanning remaining channels even if one fails.
                 logging.exception("History scan failed for %s (%s)", guild.name, channel.name)
