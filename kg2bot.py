@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.4"
+BOT_VERSION = "2026-02-13.5"
 PATCH_NOTES = [
-    "Bug fix: auto-migrate older attack_reports schema so !track works even when DB columns were missing.",
+    "Added: !attackbackfill command to backfill attack reports from Discord history for !track.",
 ]
 # -------------------------------------------------
 
@@ -2671,6 +2671,37 @@ async def backfill(ctx, days: int = None):
 
 
 @bot.command()
+async def attackbackfill(ctx, days: int = None):
+    """
+    !attackbackfill [days]
+    Pulls Discord history and backfills attack reports used by !track.
+    - If days provided: only last N days
+    - Else: full readable history
+    """
+    if not _is_admin(ctx):
+        return await ctx.send("❌ Admin only.")
+
+    try:
+        if days and int(days) > 0:
+            await ctx.send(f"🧱 Backfilling attack reports from the last **{int(days)}** days...")
+        else:
+            await ctx.send("🧱 Backfilling attack reports from **ALL** readable Discord history...")
+
+        stats = await sync_ingest_history(int(days) if days else None)
+        await ctx.send(
+            "✅ **Attack backfill complete**\n"
+            f"Guilds scanned: `{stats['guilds']}` • Channels scanned: `{stats['channels_scanned']}`\n"
+            f"Messages scanned: `{stats['messages_scanned']}` • Matched reports: `{stats['messages_matched']}`\n"
+            f"Attack reports saved: `{stats['attack_reports_saved']}` • Attack duplicates: `{stats['attack_duplicates']}`\n"
+            f"Forwarded to recon-hub: `{stats['reports_forwarded']}` • Forward failures: `{stats['forward_failures']}`"
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ attackbackfill failed.")
+        await send_error(ctx.guild, f"attackbackfill error: {e}", tb=tb)
+
+
+@bot.command()
 async def troops(ctx, *, kingdom: str):
     """!troops <kingdom> -> latest SR troop snapshot (home troops) for a kingdom."""
     try:
@@ -2787,6 +2818,7 @@ async def help_cmd(ctx):
             "`!techcsv` - Admin: export indexed tech CSV",
             "`!techpull <kingdom>` - Rebuild indexed tech for one kingdom",
             "`!backfill [days]` - Admin: reprocess saved reports for indexing",
+            "`!attackbackfill [days]` - Admin: pull attack/spy reports from Discord history for track data",
             "`!troops <kingdom>` - Latest saved troop snapshot",
             "`!troopsdelta <kingdom>` - Troop delta from last two snapshots",
             "`!troopdelta <kingdom>` - Alias of !troopsdelta",
