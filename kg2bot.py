@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.10"
+BOT_VERSION = "2026-02-13.11"
 PATCH_NOTES = [
-    "Bug fix: legacy attack_reports.raw_text NOT NULL is now handled and attack inserts always populate raw_text for backfill compatibility.",
+    "Bug fix: tightened attack parsing, prevented false settlement losses, and added message-level dedupe so !track totals are not inflated by duplicate/backfill variants.",
 ]
 # -------------------------------------------------
 
@@ -387,39 +387,46 @@ def parse_attack_details(text: str) -> dict:
                 details["defender"] = details["defender"] or m_pair.group(2).strip()
             continue
 
-        # Land parse
+        # Header-only format: "Attack Report: Galileo (NW: + 171041)"
+        if ll.startswith("attack report:") and "attacked" not in ll and not details["defender"]:
+            m_hdr = re.match(r"attack report:\s*(.+?)(?:\s*\(.*\))?$", line, re.IGNORECASE)
+            if m_hdr:
+                details["defender"] = m_hdr.group(1).strip()
+            continue
+
+        # Land parse (strict to avoid NW/other-number misreads).
         if details["land_taken"] is None and ("land" in ll or "acre" in ll):
-            # "You have gained ...: 501 Land, 27624 Food, ..."
-            m_gained_land = re.search(r"([\d,]+)\s+land\b", line, re.IGNORECASE)
-            if m_gained_land:
-                try:
-                    details["land_taken"] = int(m_gained_land.group(1).replace(",", ""))
-                    continue
-                except Exception:
-                    pass
-            m_land = re.search(r"([\d,]+)\s*acres?", line, re.IGNORECASE)
-            if m_land:
-                try:
-                    details["land_taken"] = int(m_land.group(1).replace(",", ""))
-                    continue
-                except Exception:
-                    pass
-            m_land2 = re.search(
-                r"(?:land|acres?)\s*(?:taken|gained|captured|conquered|lost|stolen)?\s*[:\-]?\s*([\d,]+)",
-                line,
-                re.IGNORECASE,
-            )
-            if m_land2:
-                try:
-                    details["land_taken"] = int(m_land2.group(1).replace(",", ""))
-                    continue
-                except Exception:
-                    pass
+            if "you have gained the following during the attack" in ll:
+                m_gained_land = re.search(r"([\d,]+)\s+land\b", line, re.IGNORECASE)
+                if m_gained_land:
+                    try:
+                        details["land_taken"] = int(m_gained_land.group(1).replace(",", ""))
+                        continue
+                    except Exception:
+                        pass
+            if ll.startswith("land taken:") or ll.startswith("land:"):
+                m_land = re.search(r":\s*([\d,]+)\s*(?:acres?)?", line, re.IGNORECASE)
+                if m_land:
+                    try:
+                        details["land_taken"] = int(m_land.group(1).replace(",", ""))
+                        continue
+                    except Exception:
+                        pass
+            if "acres" in ll and any(k in ll for k in ("gained", "taken", "captured", "conquered", "stolen")):
+                m_land = re.search(r"([\d,]+)\s*acres?", line, re.IGNORECASE)
+                if m_land:
+                    try:
+                        details["land_taken"] = int(m_land.group(1).replace(",", ""))
+                        continue
+                    except Exception:
+                        pass
 
         # Settlement movement/loss markers.
         if any(k in ll for k in ("settlement", "town", "city")) and any(
             k in ll for k in ("lost", "sacked", "captured", "taken", "took", "take")
         ):
+            if any(bad in ll for bad in ("unable to take", "failed to take", "could not take", "unsuccessful")):
+                continue
             name = None
             m_name = re.search(r"(?:settlement|town|city)\s+([A-Za-z0-9][A-Za-z0-9 '\-]{1,48})", line, re.IGNORECASE)
             if m_name:
@@ -1015,7 +1022,9 @@ def init_db():
             raw TEXT,
             raw_text TEXT,
             raw_gz BYTEA,
-            report_hash TEXT UNIQUE
+            report_hash TEXT UNIQUE,
+            source_message_id BIGINT,
+            source_channel_id BIGINT
         );
         """)
 
@@ -1053,6 +1062,10 @@ def init_db():
             cur.execute("ALTER TABLE attack_reports ADD COLUMN raw_gz BYTEA;")
         if "report_hash" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN report_hash TEXT;")
+        if "source_message_id" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN source_message_id BIGINT;")
+        if "source_channel_id" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN source_channel_id BIGINT;")
 
         # Backfill from common legacy names if present.
         if "target_kingdom" in attack_cols and "defender" in attack_cols:
@@ -1143,6 +1156,11 @@ def init_db():
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS attack_reports_report_hash_uq
             ON attack_reports (report_hash);
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS attack_reports_source_message_id_uq
+            ON attack_reports (source_message_id)
+            WHERE source_message_id IS NOT NULL;
         """)
 
 
@@ -1554,7 +1572,12 @@ def sync_store_report(msg_content: str, created_at_utc: datetime):
         return {"saved": True, "duplicate": True, "row": None}
 
 
-def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
+def sync_store_attack_report(
+    msg_content: str,
+    created_at_utc: datetime,
+    source_message_id: int | None = None,
+    source_channel_id: int | None = None,
+):
     """
     Stores attack report deduped by hash.
     Tracks attacker/defender/result/land/settlement-loss signals for !track.
@@ -1569,6 +1592,11 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
     )
     if not has_attack_shape:
         return {"saved": False}
+    if not d.get("defender") or not d.get("result"):
+        # Avoid storing partial/non-standard fragments as attack rows.
+        return {"saved": False}
+    if d.get("land_taken") is None:
+        d["land_taken"] = 0
 
     h = hash_report(msg_content)
     raw_gz = psycopg2.Binary(compress_report(msg_content))
@@ -1579,6 +1607,15 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
     settlements_txt = " | ".join([str(x).strip() for x in settlements if str(x).strip()]) or None
 
     with db_conn() as conn, conn.cursor() as cur:
+        if source_message_id:
+            cur.execute(
+                "SELECT id FROM attack_reports WHERE source_message_id=%s LIMIT 1;",
+                (int(source_message_id),),
+            )
+            exists_msg = cur.fetchone()
+            if exists_msg:
+                return {"saved": True, "duplicate": True, "row": None}
+
         cur.execute("SELECT id FROM attack_reports WHERE report_hash=%s LIMIT 1;", (h,))
         exists = cur.fetchone()
         if exists:
@@ -1589,11 +1626,11 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
             INSERT INTO attack_reports (
                 attacker, defender, attack_result, land_taken,
                 settlements_lost_count, settlements_lost, reported_at, created_at,
-                raw, raw_text, raw_gz, report_hash
+                raw, raw_text, raw_gz, report_hash, source_message_id, source_channel_id
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id, attacker, defender, attack_result, land_taken,
-                      settlements_lost_count, settlements_lost, reported_at, created_at;
+                      settlements_lost_count, settlements_lost, reported_at, created_at, source_message_id;
             """,
             (
                 d.get("attacker"),
@@ -1608,6 +1645,8 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
                 raw_text_compat,
                 raw_gz,
                 h,
+                int(source_message_id) if source_message_id else None,
+                int(source_channel_id) if source_channel_id else None,
             ),
         )
         row = cur.fetchone()
@@ -1620,7 +1659,7 @@ def sync_get_attack_rows_for_day(day_start_utc: datetime, day_end_utc: datetime,
             cur.execute(
                 """
                 SELECT id, attacker, defender, attack_result, land_taken,
-                       settlements_lost_count, settlements_lost,
+                       settlements_lost_count, settlements_lost, source_message_id,
                        COALESCE(reported_at, created_at) AS happened_at
                 FROM attack_reports
                 WHERE COALESCE(reported_at, created_at) >= %s
@@ -1637,7 +1676,7 @@ def sync_get_attack_rows_for_day(day_start_utc: datetime, day_end_utc: datetime,
             cur.execute(
                 """
                 SELECT id, attacker, defender, attack_result, land_taken,
-                       settlements_lost_count, settlements_lost,
+                       settlements_lost_count, settlements_lost, source_message_id,
                        COALESCE(reported_at, created_at) AS happened_at
                 FROM attack_reports
                 WHERE COALESCE(reported_at, created_at) >= %s
@@ -2112,7 +2151,13 @@ async def on_message(msg: discord.Message):
     try:
         ts = normalize_to_utc(msg.created_at)
         result = await run_db(sync_store_report, msg.content, ts)
-        attack_result = await run_db(sync_store_attack_report, msg.content, ts)
+        attack_result = await run_db(
+            sync_store_attack_report,
+            msg.content,
+            ts,
+            int(msg.id),
+            int(msg.channel.id) if getattr(msg, "channel", None) else None,
+        )
         forwarded = None
 
         if looks_like_recon_report(msg.content):
@@ -2224,7 +2269,13 @@ async def sync_ingest_history(days: int | None = None):
                                 else:
                                     stats["duplicates"] += 1
 
-                            ares = await run_db(sync_store_attack_report, content, normalize_to_utc(m.created_at))
+                            ares = await run_db(
+                                sync_store_attack_report,
+                                content,
+                                normalize_to_utc(m.created_at),
+                                int(m.id),
+                                int(channel.id),
+                            )
                             if ares.get("saved"):
                                 matched = True
                                 if not ares.get("duplicate"):
@@ -2478,6 +2529,32 @@ async def track(ctx, *, arg: str = None):
         if not rows:
             target_txt = f" for `{real_kingdom}`" if real_kingdom else ""
             return await ctx.send(f"No attack reports found{target_txt} on `{day_start.date()}` (UTC).")
+
+        # Collapse likely duplicates from legacy ingests.
+        deduped = {}
+        for r in rows:
+            smid = r.get("source_message_id")
+            dt = r.get("happened_at")
+            dt_key = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "none"
+            key = (
+                f"msg:{int(smid)}" if smid else
+                f"legacy:{dt_key}|{str(r.get('attacker') or '').strip().lower()}|"
+                f"{str(r.get('defender') or '').strip().lower()}|{str(r.get('attack_result') or '').strip().lower()}|"
+                f"{str(r.get('settlements_lost') or '').strip().lower()}"
+            )
+            cur = deduped.get(key)
+            if not cur:
+                deduped[key] = r
+                continue
+            # Keep lower positive land if same apparent event, to avoid NW misparse inflation.
+            new_land = int(r.get("land_taken") or 0)
+            cur_land = int(cur.get("land_taken") or 0)
+            if cur_land <= 0 and new_land > 0:
+                deduped[key] = r
+            elif new_land > 0 and cur_land > 0 and new_land < cur_land:
+                deduped[key] = r
+
+        rows = list(deduped.values())
 
         agg = {}
         for r in rows:
