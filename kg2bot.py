@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.3"
+BOT_VERSION = "2026-02-13.4"
 PATCH_NOTES = [
-    "Added: !help command to show all available bot commands.",
+    "Bug fix: auto-migrate older attack_reports schema so !track works even when DB columns were missing.",
 ]
 # -------------------------------------------------
 
@@ -926,6 +926,73 @@ def init_db():
         );
         """)
 
+        # Migration-safe upgrades for older attack_reports schema versions.
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'attack_reports';
+        """)
+        attack_cols = {r["column_name"] for r in cur.fetchall()}
+
+        if "attacker" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN attacker TEXT;")
+        if "defender" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN defender TEXT;")
+        if "attack_result" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN attack_result TEXT;")
+        if "land_taken" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN land_taken INTEGER;")
+        if "settlements_lost_count" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN settlements_lost_count INTEGER DEFAULT 0;")
+        if "settlements_lost" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN settlements_lost TEXT;")
+        if "reported_at" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN reported_at TIMESTAMPTZ;")
+        if "created_at" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN created_at TIMESTAMPTZ;")
+        if "raw" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN raw TEXT;")
+        if "raw_gz" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN raw_gz BYTEA;")
+        if "report_hash" not in attack_cols:
+            cur.execute("ALTER TABLE attack_reports ADD COLUMN report_hash TEXT;")
+
+        # Backfill from common legacy names if present.
+        if "result" in attack_cols and "attack_result" in attack_cols:
+            cur.execute("""
+                UPDATE attack_reports
+                SET attack_result = COALESCE(attack_result, result::text)
+                WHERE attack_result IS NULL;
+            """)
+        if "land" in attack_cols and "land_taken" in attack_cols:
+            cur.execute("""
+                UPDATE attack_reports
+                SET land_taken = COALESCE(land_taken, land)
+                WHERE land_taken IS NULL;
+            """)
+        if "captured_at" in attack_cols and "reported_at" in attack_cols:
+            cur.execute("""
+                UPDATE attack_reports
+                SET reported_at = COALESCE(reported_at, captured_at)
+                WHERE reported_at IS NULL;
+            """)
+        if "captured_at" in attack_cols and "created_at" in attack_cols:
+            cur.execute("""
+                UPDATE attack_reports
+                SET created_at = COALESCE(created_at, captured_at)
+                WHERE created_at IS NULL;
+            """)
+        cur.execute("""
+            UPDATE attack_reports
+            SET settlements_lost_count = COALESCE(settlements_lost_count, 0)
+            WHERE settlements_lost_count IS NULL;
+        """)
+        cur.execute("""
+            UPDATE attack_reports
+            SET created_at = COALESCE(created_at, reported_at, NOW())
+            WHERE created_at IS NULL;
+        """)
+
         # indices
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS spy_reports_report_hash_uq ON spy_reports(report_hash);")
         cur.execute("""
@@ -951,6 +1018,10 @@ def init_db():
         cur.execute("""
             CREATE INDEX IF NOT EXISTS attack_reports_defender_created_at_idx
             ON attack_reports (defender, created_at DESC, id DESC);
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS attack_reports_report_hash_uq
+            ON attack_reports (report_hash);
         """)
 
 
