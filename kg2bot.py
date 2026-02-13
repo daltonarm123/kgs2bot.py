@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.6"
+BOT_VERSION = "2026-02-13.7"
 PATCH_NOTES = [
-    "Bug fix: improved attack report detection so backfill captures more valid attack report formats for !track.",
+    "Bug fix: attack parser now supports mailbox-style reports (Recipient/Subject/You have gained ... Land) used by !track.",
 ]
 # -------------------------------------------------
 
@@ -337,9 +337,41 @@ def parse_attack_details(text: str) -> dict:
                 except Exception:
                     pass
             continue
+        if ll.startswith("received:"):
+            m_dt = re.search(
+                r"([a-z]{3,9}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+[ap]m)",
+                line,
+                re.IGNORECASE,
+            )
+            if m_dt:
+                try:
+                    details["reported_at"] = datetime.strptime(
+                        m_dt.group(1), "%b %d, %Y, %I:%M:%S %p"
+                    ).replace(tzinfo=timezone.utc)
+                except Exception:
+                    try:
+                        details["reported_at"] = datetime.strptime(
+                            m_dt.group(1), "%B %d, %Y, %I:%M:%S %p"
+                        ).replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+            continue
 
         if ll.startswith("target:"):
             details["defender"] = line.split(":", 1)[1].strip()
+            continue
+        if ll.startswith("recipient"):
+            # In many inbox formats, recipient is the attacker (you).
+            details["attacker"] = details["attacker"] or line.split(":", 1)[1].strip()
+            continue
+        if ll.startswith("sender:") or ll.startswith("from:"):
+            details["attacker"] = details["attacker"] or line.split(":", 1)[1].strip()
+            continue
+        if ll.startswith("subject:"):
+            subj = line.split(":", 1)[1].strip()
+            m_sub = re.match(r"attack report:\s*(.+)$", subj, re.IGNORECASE)
+            if m_sub and not details["defender"]:
+                details["defender"] = m_sub.group(1).strip()
             continue
 
         if ll.startswith("attack result:") or ll.startswith("result:"):
@@ -357,6 +389,14 @@ def parse_attack_details(text: str) -> dict:
 
         # Land parse
         if details["land_taken"] is None and ("land" in ll or "acre" in ll):
+            # "You have gained ...: 501 Land, 27624 Food, ..."
+            m_gained_land = re.search(r"([\d,]+)\s+land\b", line, re.IGNORECASE)
+            if m_gained_land:
+                try:
+                    details["land_taken"] = int(m_gained_land.group(1).replace(",", ""))
+                    continue
+                except Exception:
+                    pass
             m_land = re.search(r"([\d,]+)\s*acres?", line, re.IGNORECASE)
             if m_land:
                 try:
@@ -378,7 +418,7 @@ def parse_attack_details(text: str) -> dict:
 
         # Settlement movement/loss markers.
         if any(k in ll for k in ("settlement", "town", "city")) and any(
-            k in ll for k in ("lost", "sacked", "captured", "taken", "took")
+            k in ll for k in ("lost", "sacked", "captured", "taken", "took", "take")
         ):
             name = None
             m_name = re.search(r"(?:settlement|town|city)\s+([A-Za-z0-9][A-Za-z0-9 '\-]{1,48})", line, re.IGNORECASE)
