@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.5"
+BOT_VERSION = "2026-02-13.6"
 PATCH_NOTES = [
-    "Added: !attackbackfill command to backfill attack reports from Discord history for !track.",
+    "Bug fix: improved attack report detection so backfill captures more valid attack report formats for !track.",
 ]
 # -------------------------------------------------
 
@@ -671,9 +671,15 @@ def looks_like_spy_report(text: str) -> bool:
 
 def looks_like_attack_report(text: str) -> bool:
     ll = (text or "").lower()
+    if "subject: attack report:" in ll:
+        return True
+    if "attack report:" in ll and "attacked" in ll:
+        return True
     if "attack report:" in ll and "attack result:" in ll:
         return True
-    if "subject: attack report:" in ll and "attack result:" in ll:
+    if "attack result:" in ll and ("land taken" in ll or "acres" in ll):
+        return True
+    if "attack result:" in ll and ("subject:" in ll or "target:" in ll):
         return True
     return False
 
@@ -1438,10 +1444,17 @@ def sync_store_attack_report(msg_content: str, created_at_utc: datetime):
     Stores attack report deduped by hash.
     Tracks attacker/defender/result/land/settlement-loss signals for !track.
     """
-    if not looks_like_attack_report(msg_content):
+    d = parse_attack_details(msg_content)
+    # Guard against non-attack content even if detection is permissive.
+    ll = (msg_content or "").lower()
+    has_attack_shape = bool(
+        "attack report" in ll
+        or "attack result:" in ll
+        or ("attacked" in ll and ("land taken" in ll or "acres" in ll))
+    )
+    if not has_attack_shape:
         return {"saved": False}
 
-    d = parse_attack_details(msg_content)
     h = hash_report(msg_content)
     raw_gz = psycopg2.Binary(compress_report(msg_content))
     raw_text = msg_content if KEEP_RAW_TEXT else None
