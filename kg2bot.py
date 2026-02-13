@@ -828,8 +828,22 @@ def sync_fuzzy_kingdom(query: str):
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT DISTINCT kingdom FROM spy_reports WHERE kingdom IS NOT NULL;")
         names = [r["kingdom"] for r in cur.fetchall() if r.get("kingdom")]
-    match = difflib.get_close_matches(query, names, 1, 0.5)
-    return match[0] if match else None
+    if not names:
+        return None
+
+    q = query.strip()
+    q_low = q.lower()
+    by_low = {str(n).lower(): n for n in names}
+
+    # Exact case-insensitive hit first.
+    if q_low in by_low:
+        return by_low[q_low]
+
+    # Fuzzy match on lowercase keys, then map back to canonical casing.
+    match = difflib.get_close_matches(q_low, list(by_low.keys()), 1, 0.5)
+    if not match:
+        return None
+    return by_low.get(match[0])
 
 
 def sync_get_spy_by_id(report_id: int):
@@ -848,7 +862,7 @@ def sync_get_latest_spy_for_kingdom(kingdom: str):
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE kingdom=%s
+            WHERE LOWER(kingdom)=LOWER(%s)
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
         """, (kingdom,))
@@ -860,7 +874,7 @@ def sync_get_latest_dp_spy_for_kingdom(kingdom: str):
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE kingdom=%s AND defense_power IS NOT NULL AND defense_power > 0
+            WHERE LOWER(kingdom)=LOWER(%s) AND defense_power IS NOT NULL AND defense_power > 0
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
         """, (kingdom,))
@@ -884,7 +898,7 @@ def sync_get_spy_history(kingdom: str, limit: int = 5):
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at
             FROM spy_reports
-            WHERE kingdom=%s
+            WHERE LOWER(kingdom)=LOWER(%s)
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT %s;
         """, (kingdom, int(limit)))
@@ -896,7 +910,7 @@ def sync_get_spy_history_with_raw(kingdom: str, limit: int = 10):
         cur.execute("""
             SELECT id, kingdom, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE kingdom=%s
+            WHERE LOWER(kingdom)=LOWER(%s)
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT %s;
         """, (kingdom, int(limit)))
