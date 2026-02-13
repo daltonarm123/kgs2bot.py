@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.7"
+BOT_VERSION = "2026-02-13.8"
 PATCH_NOTES = [
-    "Bug fix: attack parser now supports mailbox-style reports (Recipient/Subject/You have gained ... Land) used by !track.",
+    "Bug fix: !attackbackfill now scans both message and embed text, and saves attack reports without relying on strict pre-filters.",
 ]
 # -------------------------------------------------
 
@@ -817,6 +817,52 @@ def split_for_discord(s: str, limit: int = 1900) -> list[str]:
     if cur:
         chunks.append(cur.rstrip("\n"))
     return chunks
+
+
+def extract_discord_message_texts(msg: discord.Message) -> list[str]:
+    """
+    Collect candidate report text from message content and embeds.
+    This helps when users/bots paste reports as embed descriptions.
+    """
+    texts = []
+    if (msg.content or "").strip():
+        texts.append(msg.content.strip())
+
+    for emb in (msg.embeds or []):
+        parts = []
+        if getattr(emb, "title", None):
+            parts.append(str(emb.title))
+        if getattr(emb, "description", None):
+            parts.append(str(emb.description))
+        for f in (getattr(emb, "fields", None) or []):
+            try:
+                if getattr(f, "name", None):
+                    parts.append(str(f.name))
+                if getattr(f, "value", None):
+                    parts.append(str(f.value))
+            except Exception:
+                continue
+        footer = getattr(emb, "footer", None)
+        if footer and getattr(footer, "text", None):
+            parts.append(str(footer.text))
+
+        s = "\n".join([p for p in parts if (p or "").strip()]).strip()
+        if s:
+            texts.append(s)
+
+    # De-dup preserve order.
+    seen = set()
+    out = []
+    for t in texts:
+        k = t.strip()
+        if not k:
+            continue
+        hk = hashlib.sha1(k.encode("utf-8", errors="ignore")).hexdigest()
+        if hk in seen:
+            continue
+        seen.add(hk)
+        out.append(k)
+    return out
 
 
 def parse_track_day_arg(arg: str | None) -> datetime:
@@ -2130,30 +2176,38 @@ async def sync_ingest_history(days: int | None = None):
                         continue
                     stats["messages_scanned"] += 1
 
-                    content = (m.content or "").strip()
-                    if not content or not looks_like_recon_report(content):
+                    candidates = extract_discord_message_texts(m)
+                    if not candidates:
                         continue
 
-                    stats["messages_matched"] += 1
-                    if looks_like_spy_report(content):
+                    for content in candidates:
+                        matched = False
+
                         res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
+                        if res.get("saved"):
+                            matched = True
+                            if not res.get("duplicate"):
+                                stats["reports_saved"] += 1
+                            else:
+                                stats["duplicates"] += 1
 
-                        if res.get("saved") and not res.get("duplicate"):
-                            stats["reports_saved"] += 1
-                        elif res.get("duplicate"):
-                            stats["duplicates"] += 1
-                    elif looks_like_attack_report(content):
                         ares = await run_db(sync_store_attack_report, content, normalize_to_utc(m.created_at))
-                        if ares.get("saved") and not ares.get("duplicate"):
-                            stats["attack_reports_saved"] += 1
-                        elif ares.get("duplicate"):
-                            stats["attack_duplicates"] += 1
+                        if ares.get("saved"):
+                            matched = True
+                            if not ares.get("duplicate"):
+                                stats["attack_reports_saved"] += 1
+                            else:
+                                stats["attack_duplicates"] += 1
 
-                    fwd = await run_db(sync_recon_ingest_report, content)
-                    if fwd.get("ok"):
-                        stats["reports_forwarded"] += 1
-                    else:
-                        stats["forward_failures"] += 1
+                        if matched:
+                            stats["messages_matched"] += 1
+
+                        if looks_like_recon_report(content):
+                            fwd = await run_db(sync_recon_ingest_report, content)
+                            if fwd.get("ok"):
+                                stats["reports_forwarded"] += 1
+                            else:
+                                stats["forward_failures"] += 1
             except Exception:
                 # Continue scanning remaining channels even if one fails.
                 logging.exception("History scan failed for %s (%s)", guild.name, channel.name)
