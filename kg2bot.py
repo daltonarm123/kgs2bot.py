@@ -68,9 +68,10 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-13.11"
+BOT_VERSION = "2026-02-15.1"
 PATCH_NOTES = [
-    "Bug fix: tightened attack parsing, prevented false settlement losses, and added message-level dedupe so !track totals are not inflated by duplicate/backfill variants.",
+    "Added: Battle tracker command with season-aware + up/down return tracking and return alerts.",
+    "Updated: !spy and !spyid now show troops expected to be out at SR time.",
 ]
 # -------------------------------------------------
 
@@ -123,6 +124,34 @@ ap_lock = asyncio.Lock()
 ANNOUNCED_READY_THIS_PROCESS = False
 ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
 MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL = int(os.getenv("MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL", "0") or "0")
+KG_BASE_RETURN_MINUTES = float(os.getenv("KG_BASE_RETURN_MINUTES", "20"))
+KG_SEASON_EPOCH_UTC = os.getenv("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
+KG_HIT_UP_RETURN_MULT = float(os.getenv("KG_HIT_UP_RETURN_MULT", "0.90"))
+KG_HIT_DOWN_RETURN_MULT = float(os.getenv("KG_HIT_DOWN_RETURN_MULT", "1.10"))
+RETURN_ALERT_POLL_SECONDS = int(os.getenv("RETURN_ALERT_POLL_SECONDS", "30") or "30")
+BATTLE_RETURNS_LOOP_STARTED = False
+
+
+def parse_utc_dt(s: str) -> datetime:
+    txt = str(s or "").strip().replace("Z", "+00:00")
+    try:
+        d = datetime.fromisoformat(txt)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return now_utc()
+
+
+SEASON_EPOCH = parse_utc_dt(KG_SEASON_EPOCH_UTC)
+SEASON_ORDER = ("spring", "summer", "autumn", "winter")
+SEASON_MULT = {
+    "spring": 1.00,
+    "summer": 0.75,  # return times decreased 25%
+    "autumn": 0.90,  # return times decreased 10%
+    "winter": 1.25,  # return times increased 25%
+}
+SEASON_LEN = timedelta(days=5)
 
 
 # ---------- DB Pool ----------
@@ -138,6 +167,70 @@ def normalize_to_utc(ts: datetime | None) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+def season_index_and_start(ts: datetime) -> tuple[int, datetime]:
+    t = normalize_to_utc(ts)
+    if t < SEASON_EPOCH:
+        return 0, SEASON_EPOCH
+    delta = t - SEASON_EPOCH
+    slot = int(delta.total_seconds() // SEASON_LEN.total_seconds())
+    idx = slot % 4
+    start = SEASON_EPOCH + (slot * SEASON_LEN)
+    return idx, start
+
+
+def season_name_at(ts: datetime) -> str:
+    idx, _ = season_index_and_start(ts)
+    return SEASON_ORDER[idx]
+
+
+def season_end_at(ts: datetime) -> datetime:
+    _, start = season_index_and_start(ts)
+    return start + SEASON_LEN
+
+
+def estimate_return_time_season_aware(departed_at: datetime, base_minutes: float | None = None) -> datetime:
+    """
+    Convert base return minutes into actual return timestamp with seasonal speed modifiers.
+    Handles season boundary crossings by integrating segment-by-segment.
+    """
+    remaining_base = float(base_minutes if base_minutes is not None else KG_BASE_RETURN_MINUTES)
+    t = normalize_to_utc(departed_at)
+    if remaining_base <= 0:
+        return t
+
+    guard = 0
+    while remaining_base > 0 and guard < 64:
+        guard += 1
+        s_name = season_name_at(t)
+        mult = float(SEASON_MULT.get(s_name, 1.0))
+        mult = 1.0 if mult <= 0 else mult
+        seg_end = season_end_at(t)
+        seg_real_minutes = max(0.0, (seg_end - t).total_seconds() / 60.0)
+        seg_base_capacity = seg_real_minutes / mult
+        if seg_base_capacity >= remaining_base:
+            return t + timedelta(minutes=(remaining_base * mult))
+        remaining_base -= seg_base_capacity
+        t = seg_end
+    return t
+
+
+def apply_hit_direction_return_modifier(base_minutes: float, hit_direction: str | None) -> float:
+    """
+    Applies hit-up/hit-down return-time multiplier before season integration.
+    - up: faster returns (default 0.90x)
+    - down: slower returns (default 1.10x)
+    """
+    b = float(base_minutes or 0.0)
+    if b <= 0:
+        return b
+    d = str(hit_direction or "").strip().lower()
+    if d == "up":
+        return b * max(0.01, KG_HIT_UP_RETURN_MULT)
+    if d == "down":
+        return b * max(0.01, KG_HIT_DOWN_RETURN_MULT)
+    return b
 
 
 def init_db_pool(minconn: int = 1, maxconn: int = 10):
@@ -304,6 +397,90 @@ def parse_spy_details(text: str) -> dict:
     return details
 
 
+UNIT_ALIASES = {
+    "lc": "light_cavalry",
+    "light cav": "light_cavalry",
+    "light cavalry": "light_cavalry",
+    "hc": "heavy_cavalry",
+    "heavy cav": "heavy_cavalry",
+    "heavy cavalry": "heavy_cavalry",
+    "knight": "knights",
+    "knights": "knights",
+    "pike": "pikemen",
+    "pikeman": "pikemen",
+    "pikemen": "pikemen",
+    "archer": "archers",
+    "archers": "archers",
+    "crossbow": "crossbowmen",
+    "crossbowmen": "crossbowmen",
+    "footman": "footmen",
+    "footmen": "footmen",
+    "peasant": "peasants",
+    "peasants": "peasants",
+    "elite": "elites",
+    "elites": "elites",
+}
+
+UNIT_DISPLAY = {
+    "light_cavalry": "Light Cavalry",
+    "heavy_cavalry": "Heavy Cavalry",
+    "knights": "Knights",
+    "pikemen": "Pikemen",
+    "archers": "Archers",
+    "crossbowmen": "Crossbowmen",
+    "footmen": "Footmen",
+    "peasants": "Peasants",
+    "elites": "Elites",
+}
+
+
+def normalize_unit_name(unit_name: str) -> str | None:
+    n = str(unit_name or "").strip().lower()
+    n = re.sub(r"\s+", " ", n)
+    if not n:
+        return None
+    if n in UNIT_ALIASES:
+        return UNIT_ALIASES[n]
+    for k, v in UNIT_ALIASES.items():
+        if k in n:
+            return v
+    return None
+
+
+def parse_units_inline(text: str) -> dict:
+    """
+    Parse simple inline unit expressions like:
+    '3000 LC', '1,500 Heavy Cavalry, 200 Pike'
+    """
+    out = {}
+    for m in re.finditer(r"(\d[\d,]*)\s+([A-Za-z][A-Za-z ]{1,30})", str(text or "")):
+        count = parse_first_int_from_value_line(f"x:{m.group(1)}")
+        raw_name = m.group(2).strip()
+        key = normalize_unit_name(raw_name)
+        if count is None or key is None:
+            continue
+        out[key] = int(out.get(key, 0) or 0) + int(count)
+    return out
+
+
+def parse_incoming_attack_alert(text: str) -> dict | None:
+    """
+    Example:
+    'you have been attacked by Galileo! He sent 3000 LC'
+    """
+    s = str(text or "").strip()
+    if not s:
+        return None
+    m = re.search(r"attacked by\s+(.+?)!\s*he sent\s+(.+)$", s, re.IGNORECASE)
+    if not m:
+        return None
+    attacker = m.group(1).strip()
+    units = parse_units_inline(m.group(2))
+    if not attacker or not units:
+        return None
+    return {"attacker": attacker, "units": units}
+
+
 def parse_attack_details(text: str) -> dict:
     """
     Parse core fields from an attack report.
@@ -317,6 +494,8 @@ def parse_attack_details(text: str) -> dict:
         "settlements_lost_count": 0,
         "settlements_lost": [],
         "reported_at": None,
+        "sent_units": {},
+        "lost_units": {},
     }
 
     lines = (text or "").splitlines()
@@ -376,6 +555,20 @@ def parse_attack_details(text: str) -> dict:
 
         if ll.startswith("attack result:") or ll.startswith("result:"):
             details["result"] = line.split(":", 1)[1].strip()
+            continue
+
+        if "casualties during the attack" in ll:
+            # ex: "25861/160619 Heavy Cavalry"
+            for mm in re.finditer(r"(\d[\d,]*)\s*/\s*(\d[\d,]*)\s+([A-Za-z][A-Za-z ]{1,30})", line):
+                lost = parse_first_int_from_value_line(f"x:{mm.group(1)}")
+                sent = parse_first_int_from_value_line(f"x:{mm.group(2)}")
+                unit = normalize_unit_name(mm.group(3))
+                if unit is None:
+                    continue
+                if sent is not None:
+                    details["sent_units"][unit] = int(details["sent_units"].get(unit, 0) or 0) + int(sent)
+                if lost is not None:
+                    details["lost_units"][unit] = int(details["lost_units"].get(unit, 0) or 0) + int(lost)
             continue
 
         # Subject/Attack header: "... Attack Report: Attacker attacked Defender"
@@ -1028,6 +1221,25 @@ def init_db():
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS troop_movements (
+            id SERIAL PRIMARY KEY,
+            owner_kingdom TEXT NOT NULL,
+            target_kingdom TEXT,
+            unit_name TEXT NOT NULL,
+            units_sent INTEGER NOT NULL,
+            departed_at TIMESTAMPTZ NOT NULL,
+            expected_return_at TIMESTAMPTZ NOT NULL,
+            status TEXT NOT NULL DEFAULT 'out',
+            source_attack_report_id INTEGER REFERENCES attack_reports(id),
+            source_message_id BIGINT,
+            source_channel_id BIGINT,
+            season_at_departure TEXT,
+            note TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
             SELECT column_name, is_nullable
@@ -1162,11 +1374,24 @@ def init_db():
             ON attack_reports (source_message_id)
             WHERE source_message_id IS NOT NULL;
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS troop_movements_owner_out_idx
+            ON troop_movements (owner_kingdom, status, departed_at DESC, expected_return_at ASC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS troop_movements_return_due_idx
+            ON troop_movements (status, expected_return_at ASC);
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS troop_movements_src_msg_unit_uq
+            ON troop_movements (source_message_id, unit_name)
+            WHERE source_message_id IS NOT NULL;
+        """)
 
 
 def heal_sequences():
     with db_conn() as conn, conn.cursor() as cur:
-        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots", "attack_reports"]:
+        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots", "attack_reports", "troop_movements"]:
             cur.execute(
                 f"SELECT setval(pg_get_serial_sequence('{table}','id'), "
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
@@ -1650,7 +1875,27 @@ def sync_store_attack_report(
             ),
         )
         row = cur.fetchone()
-        return {"saved": True, "duplicate": False, "row": row}
+
+        movement_rows = 0
+        sent_units = d.get("sent_units") or {}
+        if row and sent_units and d.get("attacker"):
+            departed = d.get("reported_at") or created_at_utc
+            hit_dir = infer_hit_direction_from_nw_cur(cur, d.get("attacker"), d.get("defender"), departed)
+            adj_base = apply_hit_direction_return_modifier(KG_BASE_RETURN_MINUTES, hit_dir)
+            expected = estimate_return_time_season_aware(departed, adj_base)
+            movement_rows = sync_add_troop_movements(
+                owner_kingdom=str(d.get("attacker")).strip(),
+                target_kingdom=(str(d.get("defender")).strip() if d.get("defender") else None),
+                units_map=sent_units,
+                departed_at=departed,
+                expected_return_at=expected,
+                source_attack_report_id=int(row.get("id") or 0),
+                source_message_id=source_message_id,
+                source_channel_id=source_channel_id,
+                note=f"from attack report casualties sent count; hit_direction={hit_dir or 'unknown'}",
+            )
+
+        return {"saved": True, "duplicate": False, "row": row, "movement_rows": movement_rows}
 
 
 def sync_get_attack_rows_for_day(day_start_utc: datetime, day_end_utc: datetime, kingdom: str | None = None):
@@ -1686,6 +1931,215 @@ def sync_get_attack_rows_for_day(day_start_utc: datetime, day_end_utc: datetime,
                 (day_start_utc, day_end_utc),
             )
         return cur.fetchall()
+
+
+def sync_get_latest_networth_for_kingdom_before_cur(cur, kingdom: str, at_utc: datetime):
+    cur.execute(
+        """
+        SELECT net_worth
+        FROM spy_reports
+        WHERE LOWER(kingdom) = LOWER(%s)
+          AND net_worth IS NOT NULL
+          AND created_at <= %s
+        ORDER BY created_at DESC NULLS LAST, id DESC
+        LIMIT 1;
+        """,
+        (kingdom, normalize_to_utc(at_utc)),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return int(row.get("net_worth")) if isinstance(row, dict) else int(row[0])
+    except Exception:
+        return None
+
+
+def infer_hit_direction_from_nw_cur(cur, attacker: str | None, defender: str | None, at_utc: datetime) -> str | None:
+    atk = str(attacker or "").strip()
+    dfn = str(defender or "").strip()
+    if not atk or not dfn:
+        return None
+    a_nw = sync_get_latest_networth_for_kingdom_before_cur(cur, atk, at_utc)
+    d_nw = sync_get_latest_networth_for_kingdom_before_cur(cur, dfn, at_utc)
+    if a_nw is None or d_nw is None:
+        return None
+    if a_nw < d_nw:
+        return "up"
+    if a_nw > d_nw:
+        return "down"
+    return "even"
+
+
+def sync_add_troop_movements(
+    owner_kingdom: str,
+    target_kingdom: str | None,
+    units_map: dict,
+    departed_at: datetime,
+    expected_return_at: datetime,
+    source_attack_report_id: int | None = None,
+    source_message_id: int | None = None,
+    source_channel_id: int | None = None,
+    note: str | None = None,
+):
+    owner = str(owner_kingdom or "").strip()
+    if not owner:
+        return 0
+    inserted = 0
+    season = season_name_at(departed_at)
+    with db_conn() as conn, conn.cursor() as cur:
+        for raw_unit, raw_count in (units_map or {}).items():
+            unit = normalize_unit_name(raw_unit) or str(raw_unit or "").strip().lower()
+            if not unit:
+                continue
+            count = int(raw_count or 0)
+            if count <= 0:
+                continue
+            cur.execute(
+                """
+                INSERT INTO troop_movements (
+                    owner_kingdom, target_kingdom, unit_name, units_sent, departed_at, expected_return_at,
+                    status, source_attack_report_id, source_message_id, source_channel_id, season_at_departure, note
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,'out',%s,%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING;
+                """,
+                (
+                    owner,
+                    (str(target_kingdom).strip() if target_kingdom else None),
+                    unit,
+                    count,
+                    normalize_to_utc(departed_at),
+                    normalize_to_utc(expected_return_at),
+                    (int(source_attack_report_id) if source_attack_report_id else None),
+                    (int(source_message_id) if source_message_id else None),
+                    (int(source_channel_id) if source_channel_id else None),
+                    season,
+                    (str(note).strip() if note else None),
+                ),
+            )
+            inserted += int(cur.rowcount or 0)
+    return inserted
+
+
+def sync_get_troops_out_for_kingdom_at(kingdom: str, at_utc: datetime):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, owner_kingdom, target_kingdom, unit_name, units_sent, departed_at, expected_return_at, note
+            FROM troop_movements
+            WHERE LOWER(owner_kingdom) = LOWER(%s)
+              AND status = 'out'
+              AND departed_at <= %s
+              AND expected_return_at > %s
+            ORDER BY expected_return_at ASC, id ASC;
+            """,
+            (kingdom, normalize_to_utc(at_utc), normalize_to_utc(at_utc)),
+        )
+        return cur.fetchall()
+
+
+def sync_mark_due_troop_returns(now_ts: datetime):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE troop_movements
+            SET status = 'returned'
+            WHERE status = 'out'
+              AND expected_return_at <= %s
+            RETURNING id, owner_kingdom, target_kingdom, unit_name, units_sent, departed_at, expected_return_at;
+            """,
+            (normalize_to_utc(now_ts),),
+        )
+        return cur.fetchall()
+
+
+def sync_get_latest_spy_for_kingdom_before(kingdom: str, at_utc: datetime):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
+            FROM spy_reports
+            WHERE LOWER(kingdom)=LOWER(%s)
+              AND created_at <= %s
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT 1;
+            """,
+            (kingdom, normalize_to_utc(at_utc)),
+        )
+        return cur.fetchone()
+
+
+def aggregate_out_rows(rows: list[dict]) -> tuple[dict, list[str]]:
+    units = {}
+    notes = []
+    for r in rows or []:
+        u = str(r.get("unit_name") or "").strip().lower()
+        c = int(r.get("units_sent") or 0)
+        if u and c > 0:
+            units[u] = int(units.get(u, 0) or 0) + c
+        tgt = str(r.get("target_kingdom") or "unknown")
+        due = r.get("expected_return_at")
+        due_txt = str(due).split(".")[0] if due else "unknown"
+        label = UNIT_DISPLAY.get(u, u.title() if u else "Units")
+        notes.append(f"{label} {fmt_int(c)} -> {tgt} (returns {due_txt} UTC)")
+    return units, notes
+
+
+def format_out_annotation(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    _, notes = aggregate_out_rows(rows)
+    if not notes:
+        return ""
+    lines = [
+        "",
+        "THIS sr likely did not contain the following troops expected to be out at SR time:",
+    ]
+    for n in notes[:8]:
+        lines.append(f"- {n}")
+    extra = len(notes) - 8
+    if extra > 0:
+        lines.append(f"... +{extra} more")
+    return "\n".join(lines)
+
+
+def fmt_units_short(units_map: dict, limit: int = 8) -> str:
+    if not units_map:
+        return "None"
+    items = sorted((units_map or {}).items(), key=lambda x: int(x[1] or 0), reverse=True)
+    parts = []
+    for n, c in items[:limit]:
+        label = UNIT_DISPLAY.get(str(n).lower(), str(n).replace("_", " ").title())
+        parts.append(f"{label} {fmt_int(c)}")
+    if len(items) > limit:
+        parts.append(f"+{len(items) - limit} more")
+    return " | ".join(parts)
+
+
+def sync_build_battle_estimate(kingdom: str, at_utc: datetime):
+    spy = sync_get_latest_spy_for_kingdom_before(kingdom, at_utc)
+    if not spy:
+        return {"ok": False, "reason": "no_spy"}
+    raw = extract_report_text_for_row(spy)
+    home = {}
+    for name, c in (parse_sr_troops(raw) or {}).items():
+        n = normalize_unit_name(name)
+        if n:
+            home[n] = int(home.get(n, 0) or 0) + int(c or 0)
+    out_rows = sync_get_troops_out_for_kingdom_at(kingdom, at_utc)
+    out_units, out_notes = aggregate_out_rows(out_rows)
+    est_home = dict(home)
+    for u, c in out_units.items():
+        est_home[u] = max(0, int(est_home.get(u, 0) or 0) - int(c or 0))
+    return {
+        "ok": True,
+        "spy": spy,
+        "home_from_spy": home,
+        "out_units": out_units,
+        "out_notes": out_notes,
+        "estimated_home": est_home,
+    }
 
 
 def sync_techindex_all(days: int | None = None):
@@ -2088,10 +2542,51 @@ def _is_admin(ctx: commands.Context) -> bool:
     return False
 
 
+async def send_due_return_alerts(returned_rows: list[dict]):
+    grouped = {}
+    for r in returned_rows or []:
+        owner = str(r.get("owner_kingdom") or "Unknown").strip() or "Unknown"
+        grouped.setdefault(owner, []).append(r)
+
+    for guild in bot.guilds:
+        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        if not (ch and can_send(ch, guild)):
+            continue
+        for owner, rows in grouped.items():
+            lines = [f"Troops return alert: **{owner}** may have troops back home."]
+            for r in rows[:6]:
+                unit = UNIT_DISPLAY.get(str(r.get("unit_name") or "").lower(), str(r.get("unit_name") or "Unit"))
+                cnt = int(r.get("units_sent") or 0)
+                tgt = str(r.get("target_kingdom") or "unknown")
+                departed = r.get("departed_at")
+                d_txt = str(departed).split(".")[0] if departed else "unknown"
+                lines.append(f"- {unit} `{fmt_int(cnt)}` from hit on `{tgt}` (sent {d_txt} UTC)")
+            extra = len(rows) - 6
+            if extra > 0:
+                lines.append(f"... +{extra} more")
+            try:
+                await ch.send("\n".join(lines))
+            except Exception:
+                pass
+
+
+async def battle_returns_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            returned_rows = await run_db(sync_mark_due_troop_returns, now_utc())
+            if returned_rows:
+                await send_due_return_alerts(returned_rows)
+        except Exception:
+            logging.exception("battle_returns_loop failed")
+        await asyncio.sleep(max(10, RETURN_ALERT_POLL_SECONDS))
+
+
 # ---------- Events ----------
 @bot.event
 async def on_ready():
     global ANNOUNCED_READY_THIS_PROCESS
+    global BATTLE_RETURNS_LOOP_STARTED
 
     try:
         await run_db(init_db_pool, 1, 10)
@@ -2099,6 +2594,10 @@ async def on_ready():
         await run_db(heal_sequences)
     except Exception:
         logging.exception("DB init failed")
+
+    if not BATTLE_RETURNS_LOOP_STARTED:
+        BATTLE_RETURNS_LOOP_STARTED = True
+        asyncio.create_task(battle_returns_loop())
 
     if ANNOUNCED_READY_THIS_PROCESS:
         logging.info("on_ready called again (same process) - announcement suppressed.")
@@ -2158,6 +2657,22 @@ async def on_message(msg: discord.Message):
             int(msg.id),
             int(msg.channel.id) if getattr(msg, "channel", None) else None,
         )
+        alert_inserted = 0
+        incoming_alert = parse_incoming_attack_alert(msg.content)
+        if incoming_alert:
+            expected = estimate_return_time_season_aware(ts, KG_BASE_RETURN_MINUTES)
+            alert_inserted = await run_db(
+                sync_add_troop_movements,
+                incoming_alert.get("attacker"),
+                None,
+                incoming_alert.get("units") or {},
+                ts,
+                expected,
+                None,
+                int(msg.id),
+                int(msg.channel.id) if getattr(msg, "channel", None) else None,
+                "from incoming attacked-by alert",
+            )
         forwarded = None
 
         if looks_like_recon_report(msg.content):
@@ -2188,6 +2703,12 @@ async def on_message(msg: discord.Message):
                     f"Land `{fmt_int(row.get('land_taken'))}` | "
                     f"Settlement losses `{int(row.get('settlements_lost_count') or 0)}`"
                 )
+                mr = int(attack_result.get("movement_rows") or 0)
+                if mr > 0:
+                    await msg.channel.send(f"Battle tracker: `{mr}` outgoing troop movement row(s) tracked.")
+
+        if alert_inserted > 0 and can_send(msg.channel, msg.guild):
+            await msg.channel.send(f"Battle tracker: tracked `{int(alert_inserted)}` outgoing troop movement row(s) from alert text.")
 
         if forwarded and forwarded.get("ok"):
             data = forwarded.get("data") or {}
@@ -2364,6 +2885,10 @@ async def spy(ctx, *, kingdom: str):
         if not row:
             return await ctx.send(f"❌ No saved reports for **{real}**.")
         content, raw = build_spy_text_report(row)
+        out_rows = await run_db(sync_get_troops_out_for_kingdom_at, row.get("kingdom") or real, row.get("created_at"))
+        out_note = format_out_annotation(out_rows)
+        if out_note:
+            content = f"{content}\n{out_note}"
         if raw:
             for part in split_for_discord(raw, 1900):
                 await ctx.send(part)
@@ -2382,6 +2907,14 @@ async def spyid(ctx, report_id: int):
         if not row:
             return await ctx.send("❌ No report found with that ID.")
         content, raw = build_spy_text_report(row)
+        out_rows = await run_db(
+            sync_get_troops_out_for_kingdom_at,
+            row.get("kingdom") or "Unknown",
+            row.get("created_at"),
+        )
+        out_note = format_out_annotation(out_rows)
+        if out_note:
+            content = f"{content}\n{out_note}"
         if raw:
             for part in split_for_discord(raw, 1900):
                 await ctx.send(part)
@@ -2480,6 +3013,48 @@ async def spies(ctx, *, kingdom: str):
         tb = traceback.format_exc()
         await ctx.send("⚠️ spies failed.")
         await send_error(ctx.guild, f"spies error: {e}", tb=tb)
+
+
+@bot.command()
+async def battle(ctx, *, kingdom: str):
+    """!battle <kingdom> -> estimated now-troops using latest SR minus tracked outgoing troops."""
+    try:
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+        est = await run_db(sync_build_battle_estimate, real, now_utc())
+        if not est.get("ok"):
+            return await ctx.send(f"No saved SR baseline found for **{real}**.")
+
+        spy = est.get("spy") or {}
+        spy_id = spy.get("id")
+        spy_at = spy.get("created_at")
+        spy_at_txt = str(spy_at).split(".")[0] if spy_at else "Unknown"
+        out_units = est.get("out_units") or {}
+        out_notes = est.get("out_notes") or []
+        home_sr = est.get("home_from_spy") or {}
+        home_est = est.get("estimated_home") or {}
+
+        lines = [
+            f"Battle Tracker | {real}",
+            f"Baseline SR: #{spy_id} at {spy_at_txt} UTC",
+            f"Home from SR: {fmt_units_short(home_sr)}",
+            f"Tracked out now: {fmt_units_short(out_units)}",
+            f"Estimated home now: {fmt_units_short(home_est)}",
+        ]
+        if out_notes:
+            lines.append("")
+            lines.append("Outgoing movements:")
+            for n in out_notes[:8]:
+                lines.append(f"- {n}")
+            extra = len(out_notes) - 8
+            if extra > 0:
+                lines.append(f"... +{extra} more")
+
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("battle failed.")
+        await send_error(ctx.guild, f"battle error: {e}", tb=tb)
 
 
 @bot.command()
@@ -3027,6 +3602,7 @@ async def help_cmd(ctx):
             "`!spyid <id>` - Show saved spy report by DB ID",
             "`!spyhistory <kingdom>` - Show last 5 saved spy reports",
             "`!spies <kingdom>` - Show last 10 spy reports + send recommendation",
+            "`!battle <kingdom>` - Estimate current home troops (SR minus tracked outgoing troops)",
             "`!track` - Daily attack tracker for today (UTC) + TSV export",
             "`!track yesterday` - Daily attack tracker for yesterday (UTC)",
             "`!track YYYY-MM-DD` - Daily attack tracker for a specific date (UTC)",
