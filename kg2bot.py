@@ -70,8 +70,7 @@ from psycopg2 import pool as pg_pool
 # ------------------- PATCH INFO -------------------
 BOT_VERSION = "2026-02-15.1"
 PATCH_NOTES = [
-    "Added: Battle tracker command with season-aware + up/down return tracking and return alerts.",
-    "Updated: !spy and !spyid now show troops expected to be out at SR time.",
+    "Added new commands to the !help command.",
 ]
 # -------------------------------------------------
 
@@ -3607,6 +3606,7 @@ async def help_cmd(ctx):
             "`!track yesterday` - Daily attack tracker for yesterday (UTC)",
             "`!track YYYY-MM-DD` - Daily attack tracker for a specific date (UTC)",
             "`!track <kingdom>` - Daily attack tracker filtered to a kingdom (UTC today)",
+            "`!track <kingdom> YYYY-MM-DD` - Daily attack tracker for one kingdom on a specific date (UTC)",
             "`!ap <kingdom>` - AP planner with hit buttons",
             "`!apstatus <kingdom>` - Read-only AP planner status",
             "`!techindex [days]` - Admin: pull history + rebuild indexed battle tech",
