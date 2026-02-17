@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-15.1"
+BOT_VERSION = "2026-02-15.2"
 PATCH_NOTES = [
-    "Added new commands to the !help command.",
+    "Bug fix: stopped net_worth column errors by reading NW from saved spy report text.",
 ]
 # -------------------------------------------------
 
@@ -1933,25 +1933,33 @@ def sync_get_attack_rows_for_day(day_start_utc: datetime, day_end_utc: datetime,
 
 
 def sync_get_latest_networth_for_kingdom_before_cur(cur, kingdom: str, at_utc: datetime):
+    """
+    Returns latest known NW for a kingdom by parsing saved SR text.
+    We intentionally do not query a dedicated DB column because legacy deployments
+    may not have one on spy_reports.
+    """
     cur.execute(
         """
-        SELECT net_worth
+        SELECT id, raw, raw_gz
         FROM spy_reports
         WHERE LOWER(kingdom) = LOWER(%s)
-          AND net_worth IS NOT NULL
           AND created_at <= %s
         ORDER BY created_at DESC NULLS LAST, id DESC
-        LIMIT 1;
+        LIMIT 25;
         """,
         (kingdom, normalize_to_utc(at_utc)),
     )
-    row = cur.fetchone()
-    if not row:
-        return None
-    try:
-        return int(row.get("net_worth")) if isinstance(row, dict) else int(row[0])
-    except Exception:
-        return None
+    rows = cur.fetchall() or []
+    for row in rows:
+        try:
+            text = extract_report_text_for_row(row)
+            details = parse_spy_details(text)
+            nw = details.get("net_worth")
+            if nw is not None:
+                return int(nw)
+        except Exception:
+            continue
+    return None
 
 
 def infer_hit_direction_from_nw_cur(cur, attacker: str | None, defender: str | None, at_utc: datetime) -> str | None:
