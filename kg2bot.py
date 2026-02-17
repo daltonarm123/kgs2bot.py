@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-15.2"
+BOT_VERSION = "2026-02-15.3"
 PATCH_NOTES = [
-    "Bug fix: stopped net_worth column errors by reading NW from saved spy report text.",
+    "Bug fix: !spy lookup is now case-agnostic and whitespace-tolerant for kingdom names.",
 ]
 # -------------------------------------------------
 
@@ -1417,7 +1417,7 @@ def sync_fuzzy_kingdom(query: str):
         return None
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT DISTINCT kingdom FROM spy_reports WHERE kingdom IS NOT NULL;")
-        names = [r["kingdom"] for r in cur.fetchall() if r.get("kingdom")]
+        names = [str(r["kingdom"]).strip() for r in cur.fetchall() if r.get("kingdom")]
     if not names:
         return None
 
@@ -1452,7 +1452,7 @@ def sync_get_latest_spy_for_kingdom(kingdom: str):
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE LOWER(kingdom)=LOWER(%s)
+            WHERE LOWER(BTRIM(kingdom))=LOWER(BTRIM(%s))
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
         """, (kingdom,))
@@ -1464,7 +1464,7 @@ def sync_get_latest_dp_spy_for_kingdom(kingdom: str):
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE LOWER(kingdom)=LOWER(%s) AND defense_power IS NOT NULL AND defense_power > 0
+            WHERE LOWER(BTRIM(kingdom))=LOWER(BTRIM(%s)) AND defense_power IS NOT NULL AND defense_power > 0
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
         """, (kingdom,))
