@@ -3359,6 +3359,7 @@ async def supply(ctx, *, arg: str):
     try:
         if not await _require_premium(ctx):
             return
+        dm = await ctx.author.create_dm()
 
         raw = (arg or "").strip()
         if not raw:
@@ -3444,7 +3445,7 @@ async def supply(ctx, *, arg: str):
             )[:160]
 
             if not summary:
-                return await ctx.send(
+                return await dm.send(
                     f"No supplier transactions found for **{real}** in the last `{days}` days.\n"
                     "Tip: paste full SR reports that include market transactions, then run `!backfill`."
                 )
@@ -3466,7 +3467,7 @@ async def supply(ctx, *, arg: str):
                 f"Gold `{fmt_int(gold_sum)}` | Zero-gold `{zero}` | {top_resource} | Last `{last_txt}` UTC"
             )
 
-        await ctx.send(
+        await dm.send(
             f"📦 **Supply Chain • {real}** (last `{days}` days)\n"
             "Top suppliers by total quantity sold into target:\n"
             + "\n".join(lines)
@@ -3503,11 +3504,15 @@ async def supply(ctx, *, arg: str):
         out.close()
 
         fname = f"kg2_supply_{str(real).strip().replace(' ', '_')}_{now_utc().strftime('%Y%m%d_%H%M%S')}.tsv"
-        await ctx.send(file=discord.File(fp=io.BytesIO(payload), filename=fname))
+        await dm.send(file=discord.File(fp=io.BytesIO(payload), filename=fname))
+        await ctx.send("Supply report sent to your DMs.")
 
     except Exception as e:
         tb = traceback.format_exc()
-        await ctx.send("supply failed.")
+        try:
+            await ctx.send("supply failed. Make sure your DMs are open and try again.")
+        except Exception:
+            pass
         await send_error(ctx.guild, f"supply error: {e}", tb=tb)
 
 
