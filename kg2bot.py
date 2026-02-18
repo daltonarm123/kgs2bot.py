@@ -1892,6 +1892,7 @@ def sync_store_attack_report(
                 source_message_id=source_message_id,
                 source_channel_id=source_channel_id,
                 note=f"from attack report casualties sent count; hit_direction={hit_dir or 'unknown'}",
+                cur=cur,
             )
 
         return {"saved": True, "duplicate": False, "row": row, "movement_rows": movement_rows}
@@ -1988,13 +1989,18 @@ def sync_add_troop_movements(
     source_message_id: int | None = None,
     source_channel_id: int | None = None,
     note: str | None = None,
+    cur=None,
 ):
     owner = str(owner_kingdom or "").strip()
     if not owner:
         return 0
     inserted = 0
     season = season_name_at(departed_at)
-    with db_conn() as conn, conn.cursor() as cur:
+    owns_cursor = cur is None
+    ctx = db_conn() if owns_cursor else None
+    conn = ctx.__enter__() if owns_cursor else None
+    cur = conn.cursor() if owns_cursor else cur
+    try:
         for raw_unit, raw_count in (units_map or {}).items():
             unit = normalize_unit_name(raw_unit) or str(raw_unit or "").strip().lower()
             if not unit:
@@ -2026,6 +2032,9 @@ def sync_add_troop_movements(
                 ),
             )
             inserted += int(cur.rowcount or 0)
+    finally:
+        if owns_cursor and ctx is not None:
+            ctx.__exit__(None, None, None)
     return inserted
 
 
