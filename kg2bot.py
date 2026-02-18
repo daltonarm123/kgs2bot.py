@@ -308,6 +308,60 @@ def fmt_int(value) -> str:
         return "N/A"
 
 
+def _supply_confidence_label(tx_count: int, qty_sum: int, gold_sum: int, zero_gold_count: int) -> str:
+    tx = max(0, int(tx_count or 0))
+    qty = max(0, int(qty_sum or 0))
+    gold = max(0, int(gold_sum or 0))
+    zero = max(0, int(zero_gold_count or 0))
+    if tx <= 0:
+        return "Unknown"
+
+    zero_ratio = (zero / tx) if tx > 0 else 0.0
+    if zero_ratio >= 0.60 and qty >= 100_000:
+        return "Likely Feed"
+    if zero_ratio >= 0.30 and qty >= 50_000:
+        return "Possible Feed"
+    if zero == 0 and tx >= 5 and qty > 0:
+        return "Likely Market Trade"
+    if gold == 0 and qty > 0:
+        return "Likely Feed"
+    return "Mixed"
+
+
+def _build_supply_resource_breakdown(details: list[dict]) -> dict:
+    """
+    Returns per-seller aggregates:
+    {
+      "seller_lower": {
+        "display": "SellerName",
+        "resources": {"Food": {"qty": 123, "tx": 4}, ...}
+      }
+    }
+    """
+    out = {}
+    for d in details or []:
+        seller = str(d.get("seller_kingdom") or "").strip()
+        if not seller:
+            continue
+        sk = seller.lower()
+        res = str(d.get("resource") or "").strip() or "Unknown"
+        qty = int(d.get("quantity") or 0)
+        slot = out.setdefault(sk, {"display": seller, "resources": {}})
+        r = slot["resources"].setdefault(res, {"qty": 0, "tx": 0})
+        r["qty"] += max(0, qty)
+        r["tx"] += 1
+    return out
+
+
+def _top_resource_text_for_seller(resource_map: dict, seller_key: str) -> str:
+    s = (resource_map or {}).get(str(seller_key or "").lower()) or {}
+    resources = s.get("resources") or {}
+    if not resources:
+        return "Top: N/A"
+    top_name, top_vals = max(resources.items(), key=lambda kv: (int(kv[1].get("qty") or 0), int(kv[1].get("tx") or 0), kv[0]))
+    return f"Top: {top_name} {fmt_int(int(top_vals.get('qty') or 0))} ({int(top_vals.get('tx') or 0)} tx)"
+
+
 def hash_report(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -3396,7 +3450,8 @@ async def supply(ctx, *, arg: str):
                 )
 
         lines = []
-        for i, r in enumerate(summary[:15], start=1):
+        resource_map = _build_supply_resource_breakdown(details)
+        for i, r in enumerate(summary[:12], start=1):
             seller = r.get("seller") or "Unknown"
             tx_count = int(r.get("tx_count") or 0)
             qty_sum = int(r.get("qty_sum") or 0)
@@ -3404,9 +3459,11 @@ async def supply(ctx, *, arg: str):
             zero = int(r.get("zero_gold_count") or 0)
             last_seen = r.get("last_seen")
             last_txt = str(last_seen).split(".")[0] if last_seen else "Unknown"
+            label = _supply_confidence_label(tx_count, qty_sum, gold_sum, zero)
+            top_resource = _top_resource_text_for_seller(resource_map, str(seller))
             lines.append(
-                f"{i}. **{seller}** | Tx `{tx_count}` | Qty `{fmt_int(qty_sum)}` | "
-                f"Gold `{fmt_int(gold_sum)}` | Zero-gold `{zero}` | Last `{last_txt}` UTC"
+                f"{i}. **{seller}** | `{label}` | Tx `{tx_count}` | Qty `{fmt_int(qty_sum)}` | "
+                f"Gold `{fmt_int(gold_sum)}` | Zero-gold `{zero}` | {top_resource} | Last `{last_txt}` UTC"
             )
 
         await ctx.send(
