@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.3"
+BOT_VERSION = "2026-02-18.4"
 PATCH_NOTES = [
-    "Bug fix: battle tracker now parses multi-line 'You have been attacked by ...' reports and enemy force composition lines.",
+    "Battle live updates/return alerts now route to nwo-killing-room channel.",
 ]
 # -------------------------------------------------
 
@@ -80,6 +80,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
+LIVE_BATTLE_CHANNEL_ID = int(os.getenv("LIVE_BATTLE_CHANNEL_ID", "1463579633449697334") or "1463579633449697334")
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
 RECON_INGEST_URL = os.getenv("RECON_INGEST_URL", "https://recon-hub.onrender.com/api/reports/spy").strip()
 RECON_INGEST_ENABLED = os.getenv("RECON_INGEST_ENABLED", "true").lower() in ("1", "true", "yes", "y")
@@ -1927,6 +1928,24 @@ def sync_is_premium_discord_user(discord_user_id: int | str) -> bool:
         return False
 
 
+def get_live_battle_channel(guild: discord.Guild, fallback: discord.abc.GuildChannel | None = None):
+    """
+    Preferred channel for battle-tracker live updates.
+    Falls back to the provided channel if configured channel is unavailable.
+    """
+    ch = None
+    try:
+        if LIVE_BATTLE_CHANNEL_ID > 0:
+            ch = guild.get_channel(int(LIVE_BATTLE_CHANNEL_ID))
+    except Exception:
+        ch = None
+    if ch and can_send(ch, guild):
+        return ch
+    if fallback and can_send(fallback, guild):
+        return fallback
+    return None
+
+
 def sync_get_latest_troop_snapshot_units(kingdom: str):
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -2934,7 +2953,7 @@ async def send_due_return_alerts(returned_rows: list[dict]):
         grouped.setdefault(owner, []).append(r)
 
     for guild in bot.guilds:
-        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        ch = get_live_battle_channel(guild, None)
         if not (ch and can_send(ch, guild)):
             continue
         for owner, rows in grouped.items():
@@ -3033,6 +3052,7 @@ async def on_message(msg: discord.Message):
         return
 
     try:
+        live_ch = get_live_battle_channel(msg.guild, msg.channel)
         ts = normalize_to_utc(msg.created_at)
         result = await run_db(sync_store_report, msg.content, ts)
         attack_result = await run_db(
@@ -3090,12 +3110,14 @@ async def on_message(msg: discord.Message):
                 )
                 mr = int(attack_result.get("movement_rows") or 0)
                 if mr > 0:
-                    await msg.channel.send(f"Battle tracker: `{mr}` outgoing troop movement row(s) tracked.")
+                    if live_ch and can_send(live_ch, msg.guild):
+                        await live_ch.send(f"Battle tracker: `{mr}` outgoing troop movement row(s) tracked.")
                 atk = str(row.get("attacker") or "").strip()
                 if atk:
                     live_est = await run_db(sync_build_battle_estimate, atk, ts)
                     if live_est.get("ok"):
-                        await msg.channel.send(
+                        if live_ch and can_send(live_ch, msg.guild):
+                            await live_ch.send(
                             build_live_battle_update_text(
                                 atk,
                                 live_est,
@@ -3103,13 +3125,13 @@ async def on_message(msg: discord.Message):
                             )
                         )
 
-        if alert_inserted > 0 and can_send(msg.channel, msg.guild):
-            await msg.channel.send(f"Battle tracker: tracked `{int(alert_inserted)}` outgoing troop movement row(s) from alert text.")
+        if alert_inserted > 0 and live_ch and can_send(live_ch, msg.guild):
+            await live_ch.send(f"Battle tracker: tracked `{int(alert_inserted)}` outgoing troop movement row(s) from alert text.")
             alert_atk = str((incoming_alert or {}).get("attacker") or "").strip()
             if alert_atk:
                 live_est = await run_db(sync_build_battle_estimate, alert_atk, ts)
                 if live_est.get("ok"):
-                    await msg.channel.send(
+                    await live_ch.send(
                         build_live_battle_update_text(
                             alert_atk,
                             live_est,
