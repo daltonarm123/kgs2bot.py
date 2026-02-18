@@ -866,6 +866,8 @@ def parse_market_transactions(text: str, buyer_kingdom: str | None = None) -> li
     for idx, raw_line in enumerate((text or "").splitlines(), start=1):
         line = (raw_line or "").strip()
         ll = line.lower()
+        line_clean = line.lstrip("•-* ").strip()
+        ll_clean = line_clean.lower()
 
         if "the following recent market transactions were also discovered" in ll:
             in_market = True
@@ -890,7 +892,7 @@ def parse_market_transactions(text: str, buyer_kingdom: str | None = None) -> li
 
         m = re.match(
             r"^(Bought|Sold)\s+([\d,]+)\s+x\s+(.+?)\s+(from|to)\s+(.+?)\s+for\s+([\d,]+)\s+gold(?:\s*\(([^)]+)\))?\s*$",
-            line,
+            line_clean,
             re.IGNORECASE,
         )
         if not m:
@@ -1781,9 +1783,9 @@ def sync_get_supply_summary(kingdom: str, since_utc: datetime, detail_limit: int
               COALESCE(SUM(CASE WHEN COALESCE(gold_amount, 0) = 0 THEN 1 ELSE 0 END), 0)::int AS zero_gold_count,
               MAX(captured_at) AS last_seen
             FROM market_transactions
-            WHERE LOWER(COALESCE(buyer_kingdom, '')) = LOWER(%s)
+            WHERE LOWER(BTRIM(COALESCE(buyer_kingdom, ''))) = LOWER(BTRIM(%s))
               AND captured_at >= %s
-              AND COALESCE(seller_kingdom, '') <> ''
+              AND BTRIM(COALESCE(seller_kingdom, '')) <> ''
             GROUP BY COALESCE(NULLIF(BTRIM(seller_kingdom), ''), 'Unknown')
             ORDER BY qty_sum DESC, tx_count DESC, seller ASC;
             """,
@@ -1797,9 +1799,9 @@ def sync_get_supply_summary(kingdom: str, since_utc: datetime, detail_limit: int
               report_id, captured_at, buyer_kingdom, seller_kingdom, resource,
               quantity, gold_amount, tx_time_text, raw_line
             FROM market_transactions
-            WHERE LOWER(COALESCE(buyer_kingdom, '')) = LOWER(%s)
+            WHERE LOWER(BTRIM(COALESCE(buyer_kingdom, ''))) = LOWER(BTRIM(%s))
               AND captured_at >= %s
-              AND COALESCE(seller_kingdom, '') <> ''
+              AND BTRIM(COALESCE(seller_kingdom, '')) <> ''
             ORDER BY captured_at DESC, report_id DESC, line_no ASC
             LIMIT %s;
             """,
@@ -1808,6 +1810,22 @@ def sync_get_supply_summary(kingdom: str, since_utc: datetime, detail_limit: int
         details = cur.fetchall() or []
 
         return {"summary": summary, "details": details}
+
+
+def sync_get_spy_reports_raw_since(kingdom: str, since_utc: datetime, limit: int = 300):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, kingdom, created_at, raw, raw_gz
+            FROM spy_reports
+            WHERE LOWER(BTRIM(COALESCE(kingdom, ''))) = LOWER(BTRIM(%s))
+              AND created_at >= %s
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT %s;
+            """,
+            (kingdom, since_utc, int(limit)),
+        )
+        return cur.fetchall() or []
 
 
 def sync_is_premium_discord_user(discord_user_id: int | str) -> bool:
@@ -3307,10 +3325,75 @@ async def supply(ctx, *, arg: str):
         details = res.get("details") or []
 
         if not summary:
-            return await ctx.send(
-                f"No supplier transactions found for **{real}** in the last `{days}` days.\n"
-                "Tip: paste full SR reports that include market transactions."
+            # Fallback: parse directly from stored raw reports in case indexing was introduced after reports were saved.
+            spy_rows = await run_db(sync_get_spy_reports_raw_since, real, since, 400)
+            agg = {}
+            parsed_details = []
+            for sr in spy_rows:
+                text = extract_report_text_for_row(sr)
+                if not text:
+                    continue
+                d = parse_spy_details(text)
+                buyer_name = d.get("target") or sr.get("kingdom") or real
+                txs = parse_market_transactions(text, buyer_name)
+                cap = sr.get("created_at")
+                for tx in txs:
+                    seller = str(tx.get("seller_kingdom") or "").strip()
+                    buyer = str(tx.get("buyer_kingdom") or "").strip()
+                    if not seller or not buyer:
+                        continue
+                    if buyer.lower().strip() != str(real).lower().strip():
+                        continue
+                    qty = int(tx.get("quantity") or 0)
+                    gold = int(tx.get("gold_amount") or 0)
+                    key = seller.lower()
+                    if key not in agg:
+                        agg[key] = {
+                            "seller": seller,
+                            "tx_count": 0,
+                            "qty_sum": 0,
+                            "gold_sum": 0,
+                            "zero_gold_count": 0,
+                            "last_seen": cap,
+                        }
+                    a = agg[key]
+                    a["tx_count"] += 1
+                    a["qty_sum"] += qty
+                    a["gold_sum"] += gold
+                    if gold == 0:
+                        a["zero_gold_count"] += 1
+                    if (a.get("last_seen") is None) or (cap and cap > a.get("last_seen")):
+                        a["last_seen"] = cap
+                    parsed_details.append(
+                        {
+                            "captured_at": cap,
+                            "report_id": sr.get("id"),
+                            "buyer_kingdom": buyer,
+                            "seller_kingdom": seller,
+                            "resource": tx.get("resource"),
+                            "quantity": qty,
+                            "gold_amount": gold,
+                            "tx_time_text": tx.get("tx_time_text"),
+                            "raw_line": tx.get("raw_line"),
+                        }
+                    )
+
+            summary = sorted(
+                agg.values(),
+                key=lambda x: (int(x.get("qty_sum") or 0), int(x.get("tx_count") or 0), str(x.get("seller") or "")),
+                reverse=True,
             )
+            details = sorted(
+                parsed_details,
+                key=lambda x: (x.get("captured_at") or datetime(1970, 1, 1, tzinfo=timezone.utc), int(x.get("report_id") or 0)),
+                reverse=True,
+            )[:160]
+
+            if not summary:
+                return await ctx.send(
+                    f"No supplier transactions found for **{real}** in the last `{days}` days.\n"
+                    "Tip: paste full SR reports that include market transactions, then run `!backfill`."
+                )
 
         lines = []
         for i, r in enumerate(summary[:15], start=1):
