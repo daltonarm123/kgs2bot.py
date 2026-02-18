@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.2"
+BOT_VERSION = "2026-02-18.3"
 PATCH_NOTES = [
-    "Added live battle-tracker auto updates from attack reports and attacked-by alerts (remaining troops + return timers).",
+    "Bug fix: battle tracker now parses multi-line 'You have been attacked by ...' reports and enemy force composition lines.",
 ]
 # -------------------------------------------------
 
@@ -523,17 +523,37 @@ def parse_units_inline(text: str) -> dict:
 
 def parse_incoming_attack_alert(text: str) -> dict | None:
     """
-    Example:
-    'you have been attacked by Galileo! He sent 3000 LC'
+    Examples:
+    - 'you have been attacked by Galileo! He sent 3000 LC'
+    - 'You have been attacked by Galileo (NW:86440)\n...enemy forces was as follows: 38000 Light Cavalry'
     """
     s = str(text or "").strip()
     if not s:
         return None
+
+    attacker = None
+    units = {}
+
+    # Legacy one-line alert format.
     m = re.search(r"attacked by\s+(.+?)!\s*he sent\s+(.+)$", s, re.IGNORECASE)
-    if not m:
-        return None
-    attacker = m.group(1).strip()
-    units = parse_units_inline(m.group(2))
+    if m:
+        attacker = m.group(1).strip()
+        units = parse_units_inline(m.group(2))
+
+    # Multi-line attack report alert format.
+    if not attacker:
+        m2 = re.search(r"you have been attacked by\s+(.+?)(?:\s*\(|$)", s, re.IGNORECASE)
+        if m2:
+            attacker = m2.group(1).strip()
+    if not units:
+        m3 = re.search(
+            r"(?:composition of the enemy forces was as follows|enemy forces was as follows)\s*:\s*(.+)$",
+            s,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if m3:
+            units = parse_units_inline(m3.group(1))
+
     if not attacker or not units:
         return None
     return {"attacker": attacker, "units": units}
