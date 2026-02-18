@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.1"
+BOT_VERSION = "2026-02-18.2"
 PATCH_NOTES = [
-    "Added premium supply-chain tracking from spy market transactions (`!supply`).",
+    "Added live battle-tracker auto updates from attack reports and attacked-by alerts (remaining troops + return timers).",
 ]
 # -------------------------------------------------
 
@@ -2423,6 +2423,36 @@ def fmt_units_short(units_map: dict, limit: int = 8) -> str:
     return " | ".join(parts)
 
 
+def build_live_battle_update_text(kingdom: str, est: dict, header: str | None = None) -> str:
+    spy = est.get("spy") or {}
+    spy_id = spy.get("id")
+    spy_at = spy.get("created_at")
+    spy_at_txt = str(spy_at).split(".")[0] if spy_at else "Unknown"
+    out_units = est.get("out_units") or {}
+    out_notes = est.get("out_notes") or []
+    home_est = est.get("estimated_home") or {}
+
+    lines = []
+    if header:
+        lines.append(header)
+    lines.extend(
+        [
+            f"Battle Tracker | {kingdom}",
+            f"Baseline SR: #{spy_id} at {spy_at_txt} UTC",
+            f"Estimated home now: {fmt_units_short(home_est)}",
+            f"Tracked out now: {fmt_units_short(out_units)}",
+        ]
+    )
+    if out_notes:
+        lines.append("Returns in-flight:")
+        for n in out_notes[:6]:
+            lines.append(f"- {n}")
+        extra = len(out_notes) - 6
+        if extra > 0:
+            lines.append(f"... +{extra} more")
+    return "\n".join(lines)
+
+
 def sync_build_battle_estimate(kingdom: str, at_utc: datetime):
     spy = sync_get_latest_spy_for_kingdom_before(kingdom, at_utc)
     if not spy:
@@ -3041,9 +3071,31 @@ async def on_message(msg: discord.Message):
                 mr = int(attack_result.get("movement_rows") or 0)
                 if mr > 0:
                     await msg.channel.send(f"Battle tracker: `{mr}` outgoing troop movement row(s) tracked.")
+                atk = str(row.get("attacker") or "").strip()
+                if atk:
+                    live_est = await run_db(sync_build_battle_estimate, atk, ts)
+                    if live_est.get("ok"):
+                        await msg.channel.send(
+                            build_live_battle_update_text(
+                                atk,
+                                live_est,
+                                header="Live update from attack report:",
+                            )
+                        )
 
         if alert_inserted > 0 and can_send(msg.channel, msg.guild):
             await msg.channel.send(f"Battle tracker: tracked `{int(alert_inserted)}` outgoing troop movement row(s) from alert text.")
+            alert_atk = str((incoming_alert or {}).get("attacker") or "").strip()
+            if alert_atk:
+                live_est = await run_db(sync_build_battle_estimate, alert_atk, ts)
+                if live_est.get("ok"):
+                    await msg.channel.send(
+                        build_live_battle_update_text(
+                            alert_atk,
+                            live_est,
+                            header="Live update from attacked-by alert:",
+                        )
+                    )
 
         if forwarded and forwarded.get("ok"):
             data = forwarded.get("data") or {}
