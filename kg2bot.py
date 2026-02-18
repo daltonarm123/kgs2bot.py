@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-15.3"
+BOT_VERSION = "2026-02-18.1"
 PATCH_NOTES = [
-    "Bug fix: !spy lookup is now case-agnostic and whitespace-tolerant for kingdom names.",
+    "Added premium supply-chain tracking from spy market transactions (`!supply`).",
 ]
 # -------------------------------------------------
 
@@ -88,6 +88,10 @@ RECON_CALC_BASE_URL = os.getenv("RECON_CALC_BASE_URL", "https://recon-hub.onrend
 ADMIN_USER_IDS = {944024167081209867}
 ADMIN_USER_IDS.update(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
+)
+PREMIUM_FREE_USER_IDS = {944024167081209867}
+PREMIUM_FREE_USER_IDS.update(
+    int(x.strip()) for x in os.getenv("PREMIUM_FREE_USER_IDS", "").split(",") if x.strip().isdigit()
 )
 
 if not TOKEN:
@@ -128,6 +132,7 @@ KG_SEASON_EPOCH_UTC = os.getenv("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
 KG_HIT_UP_RETURN_MULT = float(os.getenv("KG_HIT_UP_RETURN_MULT", "0.90"))
 KG_HIT_DOWN_RETURN_MULT = float(os.getenv("KG_HIT_DOWN_RETURN_MULT", "1.10"))
 RETURN_ALERT_POLL_SECONDS = int(os.getenv("RETURN_ALERT_POLL_SECONDS", "30") or "30")
+PREMIUM_GATE_ENABLED = os.getenv("PREMIUM_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 BATTLE_RETURNS_LOOP_STARTED = False
 
 
@@ -849,6 +854,85 @@ def parse_tech(text: str):
     return techs
 
 
+def parse_market_transactions(text: str, buyer_kingdom: str | None = None) -> list[dict]:
+    """
+    Parse SR market section:
+    "The following recent market transactions were also discovered:"
+    """
+    txs = []
+    in_market = False
+    buyer = str(buyer_kingdom or "").strip() or None
+
+    for idx, raw_line in enumerate((text or "").splitlines(), start=1):
+        line = (raw_line or "").strip()
+        ll = line.lower()
+
+        if "the following recent market transactions were also discovered" in ll:
+            in_market = True
+            continue
+
+        if not in_market:
+            continue
+
+        if not line:
+            continue
+
+        # stop when we hit another section header
+        if any(x in ll for x in (
+            "our spies also found the following information",
+            "the following technology information",
+            "the following information was found regarding troop movements",
+            "subject:",
+            "sender:",
+            "recipient",
+        )):
+            break
+
+        m = re.match(
+            r"^(Bought|Sold)\s+([\d,]+)\s+x\s+(.+?)\s+(from|to)\s+(.+?)\s+for\s+([\d,]+)\s+gold(?:\s*\(([^)]+)\))?\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if not m:
+            continue
+
+        verb = m.group(1).strip().lower()
+        qty = int(m.group(2).replace(",", ""))
+        resource = m.group(3).strip()
+        edge = m.group(4).strip().lower()
+        partner = m.group(5).strip()
+        gold = int(m.group(6).replace(",", ""))
+        tx_time_txt = (m.group(7) or "").strip() or None
+
+        seller = None
+        inferred_buyer = buyer
+        if verb == "bought" and edge == "from":
+            seller = partner
+        elif verb == "sold" and edge == "to":
+            inferred_buyer = partner
+        elif edge == "from":
+            seller = partner
+        elif edge == "to":
+            inferred_buyer = partner
+
+        txs.append(
+            {
+                "line_no": idx,
+                "tx_type": verb,
+                "buyer_kingdom": inferred_buyer,
+                "seller_kingdom": seller,
+                "partner_kingdom": partner,
+                "resource": resource,
+                "quantity": qty,
+                "gold_amount": gold,
+                "tx_time_text": tx_time_txt,
+                "raw_line": line,
+            }
+        )
+
+    return txs
+
+
 def is_battle_related_tech(name: str) -> bool:
     """
     Heuristic filter for "battle-related" tech.
@@ -1239,6 +1323,26 @@ def init_db():
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_transactions (
+            id SERIAL PRIMARY KEY,
+            report_id INTEGER NOT NULL REFERENCES spy_reports(id) ON DELETE CASCADE,
+            captured_at TIMESTAMPTZ NOT NULL,
+            line_no INTEGER NOT NULL,
+            tx_type TEXT,
+            buyer_kingdom TEXT,
+            seller_kingdom TEXT,
+            partner_kingdom TEXT,
+            resource TEXT,
+            quantity INTEGER,
+            gold_amount BIGINT,
+            tx_time_text TEXT,
+            raw_line TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(report_id, line_no)
+        );
+        """)
+
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
             SELECT column_name, is_nullable
@@ -1386,11 +1490,19 @@ def init_db():
             ON troop_movements (source_message_id, unit_name)
             WHERE source_message_id IS NOT NULL;
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS market_transactions_buyer_captured_idx
+            ON market_transactions (buyer_kingdom, captured_at DESC, id DESC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS market_transactions_seller_captured_idx
+            ON market_transactions (seller_kingdom, captured_at DESC, id DESC);
+        """)
 
 
 def heal_sequences():
     with db_conn() as conn, conn.cursor() as cur:
-        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots", "attack_reports", "troop_movements"]:
+        for table in ["spy_reports", "dp_sessions", "tech_index", "troop_snapshots", "attack_reports", "troop_movements", "market_transactions"]:
             cur.execute(
                 f"SELECT setval(pg_get_serial_sequence('{table}','id'), "
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
@@ -1623,6 +1735,106 @@ def sync_upsert_troop_snapshot(cur, kingdom: str, report_id: int, captured_at, t
     return inserted
 
 
+def sync_upsert_market_transactions(cur, report_id: int, captured_at, txs: list[dict]) -> int:
+    if not report_id or not txs:
+        return 0
+    inserted = 0
+    ts = captured_at or now_utc()
+    for tx in txs:
+        cur.execute(
+            """
+            INSERT INTO market_transactions (
+                report_id, captured_at, line_no, tx_type, buyer_kingdom, seller_kingdom,
+                partner_kingdom, resource, quantity, gold_amount, tx_time_text, raw_line
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (report_id, line_no) DO NOTHING;
+            """,
+            (
+                int(report_id),
+                ts,
+                int(tx.get("line_no") or 0),
+                (str(tx.get("tx_type") or "").lower() or None),
+                (str(tx.get("buyer_kingdom") or "").strip() or None),
+                (str(tx.get("seller_kingdom") or "").strip() or None),
+                (str(tx.get("partner_kingdom") or "").strip() or None),
+                (str(tx.get("resource") or "").strip() or None),
+                int(tx.get("quantity") or 0),
+                int(tx.get("gold_amount") or 0),
+                (str(tx.get("tx_time_text") or "").strip() or None),
+                (str(tx.get("raw_line") or "").strip() or None),
+            ),
+        )
+        inserted += int(cur.rowcount or 0)
+    return inserted
+
+
+def sync_get_supply_summary(kingdom: str, since_utc: datetime, detail_limit: int = 120):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              COALESCE(NULLIF(BTRIM(seller_kingdom), ''), 'Unknown') AS seller,
+              COUNT(*)::int AS tx_count,
+              COALESCE(SUM(quantity), 0)::bigint AS qty_sum,
+              COALESCE(SUM(gold_amount), 0)::bigint AS gold_sum,
+              COALESCE(SUM(CASE WHEN COALESCE(gold_amount, 0) = 0 THEN 1 ELSE 0 END), 0)::int AS zero_gold_count,
+              MAX(captured_at) AS last_seen
+            FROM market_transactions
+            WHERE LOWER(COALESCE(buyer_kingdom, '')) = LOWER(%s)
+              AND captured_at >= %s
+              AND COALESCE(seller_kingdom, '') <> ''
+            GROUP BY COALESCE(NULLIF(BTRIM(seller_kingdom), ''), 'Unknown')
+            ORDER BY qty_sum DESC, tx_count DESC, seller ASC;
+            """,
+            (kingdom, since_utc),
+        )
+        summary = cur.fetchall() or []
+
+        cur.execute(
+            """
+            SELECT
+              report_id, captured_at, buyer_kingdom, seller_kingdom, resource,
+              quantity, gold_amount, tx_time_text, raw_line
+            FROM market_transactions
+            WHERE LOWER(COALESCE(buyer_kingdom, '')) = LOWER(%s)
+              AND captured_at >= %s
+              AND COALESCE(seller_kingdom, '') <> ''
+            ORDER BY captured_at DESC, report_id DESC, line_no ASC
+            LIMIT %s;
+            """,
+            (kingdom, since_utc, int(detail_limit)),
+        )
+        details = cur.fetchall() or []
+
+        return {"summary": summary, "details": details}
+
+
+def sync_is_premium_discord_user(discord_user_id: int | str) -> bool:
+    uid = str(discord_user_id or "").strip()
+    if not uid:
+        return False
+    try:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.app_users') AS t;")
+            reg = cur.fetchone() or {}
+            if not reg.get("t"):
+                return False
+            cur.execute(
+                """
+                SELECT is_premium
+                FROM public.app_users
+                WHERE discord_user_id = %s
+                LIMIT 1;
+                """,
+                (uid,),
+            )
+            row = cur.fetchone() or {}
+            return bool(row.get("is_premium") or False)
+    except Exception:
+        return False
+
+
 def sync_get_latest_troop_snapshot_units(kingdom: str):
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -1748,11 +1960,13 @@ def sync_store_report(msg_content: str, created_at_utc: datetime):
     kingdom, dp, castles = parse_spy(msg_content)
     techs = parse_tech(msg_content)
     sr_troops = parse_sr_troops(msg_content)
+    market_txs = parse_market_transactions(msg_content, kingdom)
 
     should_save = bool(kingdom) and (
         (dp is not None and dp >= 1000) or
         (techs and len(techs) >= 1) or
-        (sr_troops and len(sr_troops) >= 1)
+        (sr_troops and len(sr_troops) >= 1) or
+        (market_txs and len(market_txs) >= 1)
     )
     if not should_save:
         return {"saved": False}
@@ -1778,6 +1992,8 @@ def sync_store_report(msg_content: str, created_at_utc: datetime):
 
             if sr_troops:
                 sync_upsert_troop_snapshot(cur, kingdom, int(row["id"]), row.get("created_at") or created_at_utc, sr_troops)
+            if market_txs:
+                sync_upsert_market_transactions(cur, int(row["id"]), row.get("created_at") or created_at_utc, market_txs)
 
             if dp is not None and dp >= 1000:
                 sync_ensure_ap_session(kingdom)
@@ -1792,6 +2008,8 @@ def sync_store_report(msg_content: str, created_at_utc: datetime):
                 sync_index_tech_for_report(cur, kingdom, rep_id, created_at_utc, techs)
             if sr_troops:
                 sync_upsert_troop_snapshot(cur, kingdom, rep_id, created_at_utc, sr_troops)
+            if market_txs:
+                sync_upsert_market_transactions(cur, rep_id, created_at_utc, market_txs)
 
         return {"saved": True, "duplicate": True, "row": None}
 
@@ -2342,6 +2560,8 @@ def sync_backfill(days: int | None = None):
         "best_updates": 0,
         "troop_reports": 0,
         "troop_rows": 0,
+        "market_reports": 0,
+        "market_rows": 0,
     }
 
     with db_conn() as conn, conn.cursor() as cur:
@@ -2386,6 +2606,13 @@ def sync_backfill(days: int | None = None):
                 stats["troop_reports"] += 1
                 inserted = sync_upsert_troop_snapshot(cur, k, int(row["id"]), row.get("created_at") or now_utc(), troops)
                 stats["troop_rows"] += int(inserted)
+
+            # market transactions / supplier traces
+            txs = parse_market_transactions(text, k)
+            if txs:
+                stats["market_reports"] += 1
+                inserted = sync_upsert_market_transactions(cur, int(row["id"]), row.get("created_at") or now_utc(), txs)
+                stats["market_rows"] += int(inserted)
 
     return stats
 
@@ -2555,6 +2782,26 @@ def _is_admin(ctx: commands.Context) -> bool:
             return bool(ctx.author.guild_permissions.administrator)
     except Exception:
         pass
+    return False
+
+
+async def _require_premium(ctx: commands.Context) -> bool:
+    """
+    Premium gate for premium-only commands.
+    Only explicit free-user IDs bypass (owner/dev accounts).
+    """
+    try:
+        uid = int(getattr(ctx.author, "id", 0) or 0)
+    except Exception:
+        uid = 0
+    if uid in PREMIUM_FREE_USER_IDS:
+        return True
+    if not PREMIUM_GATE_ENABLED:
+        return True
+    ok = await run_db(sync_is_premium_discord_user, uid)
+    if ok:
+        return True
+    await ctx.send("🔒 This command is a premium feature. Upgrade on recon-hub to use it.")
     return False
 
 
@@ -3032,6 +3279,99 @@ async def spies(ctx, *, kingdom: str):
 
 
 @bot.command()
+async def supply(ctx, *, arg: str):
+    """
+    !supply <kingdom> [days]
+    Premium-only: shows who has been supplying the target kingdom from SR market transactions.
+    """
+    try:
+        if not await _require_premium(ctx):
+            return
+
+        raw = (arg or "").strip()
+        if not raw:
+            return await ctx.send("Usage: `!supply <kingdom> [days]`")
+
+        days = 14
+        kingdom_query = raw
+        parts = raw.split()
+        if parts and re.fullmatch(r"\d{1,3}", parts[-1]):
+            days = max(1, min(365, int(parts[-1])))
+            kingdom_query = " ".join(parts[:-1]).strip() or kingdom_query
+
+        real = await run_db(sync_fuzzy_kingdom, kingdom_query)
+        real = real or kingdom_query
+        since = now_utc() - timedelta(days=int(days))
+        res = await run_db(sync_get_supply_summary, real, since, 160)
+        summary = res.get("summary") or []
+        details = res.get("details") or []
+
+        if not summary:
+            return await ctx.send(
+                f"No supplier transactions found for **{real}** in the last `{days}` days.\n"
+                "Tip: paste full SR reports that include market transactions."
+            )
+
+        lines = []
+        for i, r in enumerate(summary[:15], start=1):
+            seller = r.get("seller") or "Unknown"
+            tx_count = int(r.get("tx_count") or 0)
+            qty_sum = int(r.get("qty_sum") or 0)
+            gold_sum = int(r.get("gold_sum") or 0)
+            zero = int(r.get("zero_gold_count") or 0)
+            last_seen = r.get("last_seen")
+            last_txt = str(last_seen).split(".")[0] if last_seen else "Unknown"
+            lines.append(
+                f"{i}. **{seller}** | Tx `{tx_count}` | Qty `{fmt_int(qty_sum)}` | "
+                f"Gold `{fmt_int(gold_sum)}` | Zero-gold `{zero}` | Last `{last_txt}` UTC"
+            )
+
+        await ctx.send(
+            f"📦 **Supply Chain • {real}** (last `{days}` days)\n"
+            "Top suppliers by total quantity sold into target:\n"
+            + "\n".join(lines)
+        )
+
+        # TSV export for spreadsheet / deeper review
+        out = io.StringIO()
+        writer = csv.writer(out, delimiter="\t", lineterminator="\n")
+        writer.writerow([
+            "captured_at_utc",
+            "report_id",
+            "buyer_kingdom",
+            "seller_kingdom",
+            "resource",
+            "quantity",
+            "gold_amount",
+            "tx_time_text",
+            "raw_line",
+        ])
+        for d in details:
+            cap = d.get("captured_at")
+            writer.writerow([
+                cap.isoformat() if cap else "",
+                d.get("report_id") or "",
+                d.get("buyer_kingdom") or "",
+                d.get("seller_kingdom") or "",
+                d.get("resource") or "",
+                int(d.get("quantity") or 0),
+                int(d.get("gold_amount") or 0),
+                d.get("tx_time_text") or "",
+                d.get("raw_line") or "",
+            ])
+        payload = out.getvalue().encode("utf-8")
+        out.close()
+
+        fname = f"kg2_supply_{str(real).strip().replace(' ', '_')}_{now_utc().strftime('%Y%m%d_%H%M%S')}.tsv"
+        await ctx.send(file=discord.File(fp=io.BytesIO(payload), filename=fname))
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("supply failed.")
+        await send_error(ctx.guild, f"supply error: {e}", tb=tb)
+
+
+@bot.command()
 async def battle(ctx, *, kingdom: str):
     """!battle <kingdom> -> estimated now-troops using latest SR minus tracked outgoing troops."""
     try:
@@ -3472,7 +3812,8 @@ async def backfill(ctx, days: int = None):
             "✅ **Backfill complete**\n"
             f"Reports scanned: `{stats['reports_scanned']}`\n"
             f"Tech reports: `{stats['tech_reports']}` • Tech lines indexed: `{stats['tech_history_rows']}` • Best updates: `{stats['best_updates']}`\n"
-            f"Troop reports: `{stats['troop_reports']}` • Troop rows inserted: `{stats['troop_rows']}`"
+            f"Troop reports: `{stats['troop_reports']}` • Troop rows inserted: `{stats['troop_rows']}`\n"
+            f"Market reports: `{stats['market_reports']}` • Market rows inserted: `{stats['market_rows']}`"
         )
 
     except Exception as e:
@@ -3618,6 +3959,7 @@ async def help_cmd(ctx):
             "`!spyid <id>` - Show saved spy report by DB ID",
             "`!spyhistory <kingdom>` - Show last 5 saved spy reports",
             "`!spies <kingdom>` - Show last 10 spy reports + send recommendation",
+            "`!supply <kingdom> [days]` - Premium: show supplier kingdoms from market transactions + TSV",
             "`!battle <kingdom>` - Estimate current home troops (SR minus tracked outgoing troops)",
             "`!track` - Daily attack tracker for today (UTC) + TSV export",
             "`!track yesterday` - Daily attack tracker for yesterday (UTC)",
