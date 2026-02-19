@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.4"
+BOT_VERSION = "2026-02-18.5"
 PATCH_NOTES = [
-    "Battle live updates/return alerts now route to nwo-killing-room channel.",
+    "Return timer upgraded to NW-ratio piecewise model with caps (plus optional gem and tick-round settings).",
 ]
 # -------------------------------------------------
 
@@ -132,6 +132,17 @@ KG_BASE_RETURN_MINUTES = float(os.getenv("KG_BASE_RETURN_MINUTES", "20"))
 KG_SEASON_EPOCH_UTC = os.getenv("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
 KG_HIT_UP_RETURN_MULT = float(os.getenv("KG_HIT_UP_RETURN_MULT", "0.90"))
 KG_HIT_DOWN_RETURN_MULT = float(os.getenv("KG_HIT_DOWN_RETURN_MULT", "1.10"))
+KG_RETURN_MODEL_ENABLED = os.getenv("KG_RETURN_MODEL_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+KG_RETURN_LINEAR_SLOPE = float(os.getenv("KG_RETURN_LINEAR_SLOPE", "-232"))
+KG_RETURN_LINEAR_INTERCEPT = float(os.getenv("KG_RETURN_LINEAR_INTERCEPT", "363"))
+KG_RETURN_LINEAR_X_MIN = float(os.getenv("KG_RETURN_LINEAR_X_MIN", "0.1"))
+KG_RETURN_LINEAR_X_MAX = float(os.getenv("KG_RETURN_LINEAR_X_MAX", "1.5"))
+KG_RETURN_MIN_MINUTES = float(os.getenv("KG_RETURN_MIN_MINUTES", "24"))
+KG_RETURN_MAX_MINUTES = float(os.getenv("KG_RETURN_MAX_MINUTES", "360"))
+KG_GEM_SPEEDUP_PCT = float(os.getenv("KG_GEM_SPEEDUP_PCT", "0"))
+KG_ROUND_TO_TICK = os.getenv("KG_ROUND_TO_TICK", "false").lower() in ("1", "true", "yes", "y")
+KG_TICK_MINUTES = int(os.getenv("KG_TICK_MINUTES", "5") or "5")
+KG_TICK_ROUND_MODE = os.getenv("KG_TICK_ROUND_MODE", "floor").strip().lower()
 RETURN_ALERT_POLL_SECONDS = int(os.getenv("RETURN_ALERT_POLL_SECONDS", "30") or "30")
 PREMIUM_GATE_ENABLED = os.getenv("PREMIUM_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 BATTLE_RETURNS_LOOP_STARTED = False
@@ -236,6 +247,49 @@ def apply_hit_direction_return_modifier(base_minutes: float, hit_direction: str 
     if d == "down":
         return b * max(0.01, KG_HIT_DOWN_RETURN_MULT)
     return b
+
+
+def _compute_piecewise_base_minutes_from_nw(attacker_nw: int | None, defender_nw: int | None) -> float | None:
+    """
+    Piecewise NW-ratio model:
+      x = defender_nw / attacker_nw
+      x <= X_MIN => MAX minutes (ceiling)
+      X_MIN < x < X_MAX => linear
+      x >= X_MAX => MIN minutes (floor)
+    """
+    try:
+        a = float(attacker_nw or 0)
+        d = float(defender_nw or 0)
+        if a <= 0 or d <= 0:
+            return None
+        x = d / a
+        if x <= KG_RETURN_LINEAR_X_MIN:
+            return float(KG_RETURN_MAX_MINUTES)
+        if x >= KG_RETURN_LINEAR_X_MAX:
+            return float(KG_RETURN_MIN_MINUTES)
+        y = (KG_RETURN_LINEAR_SLOPE * x) + KG_RETURN_LINEAR_INTERCEPT
+        return float(max(KG_RETURN_MIN_MINUTES, min(KG_RETURN_MAX_MINUTES, y)))
+    except Exception:
+        return None
+
+
+def _apply_gem_speedup(minutes: float, pct: float | None = None) -> float:
+    p = float(KG_GEM_SPEEDUP_PCT if pct is None else pct)
+    p = max(0.0, min(100.0, p))
+    return max(0.01, float(minutes) * (1.0 - (p / 100.0)))
+
+
+def _round_ts_to_tick(ts: datetime, tick_minutes: int | None = None, mode: str | None = None) -> datetime:
+    t = normalize_to_utc(ts)
+    tick = max(1, int(tick_minutes or KG_TICK_MINUTES or 5))
+    m = str(mode or KG_TICK_ROUND_MODE or "floor").strip().lower()
+    tick_seconds = tick * 60
+    epoch = int(t.timestamp())
+    if m == "ceil":
+        rounded = ((epoch + tick_seconds - 1) // tick_seconds) * tick_seconds
+    else:
+        rounded = (epoch // tick_seconds) * tick_seconds
+    return datetime.fromtimestamp(rounded, tz=timezone.utc)
 
 
 def init_db_pool(minconn: int = 1, maxconn: int = 10):
@@ -2209,8 +2263,17 @@ def sync_store_attack_report(
         if row and sent_units and d.get("attacker"):
             departed = d.get("reported_at") or created_at_utc
             hit_dir = infer_hit_direction_from_nw_cur(cur, d.get("attacker"), d.get("defender"), departed)
-            adj_base = apply_hit_direction_return_modifier(KG_BASE_RETURN_MINUTES, hit_dir)
-            expected = estimate_return_time_season_aware(departed, adj_base)
+            base_minutes = None
+            if KG_RETURN_MODEL_ENABLED:
+                a_nw = sync_get_latest_networth_for_kingdom_before_cur(cur, d.get("attacker"), departed)
+                d_nw = sync_get_latest_networth_for_kingdom_before_cur(cur, d.get("defender"), departed)
+                base_minutes = _compute_piecewise_base_minutes_from_nw(a_nw, d_nw)
+            if base_minutes is None:
+                base_minutes = apply_hit_direction_return_modifier(KG_BASE_RETURN_MINUTES, hit_dir)
+            base_minutes = _apply_gem_speedup(base_minutes)
+            expected = estimate_return_time_season_aware(departed, base_minutes)
+            if KG_ROUND_TO_TICK:
+                expected = _round_ts_to_tick(expected, KG_TICK_MINUTES, KG_TICK_ROUND_MODE)
             movement_rows = sync_add_troop_movements(
                 owner_kingdom=str(d.get("attacker")).strip(),
                 target_kingdom=(str(d.get("defender")).strip() if d.get("defender") else None),
@@ -2220,7 +2283,7 @@ def sync_store_attack_report(
                 source_attack_report_id=int(row.get("id") or 0),
                 source_message_id=source_message_id,
                 source_channel_id=source_channel_id,
-                note=f"from attack report casualties sent count; hit_direction={hit_dir or 'unknown'}",
+                note=f"from attack report casualties sent count; hit_direction={hit_dir or 'unknown'}; return_model={'nw_ratio' if KG_RETURN_MODEL_ENABLED else 'legacy'}",
                 cur=cur,
             )
 
@@ -3065,7 +3128,10 @@ async def on_message(msg: discord.Message):
         alert_inserted = 0
         incoming_alert = parse_incoming_attack_alert(msg.content)
         if incoming_alert:
-            expected = estimate_return_time_season_aware(ts, KG_BASE_RETURN_MINUTES)
+            base_minutes = _apply_gem_speedup(KG_BASE_RETURN_MINUTES)
+            expected = estimate_return_time_season_aware(ts, base_minutes)
+            if KG_ROUND_TO_TICK:
+                expected = _round_ts_to_tick(expected, KG_TICK_MINUTES, KG_TICK_ROUND_MODE)
             alert_inserted = await run_db(
                 sync_add_troop_movements,
                 incoming_alert.get("attacker"),
