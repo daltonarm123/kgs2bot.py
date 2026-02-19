@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.5"
+BOT_VERSION = "2026-02-18.6"
 PATCH_NOTES = [
-    "Return timer upgraded to NW-ratio piecewise model with caps (plus optional gem and tick-round settings).",
+    "Battle tracker now records attack target from alert/report fields so returns show who troops are out on.",
 ]
 # -------------------------------------------------
 
@@ -587,6 +587,7 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
         return None
 
     attacker = None
+    defender = None
     units = {}
 
     # Legacy one-line alert format.
@@ -609,9 +610,24 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
         if m3:
             units = parse_units_inline(m3.group(1))
 
+    # Defender/target hints from richer report formats.
+    m_def = re.search(r"^\s*recipient(?:\(s\))?\s*:\s*(.+)$", s, re.IGNORECASE | re.MULTILINE)
+    if not m_def:
+        m_def = re.search(r"^\s*to\s*:\s*(.+)$", s, re.IGNORECASE | re.MULTILINE)
+    if not m_def:
+        m_def = re.search(r"^\s*target\s*:\s*(.+)$", s, re.IGNORECASE | re.MULTILINE)
+    if m_def:
+        defender = str(m_def.group(1) or "").strip()
+
+    # Outgoing AR style: Subject: Attack Report: Defender
+    if not defender:
+        m_sub_def = re.search(r"^\s*subject\s*:\s*attack report\s*:\s*(.+)$", s, re.IGNORECASE | re.MULTILINE)
+        if m_sub_def:
+            defender = str(m_sub_def.group(1) or "").strip()
+
     if not attacker or not units:
         return None
-    return {"attacker": attacker, "units": units}
+    return {"attacker": attacker, "defender": defender, "units": units}
 
 
 def parse_attack_details(text: str) -> dict:
@@ -3128,6 +3144,9 @@ async def on_message(msg: discord.Message):
         alert_inserted = 0
         incoming_alert = parse_incoming_attack_alert(msg.content)
         if incoming_alert:
+            alert_target = str(incoming_alert.get("defender") or "").strip() or None
+            if not alert_target and attack_result.get("saved") and attack_result.get("row"):
+                alert_target = str((attack_result.get("row") or {}).get("defender") or "").strip() or None
             base_minutes = _apply_gem_speedup(KG_BASE_RETURN_MINUTES)
             expected = estimate_return_time_season_aware(ts, base_minutes)
             if KG_ROUND_TO_TICK:
@@ -3135,14 +3154,14 @@ async def on_message(msg: discord.Message):
             alert_inserted = await run_db(
                 sync_add_troop_movements,
                 incoming_alert.get("attacker"),
-                None,
+                alert_target,
                 incoming_alert.get("units") or {},
                 ts,
                 expected,
                 None,
                 int(msg.id),
                 int(msg.channel.id) if getattr(msg, "channel", None) else None,
-                "from incoming attacked-by alert",
+                f"from incoming attacked-by alert; target={alert_target or 'unknown'}",
             )
         forwarded = None
 
