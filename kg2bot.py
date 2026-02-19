@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.6"
+BOT_VERSION = "2026-02-18.7"
 PATCH_NOTES = [
-    "Battle tracker now records attack target from alert/report fields so returns show who troops are out on.",
+    "Battle tracker now groups outgoing troops by shared return time/target in live updates.",
 ]
 # -------------------------------------------------
 
@@ -2510,6 +2510,44 @@ def aggregate_out_rows(rows: list[dict]) -> tuple[dict, list[str]]:
     return units, notes
 
 
+def aggregate_out_rows_grouped(rows: list[dict]) -> list[str]:
+    """
+    Group outgoing rows by (target_kingdom, expected_return_at) so one line shows
+    the combined troops returning together.
+    """
+    grouped = {}
+    for r in rows or []:
+        tgt = str(r.get("target_kingdom") or "unknown").strip() or "unknown"
+        due = normalize_to_utc(r.get("expected_return_at")) if r.get("expected_return_at") else None
+        key = (tgt.lower(), int(due.timestamp()) if due else 0)
+        g = grouped.get(key)
+        if not g:
+            g = {"target": tgt, "due": due, "units": {}, "total": 0}
+            grouped[key] = g
+        u = str(r.get("unit_name") or "").strip().lower()
+        c = int(r.get("units_sent") or 0)
+        if u and c > 0:
+            g["units"][u] = int(g["units"].get(u, 0) or 0) + c
+            g["total"] = int(g["total"] or 0) + c
+
+    out = []
+    ordered = sorted(
+        grouped.values(),
+        key=lambda x: (
+            int(x["due"].timestamp()) if x.get("due") else 0,
+            str(x.get("target") or "").lower(),
+        ),
+    )
+    for g in ordered:
+        due = g.get("due")
+        due_txt = str(due).split(".")[0] if due else "unknown"
+        units_txt = fmt_units_short(g.get("units") or {}, limit=6)
+        out.append(
+            f"{fmt_int(int(g.get('total') or 0))} troops ({units_txt}) -> {g.get('target')} (returns {due_txt} UTC)"
+        )
+    return out
+
+
 def format_out_annotation(rows: list[dict]) -> str:
     if not rows:
         return ""
@@ -2548,6 +2586,8 @@ def build_live_battle_update_text(kingdom: str, est: dict, header: str | None = 
     spy_at_txt = str(spy_at).split(".")[0] if spy_at else "Unknown"
     out_units = est.get("out_units") or {}
     out_notes = est.get("out_notes") or []
+    out_rows = est.get("out_rows") or []
+    out_grouped = aggregate_out_rows_grouped(out_rows) if out_rows else out_notes
     home_est = est.get("estimated_home") or {}
 
     lines = []
@@ -2561,11 +2601,11 @@ def build_live_battle_update_text(kingdom: str, est: dict, header: str | None = 
             f"Tracked out now: {fmt_units_short(out_units)}",
         ]
     )
-    if out_notes:
+    if out_grouped:
         lines.append("Returns in-flight:")
-        for n in out_notes[:6]:
+        for n in out_grouped[:6]:
             lines.append(f"- {n}")
-        extra = len(out_notes) - 6
+        extra = len(out_grouped) - 6
         if extra > 0:
             lines.append(f"... +{extra} more")
     return "\n".join(lines)
@@ -2589,6 +2629,7 @@ def sync_build_battle_estimate(kingdom: str, at_utc: datetime):
     return {
         "ok": True,
         "spy": spy,
+        "out_rows": out_rows,
         "home_from_spy": home,
         "out_units": out_units,
         "out_notes": out_notes,
