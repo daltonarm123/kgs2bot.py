@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.7"
+BOT_VERSION = "2026-02-18.8"
 PATCH_NOTES = [
-    "Battle tracker now groups outgoing troops by shared return time/target in live updates.",
+    "Return alerts now post in the same room the report was posted in (with fallback channel if needed).",
 ]
 # -------------------------------------------------
 
@@ -2471,7 +2471,7 @@ def sync_mark_due_troop_returns(now_ts: datetime):
             SET status = 'returned'
             WHERE status = 'out'
               AND expected_return_at <= %s
-            RETURNING id, owner_kingdom, target_kingdom, unit_name, units_sent, departed_at, expected_return_at;
+            RETURNING id, owner_kingdom, target_kingdom, unit_name, units_sent, departed_at, expected_return_at, source_channel_id;
             """,
             (normalize_to_utc(now_ts),),
         )
@@ -3067,31 +3067,60 @@ async def _require_premium(ctx: commands.Context) -> bool:
 
 
 async def send_due_return_alerts(returned_rows: list[dict]):
-    grouped = {}
+    by_channel_owner = {}
     for r in returned_rows or []:
+        channel_id = int(r.get("source_channel_id") or 0)
         owner = str(r.get("owner_kingdom") or "Unknown").strip() or "Unknown"
-        grouped.setdefault(owner, []).append(r)
+        by_channel_owner.setdefault(channel_id, {}).setdefault(owner, []).append(r)
 
-    for guild in bot.guilds:
-        ch = get_live_battle_channel(guild, None)
-        if not (ch and can_send(ch, guild)):
+    for channel_id, owner_map in by_channel_owner.items():
+        sent_to_specific_channel = False
+        if channel_id > 0:
+            ch = bot.get_channel(channel_id)
+            guild = getattr(ch, "guild", None)
+            if ch and guild and can_send(ch, guild):
+                sent_to_specific_channel = True
+                for owner, rows in owner_map.items():
+                    lines = [f"Troops return alert: **{owner}** may have troops back home."]
+                    for r in rows[:6]:
+                        unit = UNIT_DISPLAY.get(str(r.get("unit_name") or "").lower(), str(r.get("unit_name") or "Unit"))
+                        cnt = int(r.get("units_sent") or 0)
+                        tgt = str(r.get("target_kingdom") or "unknown")
+                        departed = r.get("departed_at")
+                        d_txt = str(departed).split(".")[0] if departed else "unknown"
+                        lines.append(f"- {unit} `{fmt_int(cnt)}` from hit on `{tgt}` (sent {d_txt} UTC)")
+                    extra = len(rows) - 6
+                    if extra > 0:
+                        lines.append(f"... +{extra} more")
+                    try:
+                        await ch.send("\n".join(lines))
+                    except Exception:
+                        pass
+
+        if sent_to_specific_channel:
             continue
-        for owner, rows in grouped.items():
-            lines = [f"Troops return alert: **{owner}** may have troops back home."]
-            for r in rows[:6]:
-                unit = UNIT_DISPLAY.get(str(r.get("unit_name") or "").lower(), str(r.get("unit_name") or "Unit"))
-                cnt = int(r.get("units_sent") or 0)
-                tgt = str(r.get("target_kingdom") or "unknown")
-                departed = r.get("departed_at")
-                d_txt = str(departed).split(".")[0] if departed else "unknown"
-                lines.append(f"- {unit} `{fmt_int(cnt)}` from hit on `{tgt}` (sent {d_txt} UTC)")
-            extra = len(rows) - 6
-            if extra > 0:
-                lines.append(f"... +{extra} more")
-            try:
-                await ch.send("\n".join(lines))
-            except Exception:
-                pass
+
+        # Fallback when we cannot resolve/source channel.
+        for guild in bot.guilds:
+            ch = get_live_battle_channel(guild, None)
+            if not (ch and can_send(ch, guild)):
+                continue
+            for owner, rows in owner_map.items():
+                lines = [f"Troops return alert: **{owner}** may have troops back home."]
+                for r in rows[:6]:
+                    unit = UNIT_DISPLAY.get(str(r.get("unit_name") or "").lower(), str(r.get("unit_name") or "Unit"))
+                    cnt = int(r.get("units_sent") or 0)
+                    tgt = str(r.get("target_kingdom") or "unknown")
+                    departed = r.get("departed_at")
+                    d_txt = str(departed).split(".")[0] if departed else "unknown"
+                    lines.append(f"- {unit} `{fmt_int(cnt)}` from hit on `{tgt}` (sent {d_txt} UTC)")
+                extra = len(rows) - 6
+                if extra > 0:
+                    lines.append(f"... +{extra} more")
+                try:
+                    await ch.send("\n".join(lines))
+                except Exception:
+                    pass
 
 
 async def battle_returns_loop():
@@ -3172,7 +3201,7 @@ async def on_message(msg: discord.Message):
         return
 
     try:
-        live_ch = get_live_battle_channel(msg.guild, msg.channel)
+        live_ch = msg.channel if can_send(msg.channel, msg.guild) else get_live_battle_channel(msg.guild, msg.channel)
         ts = normalize_to_utc(msg.created_at)
         result = await run_db(sync_store_report, msg.content, ts)
         attack_result = await run_db(
