@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.8"
+BOT_VERSION = "2026-02-18.9"
 PATCH_NOTES = [
-    "Return alerts now post in the same room the report was posted in (with fallback channel if needed).",
+    "Return alerts now strictly use the source report room when channel ID is present.",
 ]
 # -------------------------------------------------
 
@@ -3067,6 +3067,22 @@ async def _require_premium(ctx: commands.Context) -> bool:
 
 
 async def send_due_return_alerts(returned_rows: list[dict]):
+    async def _resolve_channel(cid: int):
+        if cid <= 0:
+            return None
+        ch = bot.get_channel(cid)
+        if ch:
+            return ch
+        for g in bot.guilds:
+            ch = g.get_channel(cid)
+            if ch:
+                return ch
+        try:
+            fetched = await bot.fetch_channel(cid)
+            return fetched
+        except Exception:
+            return None
+
     by_channel_owner = {}
     for r in returned_rows or []:
         channel_id = int(r.get("source_channel_id") or 0)
@@ -3076,7 +3092,7 @@ async def send_due_return_alerts(returned_rows: list[dict]):
     for channel_id, owner_map in by_channel_owner.items():
         sent_to_specific_channel = False
         if channel_id > 0:
-            ch = bot.get_channel(channel_id)
+            ch = await _resolve_channel(channel_id)
             guild = getattr(ch, "guild", None)
             if ch and guild and can_send(ch, guild):
                 sent_to_specific_channel = True
@@ -3096,11 +3112,19 @@ async def send_due_return_alerts(returned_rows: list[dict]):
                         await ch.send("\n".join(lines))
                     except Exception:
                         pass
+            else:
+                logging.warning(
+                    "return alert channel unresolved or unsendable for source_channel_id=%s; skipping fallback for strict routing",
+                    channel_id,
+                )
 
         if sent_to_specific_channel:
             continue
 
-        # Fallback when we cannot resolve/source channel.
+        # Fallback only when source channel is unknown/missing.
+        if channel_id > 0:
+            continue
+
         for guild in bot.guilds:
             ch = get_live_battle_channel(guild, None)
             if not (ch and can_send(ch, guild)):
