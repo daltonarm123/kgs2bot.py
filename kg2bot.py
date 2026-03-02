@@ -56,6 +56,10 @@ import urllib.parse
 from math import ceil
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 import discord
 from discord.ext import commands
@@ -68,9 +72,10 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-03-02.1"
+BOT_VERSION = "2026-03-02.2"
 PATCH_NOTES = [
-    "Combat calc/AP planner now treat Footmen as 2 AP (with Footmen-needed estimates shown).",
+    "Return tracking now parses report timestamps with timezone handling (Date/Received/mytime/epoch formats).",
+    "Incoming attack alerts now use parsed attack time (with future-time safety clamp) instead of paste time.",
 ]
 # -------------------------------------------------
 
@@ -100,6 +105,8 @@ KG_GAME_PASSWORD = os.getenv("KG_GAME_PASSWORD", "").strip()
 KG_GAME_WEB_COOKIE = os.getenv("KG_GAME_WEB_COOKIE", "").strip()
 KG_GAME_AUTH_CACHE_SECONDS = int(os.getenv("KG_GAME_AUTH_CACHE_SECONDS", "1800") or "1800")
 KG_GAME_SEARCH_KINGDOM_ID = int(os.getenv("KG_GAME_SEARCH_KINGDOM_ID", "0") or "0")
+KG_REPORT_DEFAULT_TZ = os.getenv("KG_REPORT_DEFAULT_TZ", "UTC").strip()
+KG_REPORT_MAX_FUTURE_MINUTES = int(os.getenv("KG_REPORT_MAX_FUTURE_MINUTES", "10") or "10")
 ADMIN_USER_IDS = {944024167081209867}
 ADMIN_USER_IDS.update(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
@@ -516,6 +523,125 @@ def _safe_int_or_none(v) -> int | None:
         return None
 
 
+def _tzinfo_from_token(token: str | None):
+    t = str(token or "").strip().upper()
+    if not t:
+        return None
+    if t in ("Z", "UTC", "GMT"):
+        return timezone.utc
+    offsets = {
+        "EST": -5, "EDT": -4,
+        "CST": -6, "CDT": -5,
+        "MST": -7, "MDT": -6,
+        "PST": -8, "PDT": -7,
+    }
+    if t in offsets:
+        return timezone(timedelta(hours=offsets[t]))
+    m = re.match(r"^([+-])(\d{2})(?::?(\d{2}))?$", t)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        hh = int(m.group(2))
+        mm = int(m.group(3) or "0")
+        return timezone(sign * timedelta(hours=hh, minutes=mm))
+    return None
+
+
+def _resolve_report_default_tzinfo():
+    txt = str(KG_REPORT_DEFAULT_TZ or "UTC").strip()
+    tzi = _tzinfo_from_token(txt)
+    if tzi:
+        return tzi
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(txt)
+        except Exception:
+            pass
+    logging.warning("Invalid KG_REPORT_DEFAULT_TZ=%r, defaulting to UTC", txt)
+    return timezone.utc
+
+
+REPORT_DEFAULT_TZINFO = _resolve_report_default_tzinfo()
+
+
+def parse_report_datetime_from_line(text: str) -> datetime | None:
+    """
+    Parse report timestamps robustly across formats:
+    - Date: 2026-03-01 12:00:00
+    - Received: Mar 1, 2026, 12:00:00 PM
+    - Optional timezone suffixes (UTC, CST, +01:00)
+    - [mytime] wrappers, including epoch payloads
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    # Normalize common wrappers seen in pasted reports.
+    s = re.sub(r"\[/?mytime\]", " ", raw, flags=re.IGNORECASE)
+    s = re.sub(r"/mytime", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # Epoch payload inside wrappers (seconds or milliseconds).
+    m_epoch = re.search(r"\b(\d{10,13})\b", s)
+    if m_epoch:
+        try:
+            n = int(m_epoch.group(1))
+            if n > 10**12:
+                n = int(n / 1000)
+            if 0 < n < 32503680000:  # before year 3000
+                return datetime.fromtimestamp(n, tz=timezone.utc)
+        except Exception:
+            pass
+
+    # YYYY-MM-DD HH:MM:SS [TZ]
+    m_iso = re.search(
+        r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:\s*(UTC|GMT|[ECMP][SD]T|Z|[+-]\d{2}:?\d{2}))?",
+        s,
+        re.IGNORECASE,
+    )
+    if m_iso:
+        try:
+            dt = datetime.strptime(m_iso.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S")
+            tzi = _tzinfo_from_token(m_iso.group(2)) or REPORT_DEFAULT_TZINFO
+            return dt.replace(tzinfo=tzi).astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    # Month Day, Year, HH:MM:SS AM/PM [TZ]
+    m_named = re.search(
+        r"([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)(?:\s*(UTC|GMT|[ECMP][SD]T|Z|[+-]\d{2}:?\d{2}))?",
+        s,
+        re.IGNORECASE,
+    )
+    if m_named:
+        part = m_named.group(1)
+        tzi = _tzinfo_from_token(m_named.group(2)) or REPORT_DEFAULT_TZINFO
+        for fmt in ("%b %d, %Y, %I:%M:%S %p", "%B %d, %Y, %I:%M:%S %p"):
+            try:
+                dt = datetime.strptime(part, fmt)
+                return dt.replace(tzinfo=tzi).astimezone(timezone.utc)
+            except Exception:
+                continue
+
+    return None
+
+
+def coerce_report_time(report_ts: datetime | None, captured_ts: datetime | None) -> datetime | None:
+    """
+    Keep parsed report time sane relative to message capture time.
+    If parsed time lands in the future beyond tolerance, clamp to captured time.
+    """
+    if report_ts is None:
+        return None
+    rt = normalize_to_utc(report_ts)
+    if captured_ts is None:
+        return rt
+    ct = normalize_to_utc(captured_ts)
+    if rt > ct + timedelta(minutes=max(0, int(KG_REPORT_MAX_FUTURE_MINUTES or 0))):
+        return ct
+    return rt
+
+
 def _extract_nw_from_game_api_payload(payload: dict) -> int | None:
     if not isinstance(payload, dict):
         return None
@@ -888,7 +1014,18 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
     attacker = None
     defender = None
     attacker_nw = None
+    occurred_at = None
     units = {}
+
+    for raw_line in s.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        ll = line.lower()
+        if ll.startswith("date:") or ll.startswith("received:"):
+            dt = parse_report_datetime_from_line(line)
+            if dt and (occurred_at is None or dt < occurred_at):
+                occurred_at = dt
 
     # Legacy one-line alert format.
     m = re.search(r"attacked by\s+(.+?)!\s*he sent\s+(.+)$", s, re.IGNORECASE)
@@ -930,7 +1067,13 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
 
     if not attacker or not units:
         return None
-    return {"attacker": attacker, "attacker_nw": attacker_nw, "defender": defender, "units": units}
+    return {
+        "attacker": attacker,
+        "attacker_nw": attacker_nw,
+        "defender": defender,
+        "occurred_at": occurred_at,
+        "units": units,
+    }
 
 
 def parse_attack_details(text: str) -> dict:
@@ -957,35 +1100,11 @@ def parse_attack_details(text: str) -> dict:
             continue
         ll = line.lower()
 
-        # Date line can contain wrappers like [mytime].../mytime
-        if ll.startswith("date:"):
-            m_dt = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", line)
-            if m_dt:
-                try:
-                    details["reported_at"] = datetime.strptime(
-                        m_dt.group(1), "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=timezone.utc)
-                except Exception:
-                    pass
-            continue
-        if ll.startswith("received:"):
-            m_dt = re.search(
-                r"([a-z]{3,9}\s+\d{1,2},\s+\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+[ap]m)",
-                line,
-                re.IGNORECASE,
-            )
-            if m_dt:
-                try:
-                    details["reported_at"] = datetime.strptime(
-                        m_dt.group(1), "%b %d, %Y, %I:%M:%S %p"
-                    ).replace(tzinfo=timezone.utc)
-                except Exception:
-                    try:
-                        details["reported_at"] = datetime.strptime(
-                            m_dt.group(1), "%B %d, %Y, %I:%M:%S %p"
-                        ).replace(tzinfo=timezone.utc)
-                    except Exception:
-                        pass
+        # Date line can contain wrappers like [mytime]...[/mytime], epoch values, or explicit TZ suffixes.
+        if ll.startswith("date:") or ll.startswith("received:"):
+            dt = parse_report_datetime_from_line(line)
+            if dt and (details["reported_at"] is None or dt < details["reported_at"]):
+                details["reported_at"] = dt
             continue
 
         if ll.startswith("target:"):
@@ -2509,6 +2628,8 @@ def sync_store_attack_report(
     Tracks attacker/defender/result/land/settlement-loss signals for !track.
     """
     d = parse_attack_details(msg_content)
+    reported_at = coerce_report_time(d.get("reported_at"), created_at_utc)
+    d["reported_at"] = reported_at
     # Guard against non-attack content even if detection is permissive.
     ll = (msg_content or "").lower()
     has_attack_shape = bool(
@@ -2565,7 +2686,7 @@ def sync_store_attack_report(
                 d.get("land_taken"),
                 int(d.get("settlements_lost_count") or 0),
                 settlements_txt,
-                d.get("reported_at"),
+                reported_at,
                 created_at_utc,
                 raw_text,
                 raw_text_compat,
@@ -2580,7 +2701,7 @@ def sync_store_attack_report(
         movement_rows = 0
         sent_units = d.get("sent_units") or {}
         if KG_TRACK_ATTACK_REPORT_MOVEMENTS and row and sent_units and d.get("attacker"):
-            departed = d.get("reported_at") or created_at_utc
+            departed = reported_at or created_at_utc
             base_minutes = compute_base_return_minutes_cur(cur, d.get("attacker"), d.get("defender"), departed)
             expected = estimate_return_time_season_aware(departed, base_minutes)
             if KG_ROUND_TO_TICK:
@@ -3565,11 +3686,12 @@ async def on_message(msg: discord.Message):
             alert_target = str(incoming_alert.get("defender") or "").strip() or None
             if not alert_target and attack_result.get("saved") and attack_result.get("row"):
                 alert_target = str((attack_result.get("row") or {}).get("defender") or "").strip() or None
+            alert_departed_at = coerce_report_time(incoming_alert.get("occurred_at"), ts) or ts
             expected = await run_db(
                 sync_compute_expected_return_for_pair,
                 incoming_alert.get("attacker"),
                 alert_target,
-                ts,
+                alert_departed_at,
                 incoming_alert.get("attacker_nw"),
                 None,
             )
@@ -3578,7 +3700,7 @@ async def on_message(msg: discord.Message):
                 incoming_alert.get("attacker"),
                 alert_target,
                 incoming_alert.get("units") or {},
-                ts,
+                alert_departed_at,
                 expected,
                 None,
                 int(msg.id),
