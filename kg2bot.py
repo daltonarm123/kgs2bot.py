@@ -68,9 +68,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-02-18.9"
+BOT_VERSION = "2026-03-02.1"
 PATCH_NOTES = [
-    "Return alerts now strictly use the source report room when channel ID is present.",
+    "Combat calc/AP planner now treat Footmen as 2 AP (with Footmen-needed estimates shown).",
 ]
 # -------------------------------------------------
 
@@ -119,6 +119,8 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------- Game constants ----------
 HEAVY_CAVALRY_AP = 7
+# KG live behavior: Footmen are treated as 2 AP.
+FOOTMEN_AP = 2
 AP_REDUCTIONS = [
     ("Minor Victory", 0.19),
     ("Victory", 0.35),
@@ -3217,12 +3219,17 @@ def build_calc_embed(target: str, dp: int, castles: int, used: str):
     embed.add_field(name="Adjusted DP", value=f"{adj:,}", inline=True)
     embed.add_field(name="Castles", value=str(castles), inline=True)
     embed.add_field(name="HC Needed (est.)", value=f"{ceil(adj / HEAVY_CAVALRY_AP):,}", inline=True)
+    embed.add_field(name="Footmen Needed (est.)", value=f"{ceil(adj / FOOTMEN_AP):,}", inline=True)
 
     for label, red in AP_REDUCTIONS:
         rem = ceil(adj * (1 - red))
         embed.add_field(
             name=f"{label} (-{int(red*100)}%)",
-            value=f"Remaining DP: {rem:,}\nRemaining HC: {ceil(rem/HEAVY_CAVALRY_AP):,}",
+            value=(
+                f"Remaining DP: {rem:,}\n"
+                f"Remaining HC: {ceil(rem/HEAVY_CAVALRY_AP):,}\n"
+                f"Remaining Footmen: {ceil(rem/FOOTMEN_AP):,}"
+            ),
             inline=False
         )
     return embed
@@ -3242,6 +3249,7 @@ def build_ap_embed_from_row(kingdom: str, row):
     embed.add_field(name="Hits Applied", value=str(hits), inline=True)
     embed.add_field(name="Castles", value=str(castles), inline=True)
     embed.add_field(name="HC Needed (est.)", value=f"{ceil(current_dp / HEAVY_CAVALRY_AP):,}", inline=True)
+    embed.add_field(name="Footmen Needed (est.)", value=f"{ceil(current_dp / FOOTMEN_AP):,}", inline=True)
     if row.get("last_hit"):
         embed.set_footer(text=f"Last hit by {row['last_hit']} • Captured {row.get('captured_at')}")
     else:
