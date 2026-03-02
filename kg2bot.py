@@ -86,6 +86,20 @@ RECON_INGEST_URL = os.getenv("RECON_INGEST_URL", "https://recon-hub.onrender.com
 RECON_INGEST_ENABLED = os.getenv("RECON_INGEST_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 RECON_INGEST_TIMEOUT = float(os.getenv("RECON_INGEST_TIMEOUT", "10"))
 RECON_CALC_BASE_URL = os.getenv("RECON_CALC_BASE_URL", "https://recon-hub.onrender.com/kg-calc.html").strip()
+KG_GAME_API_BASE = "https://kingdomgame.net"
+if str(os.getenv("KG_GAME_API_BASE", "")).strip().rstrip("/") not in ("", KG_GAME_API_BASE):
+    logging.warning("Ignoring KG_GAME_API_BASE override; bot is locked to https://kingdomgame.net")
+KG_GAME_API_TIMEOUT = float(os.getenv("KG_GAME_API_TIMEOUT", "4"))
+KG_GAME_API_CACHE_SECONDS = int(os.getenv("KG_GAME_API_CACHE_SECONDS", "60") or "60")
+KG_GAME_WORLD_ID = int(os.getenv("KG_GAME_WORLD_ID", "1") or "1")
+KG_GAME_ACCOUNT_ID = os.getenv("KG_GAME_ACCOUNT_ID", "").strip()
+KG_GAME_TOKEN = os.getenv("KG_GAME_TOKEN", "").strip()
+KG_GAME_TOKEN_KINGDOM_ID = os.getenv("KG_GAME_TOKEN_KINGDOM_ID", "").strip()
+KG_GAME_EMAIL = os.getenv("KG_GAME_EMAIL", "").strip()
+KG_GAME_PASSWORD = os.getenv("KG_GAME_PASSWORD", "").strip()
+KG_GAME_WEB_COOKIE = os.getenv("KG_GAME_WEB_COOKIE", "").strip()
+KG_GAME_AUTH_CACHE_SECONDS = int(os.getenv("KG_GAME_AUTH_CACHE_SECONDS", "1800") or "1800")
+KG_GAME_SEARCH_KINGDOM_ID = int(os.getenv("KG_GAME_SEARCH_KINGDOM_ID", "0") or "0")
 ADMIN_USER_IDS = {944024167081209867}
 ADMIN_USER_IDS.update(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
@@ -133,12 +147,15 @@ KG_SEASON_EPOCH_UTC = os.getenv("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
 KG_HIT_UP_RETURN_MULT = float(os.getenv("KG_HIT_UP_RETURN_MULT", "0.90"))
 KG_HIT_DOWN_RETURN_MULT = float(os.getenv("KG_HIT_DOWN_RETURN_MULT", "1.10"))
 KG_RETURN_MODEL_ENABLED = os.getenv("KG_RETURN_MODEL_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-KG_RETURN_LINEAR_SLOPE = float(os.getenv("KG_RETURN_LINEAR_SLOPE", "-232"))
-KG_RETURN_LINEAR_INTERCEPT = float(os.getenv("KG_RETURN_LINEAR_INTERCEPT", "363"))
-KG_RETURN_LINEAR_X_MIN = float(os.getenv("KG_RETURN_LINEAR_X_MIN", "0.1"))
-KG_RETURN_LINEAR_X_MAX = float(os.getenv("KG_RETURN_LINEAR_X_MAX", "1.5"))
-KG_RETURN_MIN_MINUTES = float(os.getenv("KG_RETURN_MIN_MINUTES", "24"))
-KG_RETURN_MAX_MINUTES = float(os.getenv("KG_RETURN_MAX_MINUTES", "360"))
+KG_TRACK_ATTACK_REPORT_MOVEMENTS = os.getenv("KG_TRACK_ATTACK_REPORT_MOVEMENTS", "false").lower() in ("1", "true", "yes", "y")
+KG_TRACK_INCOMING_ALERT_MOVEMENTS = os.getenv("KG_TRACK_INCOMING_ALERT_MOVEMENTS", "true").lower() in ("1", "true", "yes", "y")
+KG_TROOP_TRACKING_ENABLED = KG_TRACK_ATTACK_REPORT_MOVEMENTS or KG_TRACK_INCOMING_ALERT_MOVEMENTS
+KG_RETURN_LINEAR_SLOPE = float(os.getenv("KG_RETURN_LINEAR_SLOPE", "-185.6"))
+KG_RETURN_LINEAR_INTERCEPT = float(os.getenv("KG_RETURN_LINEAR_INTERCEPT", "290.4"))
+KG_RETURN_LINEAR_X_MIN = float(os.getenv("KG_RETURN_LINEAR_X_MIN", "0.0"))
+KG_RETURN_LINEAR_X_MAX = float(os.getenv("KG_RETURN_LINEAR_X_MAX", "4.5"))
+KG_RETURN_MIN_MINUTES = float(os.getenv("KG_RETURN_MIN_MINUTES", "18.85"))
+KG_RETURN_MAX_MINUTES = float(os.getenv("KG_RETURN_MAX_MINUTES", "288"))
 KG_GEM_SPEEDUP_PCT = float(os.getenv("KG_GEM_SPEEDUP_PCT", "0"))
 KG_ROUND_TO_TICK = os.getenv("KG_ROUND_TO_TICK", "false").lower() in ("1", "true", "yes", "y")
 KG_TICK_MINUTES = int(os.getenv("KG_TICK_MINUTES", "5") or "5")
@@ -172,6 +189,8 @@ SEASON_LEN = timedelta(days=5)
 
 # ---------- DB Pool ----------
 DB_POOL = None  # psycopg2.pool.SimpleConnectionPool
+NW_API_CACHE: dict[str, tuple[int | None, float]] = {}
+KG_API_AUTH_CACHE: dict[str, object] = {}
 
 
 def now_utc() -> datetime:
@@ -277,6 +296,32 @@ def _apply_gem_speedup(minutes: float, pct: float | None = None) -> float:
     p = float(KG_GEM_SPEEDUP_PCT if pct is None else pct)
     p = max(0.0, min(100.0, p))
     return max(0.01, float(minutes) * (1.0 - (p / 100.0)))
+
+
+def compute_base_return_minutes_cur(
+    cur,
+    attacker: str | None,
+    defender: str | None,
+    departed_at: datetime,
+    attacker_nw_hint: int | None = None,
+    defender_nw_hint: int | None = None,
+) -> float:
+    """
+    Compute baseline return minutes before seasonal integration.
+    Priority:
+    1) NW-ratio model (if enabled and NWs available)
+    2) hit-direction adjusted legacy base
+    3) gem speed adjustment always applied at the end
+    """
+    hit_dir = infer_hit_direction_from_nw_cur(cur, attacker, defender, departed_at)
+    base_minutes = None
+    if KG_RETURN_MODEL_ENABLED:
+        a_nw = _safe_int_or_none(attacker_nw_hint) or sync_get_latest_networth_for_kingdom_before_cur(cur, attacker, departed_at)
+        d_nw = _safe_int_or_none(defender_nw_hint) or sync_get_latest_networth_for_kingdom_before_cur(cur, defender, departed_at)
+        base_minutes = _compute_piecewise_base_minutes_from_nw(a_nw, d_nw)
+    if base_minutes is None:
+        base_minutes = apply_hit_direction_return_modifier(KG_BASE_RETURN_MINUTES, hit_dir)
+    return _apply_gem_speedup(base_minutes)
 
 
 def _round_ts_to_tick(ts: datetime, tick_minutes: int | None = None, mode: str | None = None) -> datetime:
@@ -453,6 +498,258 @@ def parse_first_int_from_value_line(line: str):
         return None
 
 
+def _safe_int_or_none(v) -> int | None:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            n = int(v)
+            return n if n > 0 else None
+        s = str(v).strip().replace(",", "")
+        if not s:
+            return None
+        n = int(float(s))
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _extract_nw_from_game_api_payload(payload: dict) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("networth"),
+        payload.get("net_worth"),
+        (payload.get("kingdom") or {}).get("networth") if isinstance(payload.get("kingdom"), dict) else None,
+        (payload.get("kingdom") or {}).get("net_worth") if isinstance(payload.get("kingdom"), dict) else None,
+    ]
+    for c in candidates:
+        n = _safe_int_or_none(c)
+        if n:
+            return n
+    return None
+
+
+def _dict_pick(d: dict, *keys):
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    return None
+
+
+def _decode_kg_asmx_response(body_text: str) -> dict | None:
+    try:
+        data = json.loads(body_text or "{}")
+    except Exception:
+        return None
+    if isinstance(data, dict) and "d" in data:
+        inner = data.get("d")
+        if isinstance(inner, str):
+            try:
+                data = json.loads(inner)
+            except Exception:
+                return None
+        elif isinstance(inner, dict):
+            data = inner
+    return data if isinstance(data, dict) else None
+
+
+def _kg_webservice_post(service: str, method: str, payload: dict) -> dict | None:
+    base = str(KG_GAME_API_BASE or "").strip().rstrip("/")
+    if not base:
+        return None
+    url = f"{base}/WebService/{service}.asmx/{method}"
+    body = json.dumps(payload or {}).encode("utf-8")
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "User-Agent": "kg2bot/1.0",
+        "World-Id": str(max(1, int(KG_GAME_WORLD_ID or 1))),
+        "Origin": "https://kingdomgame.net",
+        "Referer": "https://kingdomgame.net/",
+    }
+    if KG_GAME_WEB_COOKIE:
+        headers["Cookie"] = KG_GAME_WEB_COOKIE
+    try:
+        req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        with urllib.request.urlopen(req, timeout=max(1.0, float(KG_GAME_API_TIMEOUT))) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            return _decode_kg_asmx_response(text)
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        logging.debug("KG webservice %s/%s failed: %s %s", service, method, e.code, err_body[:200])
+        return None
+    except Exception:
+        return None
+
+
+def _kg_extract_auth_credentials(login_payload: dict) -> tuple[int | None, str]:
+    account_id = _safe_int_or_none(_dict_pick(login_payload, "accountId", "AccountId"))
+    token = str(_dict_pick(login_payload, "token", "Token") or "").strip()
+    return account_id, token
+
+
+def _kg_extract_first_kingdom_id(payload: dict) -> int | None:
+    rows = _dict_pick(payload, "kingdoms", "Kingdoms")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict):
+                kid = _safe_int_or_none(_dict_pick(row, "id", "Id", "kingdomId", "KingdomId"))
+                if kid:
+                    return kid
+    return _safe_int_or_none(_dict_pick(payload, "id", "Id", "kingdomId", "KingdomId"))
+
+
+def _kg_get_static_auth(now_ts: float) -> dict | None:
+    account_id = _safe_int_or_none(KG_GAME_ACCOUNT_ID)
+    token = str(KG_GAME_TOKEN or "").strip()
+    if not account_id or not token:
+        return None
+    search_kingdom_id = int(KG_GAME_SEARCH_KINGDOM_ID or 0)
+    if search_kingdom_id <= 0:
+        search_kingdom_id = _safe_int_or_none(KG_GAME_TOKEN_KINGDOM_ID) or 0
+    auth_row = {
+        "account_id": int(account_id),
+        "token": token,
+        "search_kingdom_id": int(search_kingdom_id or 0),
+        "expires_at": now_ts + max(60, int(KG_GAME_AUTH_CACHE_SECONDS or 1800)),
+        "auth_mode": "static_token",
+    }
+    KG_API_AUTH_CACHE.clear()
+    KG_API_AUTH_CACHE.update(auth_row)
+    return KG_API_AUTH_CACHE
+
+
+def _kg_get_auth(force_refresh: bool = False) -> dict | None:
+    now_ts = time.time()
+    static_auth = _kg_get_static_auth(now_ts)
+    if static_auth:
+        return static_auth
+    if not force_refresh and KG_API_AUTH_CACHE and float(KG_API_AUTH_CACHE.get("expires_at", 0) or 0) > now_ts:
+        return KG_API_AUTH_CACHE
+    if not KG_GAME_EMAIL or not KG_GAME_PASSWORD:
+        return None
+
+    login_payload = _kg_webservice_post("User", "Login", {"email": KG_GAME_EMAIL, "password": KG_GAME_PASSWORD}) or {}
+    account_id, token = _kg_extract_auth_credentials(login_payload)
+    if not account_id or not token:
+        return None
+
+    search_kingdom_id = int(KG_GAME_SEARCH_KINGDOM_ID or 0)
+    if search_kingdom_id <= 0:
+        kingdoms_payload = _kg_webservice_post(
+            "Kingdoms",
+            "GetKingdoms",
+            {"accountId": int(account_id), "token": token},
+        ) or {}
+        search_kingdom_id = _kg_extract_first_kingdom_id(kingdoms_payload) or 0
+
+    KG_API_AUTH_CACHE.clear()
+    KG_API_AUTH_CACHE.update({
+        "account_id": int(account_id),
+        "token": token,
+        "search_kingdom_id": int(search_kingdom_id or 0),
+        "expires_at": now_ts + max(60, int(KG_GAME_AUTH_CACHE_SECONDS or 1800)),
+        "auth_mode": "login",
+    })
+    return KG_API_AUTH_CACHE
+
+
+def _kg_extract_networth_from_search_payload(search_term: str, payload: dict) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    rows = _dict_pick(payload, "kingdoms", "Kingdoms")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    needle = str(search_term or "").strip().casefold()
+    chosen = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(_dict_pick(row, "name", "Name") or "").strip().casefold()
+        if name and name == needle:
+            chosen = row
+            break
+    if chosen is None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(_dict_pick(row, "name", "Name") or "").strip().casefold()
+            if needle and needle in name:
+                chosen = row
+                break
+    if chosen is None:
+        chosen = rows[0] if isinstance(rows[0], dict) else None
+    if not isinstance(chosen, dict):
+        return None
+    return _safe_int_or_none(_dict_pick(chosen, "networth", "netWorth", "net_worth", "NetWorth"))
+
+
+def fetch_kingdom_networth_from_game_api(kingdom: str) -> int | None:
+    """
+    Optional fallback NW source when local spy DB does not have fresh data.
+    Prefers authenticated KingdomGame WebService lookup and falls back to legacy public API probes.
+    """
+    base = str(KG_GAME_API_BASE or "").strip().rstrip("/")
+    k = str(kingdom or "").strip()
+    if not base or not k:
+        return None
+
+    cache_key = k.lower()
+    now_ts = time.time()
+    cached = NW_API_CACHE.get(cache_key)
+    if cached and cached[1] > now_ts:
+        return int(cached[0]) if cached[0] else None
+
+    auth = _kg_get_auth(force_refresh=False)
+    if auth:
+        payload = {
+            "accountId": int(auth.get("account_id") or 0),
+            "token": str(auth.get("token") or ""),
+            "kingdomId": int(auth.get("search_kingdom_id") or 0),
+            "searchTerm": k,
+        }
+        search_data = _kg_webservice_post("Kingdoms", "SearchByName", payload) or {}
+        nw = _kg_extract_networth_from_search_payload(k, search_data)
+        if nw is None:
+            auth = _kg_get_auth(force_refresh=True)
+            if auth:
+                payload = {
+                    "accountId": int(auth.get("account_id") or 0),
+                    "token": str(auth.get("token") or ""),
+                    "kingdomId": int(auth.get("search_kingdom_id") or 0),
+                    "searchTerm": k,
+                }
+                search_data = _kg_webservice_post("Kingdoms", "SearchByName", payload) or {}
+                nw = _kg_extract_networth_from_search_payload(k, search_data)
+        if nw:
+            NW_API_CACHE[cache_key] = (int(nw), now_ts + max(5, int(KG_GAME_API_CACHE_SECONDS)))
+            return int(nw)
+
+    # Legacy probes: leave in place as a non-auth fallback.
+    enc = urllib.parse.quote(k)
+    for url in (f"{base}/api/war-room/{enc}", f"{base}/api/kingdom/{enc}"):
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+            with urllib.request.urlopen(req, timeout=max(1.0, float(KG_GAME_API_TIMEOUT))) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(body) if body else {}
+                nw = _extract_nw_from_game_api_payload(data)
+                if nw:
+                    NW_API_CACHE[cache_key] = (int(nw), now_ts + max(5, int(KG_GAME_API_CACHE_SECONDS)))
+                    return int(nw)
+        except Exception:
+            continue
+    NW_API_CACHE[cache_key] = (None, now_ts + 15)
+    return None
+
+
 def parse_spy_details(text: str) -> dict:
     """
     Pull extra fields for !spy presentation from a raw report.
@@ -588,6 +885,7 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
 
     attacker = None
     defender = None
+    attacker_nw = None
     units = {}
 
     # Legacy one-line alert format.
@@ -601,6 +899,9 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
         m2 = re.search(r"you have been attacked by\s+(.+?)(?:\s*\(|$)", s, re.IGNORECASE)
         if m2:
             attacker = m2.group(1).strip()
+    m_nw = re.search(r"\(\s*NW\s*[:=]\s*([\d,]+)\s*\)", s, re.IGNORECASE)
+    if m_nw:
+        attacker_nw = _safe_int_or_none(m_nw.group(1))
     if not units:
         m3 = re.search(
             r"(?:composition of the enemy forces was as follows|enemy forces was as follows)\s*:\s*(.+)$",
@@ -627,7 +928,7 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
 
     if not attacker or not units:
         return None
-    return {"attacker": attacker, "defender": defender, "units": units}
+    return {"attacker": attacker, "attacker_nw": attacker_nw, "defender": defender, "units": units}
 
 
 def parse_attack_details(text: str) -> dict:
@@ -2276,17 +2577,9 @@ def sync_store_attack_report(
 
         movement_rows = 0
         sent_units = d.get("sent_units") or {}
-        if row and sent_units and d.get("attacker"):
+        if KG_TRACK_ATTACK_REPORT_MOVEMENTS and row and sent_units and d.get("attacker"):
             departed = d.get("reported_at") or created_at_utc
-            hit_dir = infer_hit_direction_from_nw_cur(cur, d.get("attacker"), d.get("defender"), departed)
-            base_minutes = None
-            if KG_RETURN_MODEL_ENABLED:
-                a_nw = sync_get_latest_networth_for_kingdom_before_cur(cur, d.get("attacker"), departed)
-                d_nw = sync_get_latest_networth_for_kingdom_before_cur(cur, d.get("defender"), departed)
-                base_minutes = _compute_piecewise_base_minutes_from_nw(a_nw, d_nw)
-            if base_minutes is None:
-                base_minutes = apply_hit_direction_return_modifier(KG_BASE_RETURN_MINUTES, hit_dir)
-            base_minutes = _apply_gem_speedup(base_minutes)
+            base_minutes = compute_base_return_minutes_cur(cur, d.get("attacker"), d.get("defender"), departed)
             expected = estimate_return_time_season_aware(departed, base_minutes)
             if KG_ROUND_TO_TICK:
                 expected = _round_ts_to_tick(expected, KG_TICK_MINUTES, KG_TICK_ROUND_MODE)
@@ -2299,7 +2592,7 @@ def sync_store_attack_report(
                 source_attack_report_id=int(row.get("id") or 0),
                 source_message_id=source_message_id,
                 source_channel_id=source_channel_id,
-                note=f"from attack report casualties sent count; hit_direction={hit_dir or 'unknown'}; return_model={'nw_ratio' if KG_RETURN_MODEL_ENABLED else 'legacy'}",
+                note=f"from attack report casualties sent count; return_model={'nw_ratio' if KG_RETURN_MODEL_ENABLED else 'legacy'}",
                 cur=cur,
             )
 
@@ -2368,7 +2661,8 @@ def sync_get_latest_networth_for_kingdom_before_cur(cur, kingdom: str, at_utc: d
                 return int(nw)
         except Exception:
             continue
-    return None
+    # Fallback to game API if configured.
+    return fetch_kingdom_networth_from_game_api(kingdom)
 
 
 def infer_hit_direction_from_nw_cur(cur, attacker: str | None, defender: str | None, at_utc: datetime) -> str | None:
@@ -2385,6 +2679,28 @@ def infer_hit_direction_from_nw_cur(cur, attacker: str | None, defender: str | N
     if a_nw > d_nw:
         return "down"
     return "even"
+
+
+def sync_compute_expected_return_for_pair(
+    attacker: str | None,
+    defender: str | None,
+    departed_at: datetime,
+    attacker_nw_hint: int | None = None,
+    defender_nw_hint: int | None = None,
+) -> datetime:
+    with db_conn() as conn, conn.cursor() as cur:
+        base_minutes = compute_base_return_minutes_cur(
+            cur,
+            attacker,
+            defender,
+            departed_at,
+            attacker_nw_hint=attacker_nw_hint,
+            defender_nw_hint=defender_nw_hint,
+        )
+    expected = estimate_return_time_season_aware(departed_at, base_minutes)
+    if KG_ROUND_TO_TICK:
+        expected = _round_ts_to_tick(expected, KG_TICK_MINUTES, KG_TICK_ROUND_MODE)
+    return expected
 
 
 def sync_add_troop_movements(
@@ -3172,7 +3488,7 @@ async def on_ready():
     except Exception:
         logging.exception("DB init failed")
 
-    if not BATTLE_RETURNS_LOOP_STARTED:
+    if KG_TROOP_TRACKING_ENABLED and not BATTLE_RETURNS_LOOP_STARTED:
         BATTLE_RETURNS_LOOP_STARTED = True
         asyncio.create_task(battle_returns_loop())
 
@@ -3237,14 +3553,18 @@ async def on_message(msg: discord.Message):
         )
         alert_inserted = 0
         incoming_alert = parse_incoming_attack_alert(msg.content)
-        if incoming_alert:
+        if KG_TRACK_INCOMING_ALERT_MOVEMENTS and incoming_alert:
             alert_target = str(incoming_alert.get("defender") or "").strip() or None
             if not alert_target and attack_result.get("saved") and attack_result.get("row"):
                 alert_target = str((attack_result.get("row") or {}).get("defender") or "").strip() or None
-            base_minutes = _apply_gem_speedup(KG_BASE_RETURN_MINUTES)
-            expected = estimate_return_time_season_aware(ts, base_minutes)
-            if KG_ROUND_TO_TICK:
-                expected = _round_ts_to_tick(expected, KG_TICK_MINUTES, KG_TICK_ROUND_MODE)
+            expected = await run_db(
+                sync_compute_expected_return_for_pair,
+                incoming_alert.get("attacker"),
+                alert_target,
+                ts,
+                incoming_alert.get("attacker_nw"),
+                None,
+            )
             alert_inserted = await run_db(
                 sync_add_troop_movements,
                 incoming_alert.get("attacker"),
@@ -3304,7 +3624,7 @@ async def on_message(msg: discord.Message):
                             )
                         )
 
-        if alert_inserted > 0 and live_ch and can_send(live_ch, msg.guild):
+        if KG_TRACK_INCOMING_ALERT_MOVEMENTS and alert_inserted > 0 and live_ch and can_send(live_ch, msg.guild):
             await live_ch.send(f"Battle tracker: tracked `{int(alert_inserted)}` outgoing troop movement row(s) from alert text.")
             alert_atk = str((incoming_alert or {}).get("attacker") or "").strip()
             if alert_atk:
@@ -3793,6 +4113,8 @@ async def supply(ctx, *, arg: str):
 async def battle(ctx, *, kingdom: str):
     """!battle <kingdom> -> estimated now-troops using latest SR minus tracked outgoing troops."""
     try:
+        if not KG_TROOP_TRACKING_ENABLED:
+            return await ctx.send("Battle tracker is currently disabled (troop tracking off).")
         real = await run_db(sync_fuzzy_kingdom, kingdom)
         real = real or kingdom
         est = await run_db(sync_build_battle_estimate, real, now_utc())
@@ -4378,7 +4700,7 @@ async def help_cmd(ctx):
             "`!spyhistory <kingdom>` - Show last 5 saved spy reports",
             "`!spies <kingdom>` - Show last 10 spy reports + send recommendation",
             "`!supply <kingdom> [days]` - Premium: show supplier kingdoms from market transactions + TSV",
-            "`!battle <kingdom>` - Estimate current home troops (SR minus tracked outgoing troops)",
+            "`!battle <kingdom>` - Estimate current home troops (available when troop tracking is enabled)",
             "`!track` - Daily attack tracker for today (UTC) + TSV export",
             "`!track yesterday` - Daily attack tracker for yesterday (UTC)",
             "`!track YYYY-MM-DD` - Daily attack tracker for a specific date (UTC)",

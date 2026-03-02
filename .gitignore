@@ -4,3 +4,4 @@ __pycache__/
 *.db
 *.log
 .DS_Store
+app_tmp.js
