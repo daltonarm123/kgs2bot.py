@@ -107,6 +107,9 @@ KG_GAME_AUTH_CACHE_SECONDS = int(os.getenv("KG_GAME_AUTH_CACHE_SECONDS", "1800")
 KG_GAME_SEARCH_KINGDOM_ID = int(os.getenv("KG_GAME_SEARCH_KINGDOM_ID", "0") or "0")
 KG_REPORT_DEFAULT_TZ = os.getenv("KG_REPORT_DEFAULT_TZ", "UTC").strip()
 KG_REPORT_MAX_FUTURE_MINUTES = int(os.getenv("KG_REPORT_MAX_FUTURE_MINUTES", "10") or "10")
+KG_REPORT_AUTO_INFER_TZ = os.getenv("KG_REPORT_AUTO_INFER_TZ", "true").lower() in ("1", "true", "yes", "y")
+KG_REPORT_INFER_IF_DELTA_MINUTES = int(os.getenv("KG_REPORT_INFER_IF_DELTA_MINUTES", "180") or "180")
+KG_REPORT_INFER_MAX_PAST_HOURS = int(os.getenv("KG_REPORT_INFER_MAX_PAST_HOURS", "8") or "8")
 ADMIN_USER_IDS = {944024167081209867}
 ADMIN_USER_IDS.update(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
@@ -563,7 +566,7 @@ def _resolve_report_default_tzinfo():
 REPORT_DEFAULT_TZINFO = _resolve_report_default_tzinfo()
 
 
-def parse_report_datetime_from_line(text: str) -> datetime | None:
+def parse_report_datetime_from_line(text: str) -> tuple[datetime | None, bool]:
     """
     Parse report timestamps robustly across formats:
     - Date: 2026-03-01 12:00:00
@@ -573,7 +576,7 @@ def parse_report_datetime_from_line(text: str) -> datetime | None:
     """
     raw = str(text or "").strip()
     if not raw:
-        return None
+        return None, False
 
     # Normalize common wrappers seen in pasted reports.
     s = re.sub(r"\[/?mytime\]", " ", raw, flags=re.IGNORECASE)
@@ -589,7 +592,7 @@ def parse_report_datetime_from_line(text: str) -> datetime | None:
             if n > 10**12:
                 n = int(n / 1000)
             if 0 < n < 32503680000:  # before year 3000
-                return datetime.fromtimestamp(n, tz=timezone.utc)
+                return datetime.fromtimestamp(n, tz=timezone.utc), True
         except Exception:
             pass
 
@@ -602,8 +605,9 @@ def parse_report_datetime_from_line(text: str) -> datetime | None:
     if m_iso:
         try:
             dt = datetime.strptime(m_iso.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S")
+            explicit = bool(_tzinfo_from_token(m_iso.group(2)))
             tzi = _tzinfo_from_token(m_iso.group(2)) or REPORT_DEFAULT_TZINFO
-            return dt.replace(tzinfo=tzi).astimezone(timezone.utc)
+            return dt.replace(tzinfo=tzi).astimezone(timezone.utc), explicit
         except Exception:
             pass
 
@@ -615,18 +619,58 @@ def parse_report_datetime_from_line(text: str) -> datetime | None:
     )
     if m_named:
         part = m_named.group(1)
+        explicit = bool(_tzinfo_from_token(m_named.group(2)))
         tzi = _tzinfo_from_token(m_named.group(2)) or REPORT_DEFAULT_TZINFO
         for fmt in ("%b %d, %Y, %I:%M:%S %p", "%B %d, %Y, %I:%M:%S %p"):
             try:
                 dt = datetime.strptime(part, fmt)
-                return dt.replace(tzinfo=tzi).astimezone(timezone.utc)
+                return dt.replace(tzinfo=tzi).astimezone(timezone.utc), explicit
             except Exception:
                 continue
 
-    return None
+    return None, False
 
 
-def coerce_report_time(report_ts: datetime | None, captured_ts: datetime | None) -> datetime | None:
+def _auto_infer_report_time(rt: datetime, ct: datetime) -> datetime:
+    """
+    For no-TZ report lines only: try hour-shifting to align with capture time.
+    This handles mixed user timezones where Date/Received lacks timezone data.
+    """
+    if not KG_REPORT_AUTO_INFER_TZ:
+        return rt
+    base_abs = abs((ct - rt).total_seconds())
+    if base_abs < max(0, int(KG_REPORT_INFER_IF_DELTA_MINUTES or 0)) * 60:
+        return rt
+
+    future_allow = timedelta(minutes=max(0, int(KG_REPORT_MAX_FUTURE_MINUTES or 0)))
+    max_past = timedelta(hours=max(1, int(KG_REPORT_INFER_MAX_PAST_HOURS or 1)))
+
+    best = rt
+    best_abs = base_abs
+    for h in range(-14, 15):
+        if h == 0:
+            continue
+        cand = rt + timedelta(hours=h)
+        if cand > ct + future_allow:
+            continue
+        if cand < ct - max_past:
+            continue
+        score = abs((ct - cand).total_seconds())
+        if score < best_abs:
+            best = cand
+            best_abs = score
+
+    # Require at least 60m improvement to avoid noisy flips.
+    if best is not rt and (best_abs + 3600) < base_abs:
+        return best
+    return rt
+
+
+def coerce_report_time(
+    report_ts: datetime | None,
+    captured_ts: datetime | None,
+    has_explicit_tz: bool = False,
+) -> datetime | None:
     """
     Keep parsed report time sane relative to message capture time.
     If parsed time lands in the future beyond tolerance, clamp to captured time.
@@ -637,6 +681,8 @@ def coerce_report_time(report_ts: datetime | None, captured_ts: datetime | None)
     if captured_ts is None:
         return rt
     ct = normalize_to_utc(captured_ts)
+    if not has_explicit_tz:
+        rt = _auto_infer_report_time(rt, ct)
     if rt > ct + timedelta(minutes=max(0, int(KG_REPORT_MAX_FUTURE_MINUTES or 0))):
         return ct
     return rt
@@ -1015,6 +1061,7 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
     defender = None
     attacker_nw = None
     occurred_at = None
+    occurred_at_has_tz = False
     units = {}
 
     for raw_line in s.splitlines():
@@ -1023,9 +1070,10 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
             continue
         ll = line.lower()
         if ll.startswith("date:") or ll.startswith("received:"):
-            dt = parse_report_datetime_from_line(line)
+            dt, has_tz = parse_report_datetime_from_line(line)
             if dt and (occurred_at is None or dt < occurred_at):
                 occurred_at = dt
+                occurred_at_has_tz = bool(has_tz)
 
     # Legacy one-line alert format.
     m = re.search(r"attacked by\s+(.+?)!\s*he sent\s+(.+)$", s, re.IGNORECASE)
@@ -1072,6 +1120,7 @@ def parse_incoming_attack_alert(text: str) -> dict | None:
         "attacker_nw": attacker_nw,
         "defender": defender,
         "occurred_at": occurred_at,
+        "occurred_at_has_tz": occurred_at_has_tz,
         "units": units,
     }
 
@@ -1089,6 +1138,7 @@ def parse_attack_details(text: str) -> dict:
         "settlements_lost_count": 0,
         "settlements_lost": [],
         "reported_at": None,
+        "reported_at_has_tz": False,
         "sent_units": {},
         "lost_units": {},
     }
@@ -1102,9 +1152,10 @@ def parse_attack_details(text: str) -> dict:
 
         # Date line can contain wrappers like [mytime]...[/mytime], epoch values, or explicit TZ suffixes.
         if ll.startswith("date:") or ll.startswith("received:"):
-            dt = parse_report_datetime_from_line(line)
+            dt, has_tz = parse_report_datetime_from_line(line)
             if dt and (details["reported_at"] is None or dt < details["reported_at"]):
                 details["reported_at"] = dt
+                details["reported_at_has_tz"] = bool(has_tz)
             continue
 
         if ll.startswith("target:"):
@@ -2628,7 +2679,11 @@ def sync_store_attack_report(
     Tracks attacker/defender/result/land/settlement-loss signals for !track.
     """
     d = parse_attack_details(msg_content)
-    reported_at = coerce_report_time(d.get("reported_at"), created_at_utc)
+    reported_at = coerce_report_time(
+        d.get("reported_at"),
+        created_at_utc,
+        bool(d.get("reported_at_has_tz")),
+    )
     d["reported_at"] = reported_at
     # Guard against non-attack content even if detection is permissive.
     ll = (msg_content or "").lower()
@@ -3686,7 +3741,11 @@ async def on_message(msg: discord.Message):
             alert_target = str(incoming_alert.get("defender") or "").strip() or None
             if not alert_target and attack_result.get("saved") and attack_result.get("row"):
                 alert_target = str((attack_result.get("row") or {}).get("defender") or "").strip() or None
-            alert_departed_at = coerce_report_time(incoming_alert.get("occurred_at"), ts) or ts
+            alert_departed_at = coerce_report_time(
+                incoming_alert.get("occurred_at"),
+                ts,
+                bool(incoming_alert.get("occurred_at_has_tz")),
+            ) or ts
             expected = await run_db(
                 sync_compute_expected_return_for_pair,
                 incoming_alert.get("attacker"),
