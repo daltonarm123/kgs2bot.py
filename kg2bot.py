@@ -212,6 +212,7 @@ DB_READY = False
 DB_POOL = None  # psycopg2.pool.SimpleConnectionPool
 NW_API_CACHE: dict[str, tuple[int | None, float]] = {}
 KG_API_AUTH_CACHE: dict[str, object] = {}
+BACKFILL_PROGRESS: dict[str, dict] = {}
 
 
 def now_utc() -> datetime:
@@ -3413,7 +3414,7 @@ def sync_get_research_export_rows():
         return cur.fetchall()
 
 
-def sync_backfill(days: int | None = None):
+def sync_backfill(days: int | None = None, progress_id: str | None = None):
     """
     Ensures:
     - tech_index + kingdom_tech updated for all relevant reports
@@ -3453,6 +3454,16 @@ def sync_backfill(days: int | None = None):
             """)
 
         rows = cur.fetchall()
+        total_rows = len(rows)
+
+        if progress_id:
+            BACKFILL_PROGRESS[progress_id] = {
+                "phase": "db_reprocess",
+                "done": 0,
+                "total": int(total_rows),
+                "updated_at": time.time(),
+                "complete": False,
+            }
 
         for row in rows:
             stats["reports_scanned"] += 1
@@ -3485,6 +3496,24 @@ def sync_backfill(days: int | None = None):
                 stats["market_reports"] += 1
                 inserted = sync_upsert_market_transactions(cur, int(row["id"]), row.get("created_at") or now_utc(), txs)
                 stats["market_rows"] += int(inserted)
+
+            if progress_id and ((stats["reports_scanned"] % 100) == 0 or stats["reports_scanned"] == total_rows):
+                BACKFILL_PROGRESS[progress_id] = {
+                    "phase": "db_reprocess",
+                    "done": int(stats["reports_scanned"]),
+                    "total": int(total_rows),
+                    "updated_at": time.time(),
+                    "complete": False,
+                }
+
+        if progress_id:
+            BACKFILL_PROGRESS[progress_id] = {
+                "phase": "db_reprocess",
+                "done": int(stats["reports_scanned"]),
+                "total": int(total_rows),
+                "updated_at": time.time(),
+                "complete": True,
+            }
 
     return stats
 
@@ -4876,16 +4905,68 @@ async def backfill(ctx, days: int = None):
     if not _is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
+    progress_id = None
     try:
+        def _bar(pct: float, width: int = 20) -> str:
+            p = max(0.0, min(100.0, float(pct or 0.0)))
+            filled = int(round((p / 100.0) * width))
+            return "[" + ("#" * filled) + ("-" * max(0, width - filled)) + "]"
+
+        started = time.monotonic()
+        spinner = ["|", "/", "-", "\\"]
+
         if days and int(days) > 0:
-            await ctx.send(f"🧱 Backfilling last **{int(days)}** days from Discord history, then reprocessing reports (tech + troops)…")
+            status = await ctx.send(f"🧱 Backfilling last **{int(days)}** days from Discord history, then reprocessing reports (tech + troops)…")
         else:
-            await ctx.send("🧱 Backfilling **ALL** readable Discord history, then reprocessing reports (tech + troops)…")
+            status = await ctx.send("🧱 Backfilling **ALL** readable Discord history, then reprocessing reports (tech + troops)…")
 
-        ingest = await sync_ingest_history(int(days) if days else None)
-        stats = await run_db(sync_backfill, int(days) if days else None)
+        # Phase 1: Discord history ingest (indeterminate progress with live heartbeat).
+        ingest_task = asyncio.create_task(sync_ingest_history(int(days) if days else None))
+        spin_i = 0
+        while not ingest_task.done():
+            elapsed = int(time.monotonic() - started)
+            try:
+                await status.edit(
+                    content=(
+                        "🧱 **Backfill in progress**\n"
+                        f"Phase 1/2: Scanning Discord history {spinner[spin_i % len(spinner)]}\n"
+                        f"Elapsed: `{elapsed}s`"
+                    )
+                )
+            except Exception:
+                pass
+            spin_i += 1
+            await asyncio.sleep(4)
 
-        await ctx.send(
+        ingest = await ingest_task
+
+        # Phase 2: DB reprocess with real percentage bar.
+        progress_id = f"bf:{int(time.time() * 1000)}:{int(getattr(ctx.guild, 'id', 0) or 0)}:{int(getattr(ctx.channel, 'id', 0) or 0)}"
+        db_task = asyncio.create_task(run_db(sync_backfill, int(days) if days else None, progress_id))
+
+        while not db_task.done():
+            p = BACKFILL_PROGRESS.get(progress_id) or {}
+            done = int(p.get("done") or 0)
+            total = int(p.get("total") or 0)
+            pct = (100.0 * done / total) if total > 0 else 0.0
+            elapsed = int(time.monotonic() - started)
+            try:
+                await status.edit(
+                    content=(
+                        "🧱 **Backfill in progress**\n"
+                        "Phase 1/2: Discord history scan complete\n"
+                        f"Phase 2/2: Reprocessing saved reports `{done}`/`{total}` { _bar(pct) } `{pct:.1f}%`\n"
+                        f"Elapsed: `{elapsed}s`"
+                    )
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+        stats = await db_task
+        BACKFILL_PROGRESS.pop(progress_id, None)
+
+        await status.edit(
             "✅ **Backfill complete**\n"
             f"Guilds scanned: `{ingest['guilds']}` • Channels scanned: `{ingest['channels_scanned']}`\n"
             f"Messages scanned: `{ingest['messages_scanned']}` • Matched reports: `{ingest['messages_matched']}`\n"
@@ -4900,6 +4981,9 @@ async def backfill(ctx, days: int = None):
         )
 
     except Exception as e:
+        # Best-effort cleanup of progress entries on command failure.
+        if progress_id:
+            BACKFILL_PROGRESS.pop(progress_id, None)
         tb = traceback.format_exc()
         await ctx.send("⚠️ backfill failed.")
         await send_error(ctx.guild, f"backfill error: {e}", tb=tb)
