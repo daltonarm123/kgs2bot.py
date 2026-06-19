@@ -1720,7 +1720,9 @@ def sync_ingest_history_candidate(msg_content: str, created_at_utc: datetime, so
         "attack_reports_saved": 0,
         "attack_duplicates": 0,
         "reports_forwarded": 0,
+        "forward_skipped": 0,
         "forward_failures": 0,
+        "forward_failure_reason": None,
     }
 
     res = sync_store_report(msg_content, created_at_utc)
@@ -1743,8 +1745,27 @@ def sync_ingest_history_candidate(msg_content: str, created_at_utc: datetime, so
         fwd = sync_recon_ingest_report(msg_content)
         if fwd.get("ok"):
             out["reports_forwarded"] += 1
+        elif fwd.get("disabled"):
+            out["forward_skipped"] += 1
         else:
             out["forward_failures"] += 1
+            status = int(fwd.get("status") or 0)
+            err = str(fwd.get("error") or fwd.get("reason") or "").strip().lower()
+            if status:
+                if 400 <= status < 500:
+                    out["forward_failure_reason"] = f"http_{status}_client"
+                elif 500 <= status < 600:
+                    out["forward_failure_reason"] = f"http_{status}_server"
+                else:
+                    out["forward_failure_reason"] = f"http_{status}"
+            elif "timed out" in err:
+                out["forward_failure_reason"] = "timeout"
+            elif "name or service not known" in err or "temporary failure in name resolution" in err:
+                out["forward_failure_reason"] = "dns"
+            elif "connection refused" in err:
+                out["forward_failure_reason"] = "connection_refused"
+            else:
+                out["forward_failure_reason"] = "other"
 
     return out
 
@@ -4015,7 +4036,9 @@ async def sync_ingest_history(days: int | None = None):
         "attack_reports_saved": 0,
         "attack_duplicates": 0,
         "reports_forwarded": 0,
+        "forward_skipped": 0,
         "forward_failures": 0,
+        "forward_failure_reasons": {},
         "ingest_errors": 0,
     }
 
@@ -4029,7 +4052,9 @@ async def sync_ingest_history(days: int | None = None):
             "attack_reports_saved": 0,
             "attack_duplicates": 0,
             "reports_forwarded": 0,
+            "forward_skipped": 0,
             "forward_failures": 0,
+            "forward_failure_reasons": {},
             "ingest_errors": 0,
         }
 
@@ -4073,7 +4098,12 @@ async def sync_ingest_history(days: int | None = None):
                         local["attack_reports_saved"] += int(row.get("attack_reports_saved") or 0)
                         local["attack_duplicates"] += int(row.get("attack_duplicates") or 0)
                         local["reports_forwarded"] += int(row.get("reports_forwarded") or 0)
+                        local["forward_skipped"] += int(row.get("forward_skipped") or 0)
                         local["forward_failures"] += int(row.get("forward_failures") or 0)
+                        reason = str(row.get("forward_failure_reason") or "").strip().lower()
+                        if reason:
+                            bucket = local["forward_failure_reasons"]
+                            bucket[reason] = int(bucket.get(reason) or 0) + 1
                     except Exception:
                         local["ingest_errors"] += 1
                         logging.exception("Backfill ingest failed for message %s in #%s", getattr(m, "id", "unknown"), channel.name)
@@ -4110,7 +4140,10 @@ async def sync_ingest_history(days: int | None = None):
         stats["attack_reports_saved"] += int(r.get("attack_reports_saved") or 0)
         stats["attack_duplicates"] += int(r.get("attack_duplicates") or 0)
         stats["reports_forwarded"] += int(r.get("reports_forwarded") or 0)
+        stats["forward_skipped"] += int(r.get("forward_skipped") or 0)
         stats["forward_failures"] += int(r.get("forward_failures") or 0)
+        for reason, ct in (r.get("forward_failure_reasons") or {}).items():
+            stats["forward_failure_reasons"][reason] = int(stats["forward_failure_reasons"].get(reason) or 0) + int(ct or 0)
         stats["ingest_errors"] += int(r.get("ingest_errors") or 0)
 
     return stats
@@ -4966,13 +4999,17 @@ async def backfill(ctx, days: int = None):
         stats = await db_task
         BACKFILL_PROGRESS.pop(progress_id, None)
 
+        reason_items = sorted((ingest.get("forward_failure_reasons") or {}).items(), key=lambda kv: int(kv[1]), reverse=True)
+        reason_txt = ", ".join([f"{k}:{int(v)}" for k, v in reason_items[:3]]) if reason_items else "n/a"
+
         await status.edit(content=(
             "✅ **Backfill complete**\n"
             f"Guilds scanned: `{ingest['guilds']}` • Channels scanned: `{ingest['channels_scanned']}`\n"
             f"Messages scanned: `{ingest['messages_scanned']}` • Matched reports: `{ingest['messages_matched']}`\n"
             f"New spy reports saved: `{ingest['reports_saved']}` • Spy duplicates: `{ingest['duplicates']}`\n"
             f"New attack reports saved: `{ingest['attack_reports_saved']}` • Attack duplicates: `{ingest['attack_duplicates']}`\n"
-            f"Forwarded to recon-hub: `{ingest['reports_forwarded']}` • Forward failures: `{ingest['forward_failures']}`\n"
+            f"Forwarded to recon-hub: `{ingest['reports_forwarded']}` • Forward skipped: `{ingest.get('forward_skipped', 0)}` • Forward failures: `{ingest['forward_failures']}`\n"
+            f"Forward failure reasons (top): `{reason_txt}`\n"
             f"Ingest errors: `{ingest['ingest_errors']}`\n"
             f"Reports scanned: `{stats['reports_scanned']}`\n"
             f"Tech reports: `{stats['tech_reports']}` • Tech lines indexed: `{stats['tech_history_rows']}` • Best updates: `{stats['best_updates']}`\n"
@@ -5007,12 +5044,15 @@ async def attackbackfill(ctx, days: int = None):
             await ctx.send("🧱 Backfilling attack reports from **ALL** readable Discord history...")
 
         stats = await sync_ingest_history(int(days) if days else None)
+        reason_items = sorted((stats.get("forward_failure_reasons") or {}).items(), key=lambda kv: int(kv[1]), reverse=True)
+        reason_txt = ", ".join([f"{k}:{int(v)}" for k, v in reason_items[:3]]) if reason_items else "n/a"
         await ctx.send(
             "✅ **Attack backfill complete**\n"
             f"Guilds scanned: `{stats['guilds']}` • Channels scanned: `{stats['channels_scanned']}`\n"
             f"Messages scanned: `{stats['messages_scanned']}` • Matched reports: `{stats['messages_matched']}`\n"
             f"Attack reports saved: `{stats['attack_reports_saved']}` • Attack duplicates: `{stats['attack_duplicates']}`\n"
-            f"Forwarded to recon-hub: `{stats['reports_forwarded']}` • Forward failures: `{stats['forward_failures']}`\n"
+            f"Forwarded to recon-hub: `{stats['reports_forwarded']}` • Forward skipped: `{stats.get('forward_skipped', 0)}` • Forward failures: `{stats['forward_failures']}`\n"
+            f"Forward failure reasons (top): `{reason_txt}`\n"
             f"Ingest errors: `{stats['ingest_errors']}`"
         )
     except Exception as e:
