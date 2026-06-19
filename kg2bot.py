@@ -94,6 +94,7 @@ KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "ye
 RECON_INGEST_URL = os.getenv("RECON_INGEST_URL", "https://recon-hub.onrender.com/api/reports/spy").strip()
 RECON_INGEST_ENABLED = os.getenv("RECON_INGEST_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 RECON_INGEST_TIMEOUT = float(os.getenv("RECON_INGEST_TIMEOUT", "10"))
+BACKFILL_FORWARD_ENABLED = os.getenv("BACKFILL_FORWARD_ENABLED", "false").lower() in ("1", "true", "yes", "y")
 RECON_CALC_BASE_URL = os.getenv("RECON_CALC_BASE_URL", "https://recon-hub.onrender.com/kg-calc.html").strip()
 KG_GAME_API_BASE = "https://kingdomgame.net"
 if str(os.getenv("KG_GAME_API_BASE", "")).strip().rstrip("/") not in ("", KG_GAME_API_BASE):
@@ -1741,7 +1742,9 @@ def sync_ingest_history_candidate(msg_content: str, created_at_utc: datetime, so
         else:
             out["attack_duplicates"] += 1
 
-    if looks_like_recon_report(msg_content):
+    looks_recon = looks_like_recon_report(msg_content)
+    newly_saved_local = (int(out["reports_saved"]) + int(out["attack_reports_saved"])) > 0
+    if looks_recon and BACKFILL_FORWARD_ENABLED and newly_saved_local:
         fwd = sync_recon_ingest_report(msg_content)
         if fwd.get("ok"):
             out["reports_forwarded"] += 1
@@ -1766,6 +1769,9 @@ def sync_ingest_history_candidate(msg_content: str, created_at_utc: datetime, so
                 out["forward_failure_reason"] = "connection_refused"
             else:
                 out["forward_failure_reason"] = "other"
+    elif looks_recon:
+        # Skip forward during backfill by default, and skip duplicates even when enabled.
+        out["forward_skipped"] += 1
 
     return out
 
