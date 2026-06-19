@@ -157,6 +157,9 @@ ap_lock = asyncio.Lock()
 ANNOUNCED_READY_THIS_PROCESS = False
 ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
 MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL = int(os.getenv("MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL", "0") or "0")
+BACKFILL_CHANNEL_CONCURRENCY = int(os.getenv("BACKFILL_CHANNEL_CONCURRENCY", "4") or "4")
+INGEST_PROGRESS_EVERY_MESSAGES = int(os.getenv("INGEST_PROGRESS_EVERY_MESSAGES", "2000") or "2000")
+INGEST_PREFILTER_ENABLED = os.getenv("INGEST_PREFILTER_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 KG_BASE_RETURN_MINUTES = float(os.getenv("KG_BASE_RETURN_MINUTES", "20"))
 KG_SEASON_EPOCH_UTC = os.getenv("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
 KG_HIT_UP_RETURN_MULT = float(os.getenv("KG_HIT_UP_RETURN_MULT", "0.90"))
@@ -1678,6 +1681,69 @@ def looks_like_attack_report(text: str) -> bool:
 
 def looks_like_recon_report(text: str) -> bool:
     return looks_like_spy_report(text) or looks_like_attack_report(text)
+
+
+def looks_like_history_candidate_fast(text: str) -> bool:
+    """
+    Cheap first-pass prefilter to avoid expensive parse/DB work for obvious non-reports.
+    This is intentionally permissive to avoid losing valid reports.
+    """
+    ll = (text or "").lower()
+    if len(ll) < 30:
+        return False
+    if "target:" in ll:
+        return True
+    if "attack report" in ll or "attack result:" in ll:
+        return True
+    if "defensive power" in ll:
+        return True
+    if "our spies also found" in ll:
+        return True
+    if "the following technology information was also discovered" in ll:
+        return True
+    if "you have been attacked by" in ll:
+        return True
+    return False
+
+
+def sync_ingest_history_candidate(msg_content: str, created_at_utc: datetime, source_message_id: int, source_channel_id: int):
+    """
+    Process one candidate text in one worker call to reduce async/thread overhead.
+    """
+    out = {
+        "matched": 0,
+        "reports_saved": 0,
+        "duplicates": 0,
+        "attack_reports_saved": 0,
+        "attack_duplicates": 0,
+        "reports_forwarded": 0,
+        "forward_failures": 0,
+    }
+
+    res = sync_store_report(msg_content, created_at_utc)
+    if res.get("saved"):
+        out["matched"] = 1
+        if not res.get("duplicate"):
+            out["reports_saved"] += 1
+        else:
+            out["duplicates"] += 1
+
+    ares = sync_store_attack_report(msg_content, created_at_utc, source_message_id, source_channel_id)
+    if ares.get("saved"):
+        out["matched"] = 1
+        if not ares.get("duplicate"):
+            out["attack_reports_saved"] += 1
+        else:
+            out["attack_duplicates"] += 1
+
+    if looks_like_recon_report(msg_content):
+        fwd = sync_recon_ingest_report(msg_content)
+        if fwd.get("ok"):
+            out["reports_forwarded"] += 1
+        else:
+            out["forward_failures"] += 1
+
+    return out
 
 
 def sync_recon_ingest_report(msg_content: str):
@@ -3899,9 +3965,11 @@ async def on_message(msg: discord.Message):
 
 async def sync_ingest_history(days: int | None = None):
     """
-    Pull spy reports from readable Discord channel history into DB.
+    Pull spy/attack reports from readable Discord channel history into DB.
     This is safe to rerun because storage is deduped by report hash.
     """
+    await ensure_db_ready()
+
     since = None
     if days and int(days) > 0:
         since = now_utc() - timedelta(days=int(days))
@@ -3920,71 +3988,99 @@ async def sync_ingest_history(days: int | None = None):
         "ingest_errors": 0,
     }
 
+    async def _scan_channel(guild: discord.Guild, channel: discord.TextChannel):
+        local = {
+            "channels_scanned": 1,
+            "messages_scanned": 0,
+            "messages_matched": 0,
+            "reports_saved": 0,
+            "duplicates": 0,
+            "attack_reports_saved": 0,
+            "attack_duplicates": 0,
+            "reports_forwarded": 0,
+            "forward_failures": 0,
+            "ingest_errors": 0,
+        }
+
+        history_kwargs = {"limit": None}
+        if since:
+            history_kwargs["after"] = since
+        if MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL > 0:
+            history_kwargs["limit"] = MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL
+
+        try:
+            async for m in channel.history(**history_kwargs):
+                if not m or m.author.bot:
+                    continue
+                local["messages_scanned"] += 1
+
+                if INGEST_PROGRESS_EVERY_MESSAGES > 0 and (local["messages_scanned"] % INGEST_PROGRESS_EVERY_MESSAGES) == 0:
+                    logging.info(
+                        "Backfill progress: guild=%s channel=%s scanned=%s",
+                        guild.name,
+                        channel.name,
+                        local["messages_scanned"],
+                    )
+
+                candidates = extract_discord_message_texts(m)
+                if not candidates:
+                    continue
+
+                created_at = normalize_to_utc(m.created_at)
+                msg_id = int(m.id)
+                ch_id = int(channel.id)
+
+                for content in candidates:
+                    try:
+                        if INGEST_PREFILTER_ENABLED and not looks_like_history_candidate_fast(content):
+                            continue
+
+                        row = await run_db(sync_ingest_history_candidate, content, created_at, msg_id, ch_id)
+                        local["messages_matched"] += int(row.get("matched") or 0)
+                        local["reports_saved"] += int(row.get("reports_saved") or 0)
+                        local["duplicates"] += int(row.get("duplicates") or 0)
+                        local["attack_reports_saved"] += int(row.get("attack_reports_saved") or 0)
+                        local["attack_duplicates"] += int(row.get("attack_duplicates") or 0)
+                        local["reports_forwarded"] += int(row.get("reports_forwarded") or 0)
+                        local["forward_failures"] += int(row.get("forward_failures") or 0)
+                    except Exception:
+                        local["ingest_errors"] += 1
+                        logging.exception("Backfill ingest failed for message %s in #%s", getattr(m, "id", "unknown"), channel.name)
+        except Exception:
+            logging.exception("History scan failed for %s (%s)", guild.name, channel.name)
+
+        return local
+
+    sem = asyncio.Semaphore(max(1, int(BACKFILL_CHANNEL_CONCURRENCY or 1)))
+
+    async def _scan_bounded(guild: discord.Guild, channel: discord.TextChannel):
+        async with sem:
+            return await _scan_channel(guild, channel)
+
+    jobs = []
     for guild in bot.guilds:
         stats["guilds"] += 1
         for channel in guild.text_channels:
             if not can_read_history(channel, guild):
                 continue
+            jobs.append(_scan_bounded(guild, channel))
 
-            stats["channels_scanned"] += 1
-
-            history_kwargs = {"limit": None}
-            if since:
-                history_kwargs["after"] = since
-            if MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL > 0:
-                history_kwargs["limit"] = MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL
-
-            try:
-                async for m in channel.history(**history_kwargs):
-                    if not m or m.author.bot:
-                        continue
-                    stats["messages_scanned"] += 1
-
-                    candidates = extract_discord_message_texts(m)
-                    if not candidates:
-                        continue
-
-                    for content in candidates:
-                        try:
-                            matched = False
-
-                            res = await run_db(sync_store_report, content, normalize_to_utc(m.created_at))
-                            if res.get("saved"):
-                                matched = True
-                                if not res.get("duplicate"):
-                                    stats["reports_saved"] += 1
-                                else:
-                                    stats["duplicates"] += 1
-
-                            ares = await run_db(
-                                sync_store_attack_report,
-                                content,
-                                normalize_to_utc(m.created_at),
-                                int(m.id),
-                                int(channel.id),
-                            )
-                            if ares.get("saved"):
-                                matched = True
-                                if not ares.get("duplicate"):
-                                    stats["attack_reports_saved"] += 1
-                                else:
-                                    stats["attack_duplicates"] += 1
-
-                            if matched:
-                                stats["messages_matched"] += 1
-
-                            if looks_like_recon_report(content):
-                                fwd = await run_db(sync_recon_ingest_report, content)
-                                if fwd.get("ok"):
-                                    stats["reports_forwarded"] += 1
-                                else:
-                                    stats["forward_failures"] += 1
-                        except Exception:
-                            stats["ingest_errors"] += 1
-                            logging.exception("Backfill ingest failed for message %s in #%s", getattr(m, "id", "unknown"), channel.name)
-            except Exception:
-                # Continue scanning remaining channels even if one fails.
-                logging.exception("History scan failed for %s (%s)", guild.name, channel.name)
+    results = await asyncio.gather(*jobs, return_exceptions=True)
+    for r in results:
+        if isinstance(r, Exception):
+            stats["ingest_errors"] += 1
+            logging.exception("Backfill channel job failed", exc_info=r)
+            continue
+        stats["channels_scanned"] += int(r.get("channels_scanned") or 0)
+        stats["messages_scanned"] += int(r.get("messages_scanned") or 0)
+        stats["messages_matched"] += int(r.get("messages_matched") or 0)
+        stats["reports_saved"] += int(r.get("reports_saved") or 0)
+        stats["duplicates"] += int(r.get("duplicates") or 0)
+        stats["attack_reports_saved"] += int(r.get("attack_reports_saved") or 0)
+        stats["attack_duplicates"] += int(r.get("attack_duplicates") or 0)
+        stats["reports_forwarded"] += int(r.get("reports_forwarded") or 0)
+        stats["forward_failures"] += int(r.get("forward_failures") or 0)
+        stats["ingest_errors"] += int(r.get("ingest_errors") or 0)
 
     return stats
 
