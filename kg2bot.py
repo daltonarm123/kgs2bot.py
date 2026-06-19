@@ -3441,6 +3441,52 @@ def sync_get_research_export_rows():
         return cur.fetchall()
 
 
+def sync_get_all_spy_report_export_rows(limit: int = 200000):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                kingdom,
+                defense_power,
+                castles,
+                created_at,
+                report_hash
+            FROM spy_reports
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT %s;
+            """,
+            (int(limit),),
+        )
+        return cur.fetchall() or []
+
+
+def sync_get_all_attack_report_export_rows(limit: int = 200000):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                id,
+                attacker,
+                defender,
+                attack_result,
+                land_taken,
+                settlements_lost_count,
+                settlements_lost,
+                reported_at,
+                created_at,
+                report_hash,
+                source_message_id,
+                source_channel_id
+            FROM attack_reports
+            ORDER BY COALESCE(reported_at, created_at) DESC NULLS LAST, id DESC
+            LIMIT %s;
+            """,
+            (int(limit),),
+        )
+        return cur.fetchall() or []
+
+
 def sync_backfill(days: int | None = None, progress_id: str | None = None):
     """
     Ensures:
@@ -4896,6 +4942,74 @@ async def techcsv(ctx):
         await send_error(ctx.guild, f"techcsv error: {e}", tb=tb)
 
 
+@bot.command(name="reportscsv")
+async def reportscsv(ctx):
+    """!reportscsv -> admin export of all saved spy + attack report metadata as CSV files."""
+    if not _is_admin(ctx):
+        return await ctx.send("❌ Admin only.")
+    try:
+        spy_rows = await run_db(sync_get_all_spy_report_export_rows, 200000)
+        atk_rows = await run_db(sync_get_all_attack_report_export_rows, 200000)
+
+        if not spy_rows and not atk_rows:
+            return await ctx.send("❌ No saved spy/attack reports found in DB yet.")
+
+        ts = now_utc().strftime("%Y%m%d_%H%M%S")
+
+        spy_buf = io.StringIO()
+        sw = csv.writer(spy_buf)
+        sw.writerow(["id", "kingdom", "defense_power", "castles", "created_at_utc", "report_hash"])
+        for r in spy_rows:
+            sw.writerow([
+                r.get("id") or "",
+                r.get("kingdom") or "",
+                r.get("defense_power") if r.get("defense_power") is not None else "",
+                r.get("castles") if r.get("castles") is not None else "",
+                r.get("created_at").isoformat() if r.get("created_at") else "",
+                r.get("report_hash") or "",
+            ])
+        spy_payload = spy_buf.getvalue().encode("utf-8")
+        spy_buf.close()
+
+        atk_buf = io.StringIO()
+        aw = csv.writer(atk_buf)
+        aw.writerow([
+            "id", "attacker", "defender", "attack_result", "land_taken", "settlements_lost_count",
+            "settlements_lost", "reported_at_utc", "created_at_utc", "report_hash", "source_message_id", "source_channel_id"
+        ])
+        for r in atk_rows:
+            aw.writerow([
+                r.get("id") or "",
+                r.get("attacker") or "",
+                r.get("defender") or "",
+                r.get("attack_result") or "",
+                r.get("land_taken") if r.get("land_taken") is not None else "",
+                r.get("settlements_lost_count") if r.get("settlements_lost_count") is not None else "",
+                r.get("settlements_lost") or "",
+                r.get("reported_at").isoformat() if r.get("reported_at") else "",
+                r.get("created_at").isoformat() if r.get("created_at") else "",
+                r.get("report_hash") or "",
+                r.get("source_message_id") if r.get("source_message_id") is not None else "",
+                r.get("source_channel_id") if r.get("source_channel_id") is not None else "",
+            ])
+        atk_payload = atk_buf.getvalue().encode("utf-8")
+        atk_buf.close()
+
+        spy_name = f"kg2_spy_reports_{ts}.csv"
+        atk_name = f"kg2_attack_reports_{ts}.csv"
+        await ctx.send(
+            f"📄 Export ready • Spy rows: `{len(spy_rows)}` • Attack rows: `{len(atk_rows)}`",
+            files=[
+                discord.File(fp=io.BytesIO(spy_payload), filename=spy_name),
+                discord.File(fp=io.BytesIO(atk_payload), filename=atk_name),
+            ],
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ reportscsv failed.")
+        await send_error(ctx.guild, f"reportscsv error: {e}", tb=tb)
+
+
 @bot.command()
 async def techpull(ctx, *, kingdom: str):
     """!techpull <kingdom> -> scans ALL saved reports for that kingdom and prints deduped best tech list."""
@@ -5185,6 +5299,7 @@ async def help_cmd(ctx):
             "`!tech <kingdom>` - Show indexed battle tech for a kingdom",
             "`!techtop` - Show most common indexed training names",
             "`!techcsv` - Admin: export indexed tech CSV",
+            "`!reportscsv` - Admin: export all saved spy + attack report metadata CSVs",
             "`!techpull <kingdom>` - Rebuild indexed tech for one kingdom",
             "`!backfill [days]` - Admin: reprocess saved reports for indexing",
             "`!attackbackfill [days]` - Admin: pull attack/spy reports from Discord history for track data",
