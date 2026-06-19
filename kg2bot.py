@@ -83,7 +83,8 @@ PATCH_NOTES = [
 # ---------- Env ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer").strip().lower() or "prefer"
 ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
 LIVE_BATTLE_CHANNEL_ID = int(os.getenv("LIVE_BATTLE_CHANNEL_ID", "1463579633449697334") or "1463579633449697334")
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
@@ -359,7 +360,7 @@ def init_db_pool(minconn: int = 1, maxconn: int = 10):
         maxconn=maxconn,
         dsn=DATABASE_URL,
         cursor_factory=RealDictCursor,
-        sslmode="require",
+        sslmode=DB_SSLMODE,
     )
     logging.info("DB pool initialized.")
 
@@ -2351,7 +2352,7 @@ def sync_upsert_troop_snapshot(cur, kingdom: str, report_id: int, captured_at, t
             VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT (report_id, unit_name) DO NOTHING;
         """, (kingdom, report_id, captured_at, unit_name, int(unit_count)))
-        inserted += 1
+        inserted += int(cur.rowcount or 0)
     return inserted
 
 
@@ -4722,23 +4723,30 @@ async def techpull(ctx, *, kingdom: str):
 async def backfill(ctx, days: int = None):
     """
     !backfill [days]
-    Goes through DB reports and ensures research + troops are accounted for.
-    - If days provided: only last N days
-    - Else: whole DB
+    Pulls old Discord history into DB, then ensures research + troops are accounted for.
+    - If days provided: only last N days of history/reports
+    - Else: full readable history + whole DB
     """
     if not _is_admin(ctx):
         return await ctx.send("❌ Admin only.")
 
     try:
         if days and int(days) > 0:
-            await ctx.send(f"🧱 Backfilling last **{int(days)}** days of reports (tech + troops)…")
+            await ctx.send(f"🧱 Backfilling last **{int(days)}** days from Discord history, then reprocessing reports (tech + troops)…")
         else:
-            await ctx.send("🧱 Backfilling **ALL** reports (tech + troops)…")
+            await ctx.send("🧱 Backfilling **ALL** readable Discord history, then reprocessing reports (tech + troops)…")
 
+        ingest = await sync_ingest_history(int(days) if days else None)
         stats = await run_db(sync_backfill, int(days) if days else None)
 
         await ctx.send(
             "✅ **Backfill complete**\n"
+            f"Guilds scanned: `{ingest['guilds']}` • Channels scanned: `{ingest['channels_scanned']}`\n"
+            f"Messages scanned: `{ingest['messages_scanned']}` • Matched reports: `{ingest['messages_matched']}`\n"
+            f"New spy reports saved: `{ingest['reports_saved']}` • Spy duplicates: `{ingest['duplicates']}`\n"
+            f"New attack reports saved: `{ingest['attack_reports_saved']}` • Attack duplicates: `{ingest['attack_duplicates']}`\n"
+            f"Forwarded to recon-hub: `{ingest['reports_forwarded']}` • Forward failures: `{ingest['forward_failures']}`\n"
+            f"Ingest errors: `{ingest['ingest_errors']}`\n"
             f"Reports scanned: `{stats['reports_scanned']}`\n"
             f"Tech reports: `{stats['tech_reports']}` • Tech lines indexed: `{stats['tech_history_rows']}` • Best updates: `{stats['best_updates']}`\n"
             f"Troop reports: `{stats['troop_reports']}` • Troop rows inserted: `{stats['troop_rows']}`\n"

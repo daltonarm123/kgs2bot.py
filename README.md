@@ -20,6 +20,6 @@ Includes admin/debug tools to rescan reports if parsing missed anything and to t
 
 It listens for messages in Discord.
 
-If a message looks like a spy or attack report, it parses the text with regex patterns, stores structured data in SQLite, then posts a formatted embed with calculations.
+If a message looks like a spy or attack report, it parses the text with regex patterns, stores structured data in PostgreSQL, then posts a formatted embed with calculations.
 
 Estimates (like post-attack DP) are heuristic—based on result tiers, casualty ratios, and land gained—so they’re guidance, not exact.
