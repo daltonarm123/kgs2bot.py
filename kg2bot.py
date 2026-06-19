@@ -364,6 +364,9 @@ def init_db_pool(minconn: int = 1, maxconn: int = 10):
     if DATABASE_PUBLIC_URL and DATABASE_PUBLIC_URL not in dsns:
         dsns.append(DATABASE_PUBLIC_URL)
 
+    # Ignore unresolved template strings pasted into env vars (e.g. "{{RAILWAY_TCP_PROXY_PORT}}").
+    dsns = [d for d in dsns if "{{" not in d and "}}" not in d]
+
     last_err = None
     for dsn in dsns:
         host = "unknown"
@@ -389,7 +392,7 @@ def init_db_pool(minconn: int = 1, maxconn: int = 10):
 
     if last_err:
         raise last_err
-    raise RuntimeError("No database DSN configured.")
+    raise RuntimeError("No valid database DSN configured (found unresolved template placeholders in DATABASE_URL/DATABASE_PUBLIC_URL).")
 
 
 @contextmanager
