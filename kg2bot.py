@@ -72,10 +72,12 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-03-02.2"
+BOT_VERSION = "2026-06-19.1"
 PATCH_NOTES = [
-    "Return tracking now parses report timestamps with timezone handling (Date/Received/mytime/epoch formats).",
-    "Incoming attack alerts now use parsed attack time (with future-time safety clamp) instead of paste time.",
+    "Fixed DB initialization race: commands now lazy-bootstrap DB pool/schema when needed.",
+    "Improved Railway DB handling: DATABASE_URL/DATABASE_PUBLIC_URL failover and unresolved-template guardrails.",
+    "Backfill speedup: concurrent channel scanning, candidate prefiltering, and lower per-message DB overhead.",
+    "Backfill now reliably ingests Discord history first, then reparses saved reports for tech/troops/market rows.",
 ]
 # -------------------------------------------------
 
