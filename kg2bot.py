@@ -146,6 +146,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
+db_init_lock = asyncio.Lock()
 
 # ---------- Locks ----------
 ap_lock = asyncio.Lock()
@@ -201,6 +202,7 @@ SEASON_LEN = timedelta(days=5)
 
 
 # ---------- DB Pool ----------
+DB_READY = False
 DB_POOL = None  # psycopg2.pool.SimpleConnectionPool
 NW_API_CACHE: dict[str, tuple[int | None, float]] = {}
 KG_API_AUTH_CACHE: dict[str, object] = {}
@@ -383,10 +385,28 @@ def db_conn():
     finally:
         DB_POOL.putconn(conn)
 
-
 async def run_db(fn, *args, **kwargs):
     """Run a sync DB function in a worker thread to avoid blocking asyncio."""
+    await ensure_db_ready()
     return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def ensure_db_ready():
+    """
+    Lazy, idempotent DB bootstrap.
+    Prevents command handlers from failing if on_ready DB init did not run yet.
+    """
+    global DB_READY
+    if DB_READY and DB_POOL:
+        return
+
+    async with db_init_lock:
+        if DB_READY and DB_POOL:
+            return
+        await asyncio.to_thread(init_db_pool, 1, 10)
+        await asyncio.to_thread(init_db)
+        await asyncio.to_thread(heal_sequences)
+        DB_READY = True
 
 
 def compress_report(text: str) -> bytes:
