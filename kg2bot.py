@@ -83,7 +83,8 @@ PATCH_NOTES = [
 # ---------- Env ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_PUBLIC_URL = os.getenv("DATABASE_PUBLIC_URL", "").strip()
 DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer").strip().lower() or "prefer"
 ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
 LIVE_BATTLE_CHANNEL_ID = int(os.getenv("LIVE_BATTLE_CHANNEL_ID", "1463579633449697334") or "1463579633449697334")
@@ -122,8 +123,8 @@ PREMIUM_FREE_USER_IDS.update(
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL env var.")
+if not (DATABASE_URL or DATABASE_PUBLIC_URL):
+    raise RuntimeError("Missing DATABASE_URL or DATABASE_PUBLIC_URL env var.")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -357,14 +358,38 @@ def init_db_pool(minconn: int = 1, maxconn: int = 10):
     global DB_POOL
     if DB_POOL:
         return
-    DB_POOL = pg_pool.SimpleConnectionPool(
-        minconn=minconn,
-        maxconn=maxconn,
-        dsn=DATABASE_URL,
-        cursor_factory=RealDictCursor,
-        sslmode=DB_SSLMODE,
-    )
-    logging.info("DB pool initialized.")
+    dsns = []
+    if DATABASE_URL:
+        dsns.append(DATABASE_URL)
+    if DATABASE_PUBLIC_URL and DATABASE_PUBLIC_URL not in dsns:
+        dsns.append(DATABASE_PUBLIC_URL)
+
+    last_err = None
+    for dsn in dsns:
+        host = "unknown"
+        try:
+            host = urllib.parse.urlparse(dsn).hostname or "unknown"
+        except Exception:
+            pass
+
+        try:
+            DB_POOL = pg_pool.SimpleConnectionPool(
+                minconn=minconn,
+                maxconn=maxconn,
+                dsn=dsn,
+                cursor_factory=RealDictCursor,
+                sslmode=DB_SSLMODE,
+            )
+            logging.info("DB pool initialized using host=%s sslmode=%s", host, DB_SSLMODE)
+            return
+        except Exception as e:
+            last_err = e
+            DB_POOL = None
+            logging.warning("DB connect failed using host=%s (%s)", host, e.__class__.__name__)
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("No database DSN configured.")
 
 
 @contextmanager
