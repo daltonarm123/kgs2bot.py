@@ -4966,7 +4966,7 @@ async def backfill(ctx, days: int = None):
         stats = await db_task
         BACKFILL_PROGRESS.pop(progress_id, None)
 
-        await status.edit(
+        await status.edit(content=(
             "✅ **Backfill complete**\n"
             f"Guilds scanned: `{ingest['guilds']}` • Channels scanned: `{ingest['channels_scanned']}`\n"
             f"Messages scanned: `{ingest['messages_scanned']}` • Matched reports: `{ingest['messages_matched']}`\n"
@@ -4978,7 +4978,7 @@ async def backfill(ctx, days: int = None):
             f"Tech reports: `{stats['tech_reports']}` • Tech lines indexed: `{stats['tech_history_rows']}` • Best updates: `{stats['best_updates']}`\n"
             f"Troop reports: `{stats['troop_reports']}` • Troop rows inserted: `{stats['troop_rows']}`\n"
             f"Market reports: `{stats['market_reports']}` • Market rows inserted: `{stats['market_rows']}`"
-        )
+        ))
 
     except Exception as e:
         # Best-effort cleanup of progress entries on command failure.
