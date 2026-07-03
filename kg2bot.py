@@ -2584,9 +2584,17 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
         page_size = max(1, int(KG_GAME_RANKINGS_PAGE_SIZE or 20))
         target_rows = max(page_size, int(KG_GAME_RANKINGS_TARGET_ROWS or 100))
 
+        def _to_int_allow_zero(v):
+            try:
+                if v is None:
+                    return None
+                return int(str(v).strip())
+            except Exception:
+                return None
+
         for cont_id in ordered:
             for variant_name, payload in _variants(cont_id):
-                start_seed = _safe_int_or_none(payload.get("startNumber"))
+                start_seed = _to_int_allow_zero(payload.get("startNumber"))
                 start_numbers = [None]
                 if start_seed is not None:
                     pages = max(1, ceil(float(target_rows) / float(page_size)))
@@ -6132,6 +6140,7 @@ async def help_cmd(ctx):
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
             "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
+            "`!nwjumptestalert` - Admin: send a marked test NW jump alert to all configured rooms",
             "`!nwjumppulltest` - Admin: pull rankings now and print top sample rows",
             "`!whereupdates` - Show configured target server/channel + bot send permissions",
             "`!battle <kingdom>` - Estimate current home troops (available when troop tracking is enabled)",
@@ -6447,6 +6456,40 @@ async def kgauthtest(ctx):
         await ctx.send("⚠️ kgauthtest failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"kgauthtest error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumptestalert")
+async def nwjumptestalert(ctx):
+    """Admin-only: dispatch a test NW jump alert to verify channel/fanout delivery."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        sub = await run_db(sync_get_nw_jump_subscription, int(ctx.guild.id))
+        if not sub or not bool(sub.get("enabled")):
+            return await ctx.send("ℹ️ NW jump alerts are not enabled for this server. Run `!nwjumpalerts on 5000` first.")
+
+        await ctx.send("🧪 Sending test NW jump alert to configured rooms now...")
+        fake = {
+            "kingdom_id": -1,
+            "kingdom_name": "[TEST] Training Jump",
+            "old_networth": 50000,
+            "new_networth": 65000,
+            "delta": 15000,
+            "old_rank": 12,
+            "new_rank": 10,
+        }
+        await send_nw_jump_alerts([fake])
+        await ctx.send("✅ Test alert dispatched. Check your primary + fanout NW jump channels.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumptestalert failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumptestalert error: {e}", tb=tb)
 
 
 @bot.command(name="nwjumppulltest")
