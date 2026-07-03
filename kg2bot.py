@@ -73,9 +73,10 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-03.2"
+BOT_VERSION = "2026-07-03.3"
 PATCH_NOTES = [
     "Added NW jump alert monitoring from Kingdom rankings (GetKingdomRankings polling loop).",
+    "NW jump alerts now trigger on both +5,000 and -5,000 NW changes (or your configured threshold).",
     "New !nwjumpalerts command: status, on [threshold], off (server-level subscription).",
     "New !nwjumpcheck admin command for live rankings diagnostics + alert pipeline health.",
     "Default jump threshold is 5,000 NW and can be changed per server/channel.",
