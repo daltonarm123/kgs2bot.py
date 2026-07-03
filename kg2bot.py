@@ -943,10 +943,14 @@ def _kg_get_static_auth(now_ts: float) -> dict | None:
 
 def _kg_get_auth(force_refresh: bool = False) -> dict | None:
     now_ts = time.time()
+    # Prefer login auth when credentials are available; static tokens may expire silently.
+    login_auth = _kg_get_login_auth(force_refresh)
+    if login_auth:
+        return login_auth
     static_auth = _kg_get_static_auth(now_ts)
     if static_auth:
         return static_auth
-    return _kg_get_login_auth(force_refresh)
+    return None
 
 
 def _kg_get_login_auth(force_refresh: bool = False) -> dict | None:
