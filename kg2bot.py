@@ -858,15 +858,18 @@ def _kg_webservice_post_debug(service: str, method: str, payload: dict) -> tuple
     if not base:
         return None, {"ok": False, "reason": "no_base_url"}
     url = f"{base}/WebService/{service}.asmx/{method}"
-    body = json.dumps(payload or {}).encode("utf-8")
+    # Compact JSON (no spaces) so the body matches the browser byte-for-byte.
+    body = json.dumps(payload or {}, separators=(",", ":")).encode("utf-8")
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "User-Agent": "kg2bot/1.0",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        ),
         "World-Id": str(max(1, int(KG_GAME_WORLD_ID or 1))),
-        "world-id": str(max(1, int(KG_GAME_WORLD_ID or 1))),
         "Origin": "https://kingdomgame.net",
-        "Referer": "https://kingdomgame.net/",
+        "Referer": "https://kingdomgame.net/rankings",
     }
     if KG_GAME_WEB_COOKIE:
         headers["Cookie"] = KG_GAME_WEB_COOKIE
@@ -2531,42 +2534,56 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
             seen.add(c)
             ordered.append(c)
 
+        acct_str = str(auth_row.get("account_id") or 0)
+        acct_int = int(auth_row.get("account_id") or 0)
+        token = str(auth_row.get("token") or "")
+        kid = int(auth_row.get("search_kingdom_id") or 0)
+
+        def _variants(cont_id: int) -> list[tuple[str, dict]]:
+            return [
+                ("str_acct+startingRank0", {
+                    "accountId": acct_str, "token": token, "kingdomId": kid,
+                    "continentId": int(cont_id), "startingRank": 0,
+                }),
+                ("int_acct+startingRank0", {
+                    "accountId": acct_int, "token": token, "kingdomId": kid,
+                    "continentId": int(cont_id), "startingRank": 0,
+                }),
+                ("str_acct+no_startingRank", {
+                    "accountId": acct_str, "token": token, "kingdomId": kid,
+                    "continentId": int(cont_id),
+                }),
+                ("str_acct+startingRank1", {
+                    "accountId": acct_str, "token": token, "kingdomId": kid,
+                    "continentId": int(cont_id), "startingRank": 1,
+                }),
+            ]
+
         for cont_id in ordered:
-            payload = {
-                "accountId": str(auth_row.get("account_id") or 0),
-                "token": str(auth_row.get("token") or ""),
-                "kingdomId": int(auth_row.get("search_kingdom_id") or 0),
-                "continentId": int(cont_id),
-                # Required by the ASMX endpoint for pagination; missing it returns HTTP 500.
-                "startingRank": 0,
-            }
-            data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", payload)
-            data = data or {}
-            rows = _kg_extract_rankings_rows(data)
-            norm = _kg_normalize_rankings_rows(rows)
-            ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
-            ret_str = str(_dict_pick(data, "ReturnString", "returnString") or "").strip()
-            keys = ",".join(sorted([str(k) for k in data.keys()])[:10]) if isinstance(data, dict) else ""
-            meta["attempts"].append({
-                "label": label,
-                "continent_id": int(cont_id),
-                "rows": int(len(norm or [])),
-                "return_value": ret_val,
-                "return_string": ret_str,
-                "keys": keys,
-                "http_status": req_dbg.get("status"),
-                "http_reason": req_dbg.get("reason"),
-                "body_preview": str(req_dbg.get("body_preview") or "")[:180],
-                "sent_account_id": payload.get("accountId"),
-                "sent_kingdom_id": payload.get("kingdomId"),
-                "sent_fields": ",".join(sorted(payload.keys())),
-            })
-            if norm:
-                meta["auth_mode"] = str(auth_row.get("auth_mode") or "none")
-                meta["continent_id_used"] = int(cont_id)
-                meta["return_value"] = ret_val
-                meta["return_string"] = ret_str
-                return norm
+            for variant_name, payload in _variants(cont_id):
+                data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", payload)
+                data = data or {}
+                rows = _kg_extract_rankings_rows(data)
+                norm = _kg_normalize_rankings_rows(rows)
+                ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
+                ret_str = str(_dict_pick(data, "ReturnString", "returnString") or "").strip()
+                keys = ",".join(sorted([str(k) for k in data.keys()])[:10]) if isinstance(data, dict) else ""
+                meta["attempts"].append({
+                    "label": label,
+                    "variant": variant_name,
+                    "continent_id": int(cont_id),
+                    "rows": int(len(norm or [])),
+                    "http_status": req_dbg.get("status"),
+                    "http_reason": req_dbg.get("reason"),
+                    "body_preview": str(req_dbg.get("body_preview") or "")[:120],
+                })
+                if norm:
+                    meta["auth_mode"] = str(auth_row.get("auth_mode") or "none")
+                    meta["continent_id_used"] = int(cont_id)
+                    meta["variant_used"] = variant_name
+                    meta["return_value"] = ret_val
+                    meta["return_string"] = ret_str
+                    return norm
         return []
 
     rows = _attempt_with_auth(auth, "cached_auth")
