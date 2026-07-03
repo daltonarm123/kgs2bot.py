@@ -6089,10 +6089,33 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
 async def nwjumpcheck(ctx):
     """Admin-only: run a live rankings pull and summarize NW jump pipeline health."""
     try:
+        async def _send_with_fallback(text: str):
+            chunks = split_for_discord(str(text or ""), 1800)
+            sent = False
+            for chunk in chunks:
+                try:
+                    await ctx.send(chunk)
+                    sent = True
+                except Exception:
+                    sent = False
+                    break
+            if sent:
+                return True
+
+            if ctx.guild:
+                ch = get_updates_channel(ctx.guild, ctx.channel)
+                if ch and can_send(ch, ctx.guild):
+                    for chunk in chunks:
+                        await ch.send(chunk)
+                    return True
+            return False
+
         if not _is_admin(ctx):
-            return await ctx.send("❌ You don’t have permission to use this command.")
+            return await _send_with_fallback("❌ You don’t have permission to use this command.")
         if ctx.guild and not is_target_guild(ctx.guild):
-            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+            return await _send_with_fallback(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        await _send_with_fallback("⏳ Running NW jump diagnostics now...")
 
         rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
         world_id = int(KG_GAME_WORLD_ID or 1)
@@ -6151,10 +6174,16 @@ async def nwjumpcheck(ctx):
             for r in preview:
                 lines.append(f"- #{int(r.get('rank') or 0)} {r.get('kingdom_name')} (NW {fmt_int(r.get('networth'))})")
 
-        await ctx.send("\n".join(lines))
+        await _send_with_fallback("\n".join(lines))
     except Exception as e:
         tb = traceback.format_exc()
-        await ctx.send("⚠️ nwjumpcheck failed.")
+        try:
+            await ctx.send("⚠️ nwjumpcheck failed.")
+        except Exception:
+            if ctx.guild:
+                ch = get_updates_channel(ctx.guild, ctx.channel)
+                if ch and can_send(ch, ctx.guild):
+                    await ch.send("⚠️ nwjumpcheck failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"nwjumpcheck error: {e}", tb=tb)
 
