@@ -86,50 +86,94 @@ PATCH_NOTES = [
 
 
 # ---------- Env ----------
+def _clean_env_value(v) -> str:
+    s = str(v if v is not None else "").strip()
+    # Railway/UI copy-paste often stores quoted values like '"1"'.
+    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        s = s[1:-1].strip()
+    return s
+
+
+def _env_text(name: str, default: str = "") -> str:
+    raw = os.getenv(name, default)
+    return _clean_env_value(raw)
+
+
+def _env_int(name: str, default: int) -> int:
+    txt = _env_text(name, str(default))
+    try:
+        return int(txt or str(default))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    txt = _env_text(name, str(default))
+    try:
+        return float(txt or str(default))
+    except Exception:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    txt = _env_text(name, "true" if default else "false").lower()
+    return txt in ("1", "true", "yes", "y", "on")
+
+
+def _env_csv_ints(name: str) -> set[int]:
+    txt = _env_text(name, "")
+    out = set()
+    for part in txt.split(","):
+        p = _clean_env_value(part).strip()
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except Exception:
+            continue
+    return out
+
+
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DATABASE_PUBLIC_URL = os.getenv("DATABASE_PUBLIC_URL", "").strip()
-DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer").strip().lower() or "prefer"
-ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
-TARGET_GUILD_ID = int(os.getenv("TARGET_GUILD_ID", "1405247393112395866") or "1405247393112395866")
-UPDATES_CHANNEL_ID = int(os.getenv("UPDATES_CHANNEL_ID", "0") or "0")
-UPDATES_CHANNEL_NAME = os.getenv("UPDATES_CHANNEL_NAME", ERROR_CHANNEL_NAME).strip() or ERROR_CHANNEL_NAME
-LIVE_BATTLE_CHANNEL_ID = int(os.getenv("LIVE_BATTLE_CHANNEL_ID", "1463579633449697334") or "1463579633449697334")
-KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
-RECON_INGEST_URL = os.getenv("RECON_INGEST_URL", "https://recon-hub.onrender.com/api/reports/spy").strip()
-RECON_INGEST_ENABLED = os.getenv("RECON_INGEST_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-RECON_INGEST_TIMEOUT = float(os.getenv("RECON_INGEST_TIMEOUT", "10"))
-BACKFILL_FORWARD_ENABLED = os.getenv("BACKFILL_FORWARD_ENABLED", "false").lower() in ("1", "true", "yes", "y")
-RECON_CALC_BASE_URL = os.getenv("RECON_CALC_BASE_URL", "https://recon-hub.onrender.com/kg-calc.html").strip()
+TOKEN = _env_text("DISCORD_TOKEN", "")
+DATABASE_URL = _env_text("DATABASE_URL", "")
+DATABASE_PUBLIC_URL = _env_text("DATABASE_PUBLIC_URL", "")
+DB_SSLMODE = _env_text("DB_SSLMODE", "prefer").lower() or "prefer"
+ERROR_CHANNEL_NAME = _env_text("ERROR_CHANNEL_NAME", "kg2recon-updates")
+TARGET_GUILD_ID = _env_int("TARGET_GUILD_ID", 1405247393112395866)
+UPDATES_CHANNEL_ID = _env_int("UPDATES_CHANNEL_ID", 0)
+UPDATES_CHANNEL_NAME = _env_text("UPDATES_CHANNEL_NAME", ERROR_CHANNEL_NAME) or ERROR_CHANNEL_NAME
+LIVE_BATTLE_CHANNEL_ID = _env_int("LIVE_BATTLE_CHANNEL_ID", 1463579633449697334)
+KEEP_RAW_TEXT = _env_bool("KEEP_RAW_TEXT", False)
+RECON_INGEST_URL = _env_text("RECON_INGEST_URL", "https://recon-hub.onrender.com/api/reports/spy")
+RECON_INGEST_ENABLED = _env_bool("RECON_INGEST_ENABLED", True)
+RECON_INGEST_TIMEOUT = _env_float("RECON_INGEST_TIMEOUT", 10.0)
+BACKFILL_FORWARD_ENABLED = _env_bool("BACKFILL_FORWARD_ENABLED", False)
+RECON_CALC_BASE_URL = _env_text("RECON_CALC_BASE_URL", "https://recon-hub.onrender.com/kg-calc.html")
 KG_GAME_API_BASE = "https://kingdomgame.net"
-if str(os.getenv("KG_GAME_API_BASE", "")).strip().rstrip("/") not in ("", KG_GAME_API_BASE):
+if str(_env_text("KG_GAME_API_BASE", "")).strip().rstrip("/") not in ("", KG_GAME_API_BASE):
     logging.warning("Ignoring KG_GAME_API_BASE override; bot is locked to https://kingdomgame.net")
-KG_GAME_API_TIMEOUT = float(os.getenv("KG_GAME_API_TIMEOUT", "4"))
-KG_GAME_API_CACHE_SECONDS = int(os.getenv("KG_GAME_API_CACHE_SECONDS", "60") or "60")
-KG_GAME_WORLD_ID = int(os.getenv("KG_GAME_WORLD_ID", "1") or "1")
-KG_GAME_ACCOUNT_ID = os.getenv("KG_GAME_ACCOUNT_ID", "").strip()
-KG_GAME_TOKEN = os.getenv("KG_GAME_TOKEN", "").strip()
-KG_GAME_TOKEN_KINGDOM_ID = os.getenv("KG_GAME_TOKEN_KINGDOM_ID", "").strip()
-KG_GAME_EMAIL = os.getenv("KG_GAME_EMAIL", "").strip()
-KG_GAME_PASSWORD = os.getenv("KG_GAME_PASSWORD", "").strip()
-KG_GAME_WEB_COOKIE = os.getenv("KG_GAME_WEB_COOKIE", "").strip()
-KG_GAME_AUTH_CACHE_SECONDS = int(os.getenv("KG_GAME_AUTH_CACHE_SECONDS", "1800") or "1800")
-KG_GAME_SEARCH_KINGDOM_ID = int(os.getenv("KG_GAME_SEARCH_KINGDOM_ID", "0") or "0")
-KG_GAME_RANKINGS_CONTINENT_ID = int(os.getenv("KG_GAME_RANKINGS_CONTINENT_ID", "-1") or "-1")
-KG_REPORT_DEFAULT_TZ = os.getenv("KG_REPORT_DEFAULT_TZ", "UTC").strip()
-KG_REPORT_MAX_FUTURE_MINUTES = int(os.getenv("KG_REPORT_MAX_FUTURE_MINUTES", "10") or "10")
-KG_REPORT_AUTO_INFER_TZ = os.getenv("KG_REPORT_AUTO_INFER_TZ", "true").lower() in ("1", "true", "yes", "y")
-KG_REPORT_INFER_IF_DELTA_MINUTES = int(os.getenv("KG_REPORT_INFER_IF_DELTA_MINUTES", "180") or "180")
-KG_REPORT_INFER_MAX_PAST_HOURS = int(os.getenv("KG_REPORT_INFER_MAX_PAST_HOURS", "8") or "8")
+KG_GAME_API_TIMEOUT = _env_float("KG_GAME_API_TIMEOUT", 4.0)
+KG_GAME_API_CACHE_SECONDS = _env_int("KG_GAME_API_CACHE_SECONDS", 60)
+KG_GAME_WORLD_ID = _env_int("KG_GAME_WORLD_ID", 1)
+KG_GAME_ACCOUNT_ID = _env_text("KG_GAME_ACCOUNT_ID", "")
+KG_GAME_TOKEN = _env_text("KG_GAME_TOKEN", "")
+KG_GAME_TOKEN_KINGDOM_ID = _env_text("KG_GAME_TOKEN_KINGDOM_ID", "")
+KG_GAME_EMAIL = _env_text("KG_GAME_EMAIL", "")
+KG_GAME_PASSWORD = _env_text("KG_GAME_PASSWORD", "")
+KG_GAME_WEB_COOKIE = _env_text("KG_GAME_WEB_COOKIE", "")
+KG_GAME_AUTH_CACHE_SECONDS = _env_int("KG_GAME_AUTH_CACHE_SECONDS", 1800)
+KG_GAME_SEARCH_KINGDOM_ID = _env_int("KG_GAME_SEARCH_KINGDOM_ID", 0)
+KG_GAME_RANKINGS_CONTINENT_ID = _env_int("KG_GAME_RANKINGS_CONTINENT_ID", -1)
+KG_REPORT_DEFAULT_TZ = _env_text("KG_REPORT_DEFAULT_TZ", "UTC")
+KG_REPORT_MAX_FUTURE_MINUTES = _env_int("KG_REPORT_MAX_FUTURE_MINUTES", 10)
+KG_REPORT_AUTO_INFER_TZ = _env_bool("KG_REPORT_AUTO_INFER_TZ", True)
+KG_REPORT_INFER_IF_DELTA_MINUTES = _env_int("KG_REPORT_INFER_IF_DELTA_MINUTES", 180)
+KG_REPORT_INFER_MAX_PAST_HOURS = _env_int("KG_REPORT_INFER_MAX_PAST_HOURS", 8)
 ADMIN_USER_IDS = {944024167081209867}
-ADMIN_USER_IDS.update(
-    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
-)
+ADMIN_USER_IDS.update(_env_csv_ints("ADMIN_USER_IDS"))
 PREMIUM_FREE_USER_IDS = {944024167081209867}
-PREMIUM_FREE_USER_IDS.update(
-    int(x.strip()) for x in os.getenv("PREMIUM_FREE_USER_IDS", "").split(",") if x.strip().isdigit()
-)
+PREMIUM_FREE_USER_IDS.update(_env_csv_ints("PREMIUM_FREE_USER_IDS"))
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -166,40 +210,40 @@ ap_lock = asyncio.Lock()
 # ---------- Announcement anti-spam ----------
 ANNOUNCED_READY_THIS_PROCESS = False
 ANNOUNCE_COOLDOWN_SECONDS = 15 * 60  # 15 minutes
-MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL = int(os.getenv("MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL", "0") or "0")
-BACKFILL_CHANNEL_CONCURRENCY = int(os.getenv("BACKFILL_CHANNEL_CONCURRENCY", "4") or "4")
-INGEST_PROGRESS_EVERY_MESSAGES = int(os.getenv("INGEST_PROGRESS_EVERY_MESSAGES", "2000") or "2000")
-INGEST_PREFILTER_ENABLED = os.getenv("INGEST_PREFILTER_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-KG_BASE_RETURN_MINUTES = float(os.getenv("KG_BASE_RETURN_MINUTES", "20"))
-KG_SEASON_EPOCH_UTC = os.getenv("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
-KG_HIT_UP_RETURN_MULT = float(os.getenv("KG_HIT_UP_RETURN_MULT", "0.90"))
-KG_HIT_DOWN_RETURN_MULT = float(os.getenv("KG_HIT_DOWN_RETURN_MULT", "1.10"))
-KG_RETURN_MODEL_ENABLED = os.getenv("KG_RETURN_MODEL_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-KG_TRACK_ATTACK_REPORT_MOVEMENTS = os.getenv("KG_TRACK_ATTACK_REPORT_MOVEMENTS", "false").lower() in ("1", "true", "yes", "y")
-KG_TRACK_INCOMING_ALERT_MOVEMENTS = os.getenv("KG_TRACK_INCOMING_ALERT_MOVEMENTS", "true").lower() in ("1", "true", "yes", "y")
+MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL = _env_int("MAX_HISTORY_SCAN_MESSAGES_PER_CHANNEL", 0)
+BACKFILL_CHANNEL_CONCURRENCY = _env_int("BACKFILL_CHANNEL_CONCURRENCY", 4)
+INGEST_PROGRESS_EVERY_MESSAGES = _env_int("INGEST_PROGRESS_EVERY_MESSAGES", 2000)
+INGEST_PREFILTER_ENABLED = _env_bool("INGEST_PREFILTER_ENABLED", True)
+KG_BASE_RETURN_MINUTES = _env_float("KG_BASE_RETURN_MINUTES", 20.0)
+KG_SEASON_EPOCH_UTC = _env_text("KG_SEASON_EPOCH_UTC", "2026-01-01T00:00:00Z")
+KG_HIT_UP_RETURN_MULT = _env_float("KG_HIT_UP_RETURN_MULT", 0.90)
+KG_HIT_DOWN_RETURN_MULT = _env_float("KG_HIT_DOWN_RETURN_MULT", 1.10)
+KG_RETURN_MODEL_ENABLED = _env_bool("KG_RETURN_MODEL_ENABLED", True)
+KG_TRACK_ATTACK_REPORT_MOVEMENTS = _env_bool("KG_TRACK_ATTACK_REPORT_MOVEMENTS", False)
+KG_TRACK_INCOMING_ALERT_MOVEMENTS = _env_bool("KG_TRACK_INCOMING_ALERT_MOVEMENTS", True)
 KG_TROOP_TRACKING_ENABLED = KG_TRACK_ATTACK_REPORT_MOVEMENTS or KG_TRACK_INCOMING_ALERT_MOVEMENTS
-KG_RETURN_LINEAR_SLOPE = float(os.getenv("KG_RETURN_LINEAR_SLOPE", "-185.6"))
-KG_RETURN_LINEAR_INTERCEPT = float(os.getenv("KG_RETURN_LINEAR_INTERCEPT", "290.4"))
-KG_RETURN_LINEAR_X_MIN = float(os.getenv("KG_RETURN_LINEAR_X_MIN", "0.0"))
-KG_RETURN_LINEAR_X_MAX = float(os.getenv("KG_RETURN_LINEAR_X_MAX", "4.5"))
-KG_RETURN_MIN_MINUTES = float(os.getenv("KG_RETURN_MIN_MINUTES", "18.85"))
-KG_RETURN_MAX_MINUTES = float(os.getenv("KG_RETURN_MAX_MINUTES", "288"))
-KG_GEM_SPEEDUP_PCT = float(os.getenv("KG_GEM_SPEEDUP_PCT", "0"))
-KG_ROUND_TO_TICK = os.getenv("KG_ROUND_TO_TICK", "false").lower() in ("1", "true", "yes", "y")
-KG_TICK_MINUTES = int(os.getenv("KG_TICK_MINUTES", "5") or "5")
-KG_TICK_ROUND_MODE = os.getenv("KG_TICK_ROUND_MODE", "floor").strip().lower()
-RETURN_ALERT_POLL_SECONDS = int(os.getenv("RETURN_ALERT_POLL_SECONDS", "30") or "30")
-NW_JUMP_ALERTS_ENABLED = os.getenv("NW_JUMP_ALERTS_ENABLED", "true").lower() in ("1", "true", "yes", "y")
-NW_JUMP_ALERT_POLL_SECONDS = int(os.getenv("NW_JUMP_ALERT_POLL_SECONDS", "60") or "60")
-NW_JUMP_ALERT_DEFAULT_THRESHOLD = int(os.getenv("NW_JUMP_ALERT_DEFAULT_THRESHOLD", "5000") or "5000")
-NW_JUMP_ALERT_SILENT_NO_SUBS = os.getenv("NW_JUMP_ALERT_SILENT_NO_SUBS", "true").lower() in ("1", "true", "yes", "y")
-ALERT_SMS_ENABLED = os.getenv("ALERT_SMS_ENABLED", "false").lower() in ("1", "true", "yes", "y")
-ALERT_SMS_TWILIO_ACCOUNT_SID = os.getenv("ALERT_SMS_TWILIO_ACCOUNT_SID", "").strip()
-ALERT_SMS_TWILIO_AUTH_TOKEN = os.getenv("ALERT_SMS_TWILIO_AUTH_TOKEN", "").strip()
-ALERT_SMS_TWILIO_FROM = os.getenv("ALERT_SMS_TWILIO_FROM", "").strip()
-ALERT_SMS_TO = os.getenv("ALERT_SMS_TO", "").strip()
-ALERT_SMS_MAX_PER_ALERT = int(os.getenv("ALERT_SMS_MAX_PER_ALERT", "10") or "10")
-PREMIUM_GATE_ENABLED = os.getenv("PREMIUM_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+KG_RETURN_LINEAR_SLOPE = _env_float("KG_RETURN_LINEAR_SLOPE", -185.6)
+KG_RETURN_LINEAR_INTERCEPT = _env_float("KG_RETURN_LINEAR_INTERCEPT", 290.4)
+KG_RETURN_LINEAR_X_MIN = _env_float("KG_RETURN_LINEAR_X_MIN", 0.0)
+KG_RETURN_LINEAR_X_MAX = _env_float("KG_RETURN_LINEAR_X_MAX", 4.5)
+KG_RETURN_MIN_MINUTES = _env_float("KG_RETURN_MIN_MINUTES", 18.85)
+KG_RETURN_MAX_MINUTES = _env_float("KG_RETURN_MAX_MINUTES", 288.0)
+KG_GEM_SPEEDUP_PCT = _env_float("KG_GEM_SPEEDUP_PCT", 0.0)
+KG_ROUND_TO_TICK = _env_bool("KG_ROUND_TO_TICK", False)
+KG_TICK_MINUTES = _env_int("KG_TICK_MINUTES", 5)
+KG_TICK_ROUND_MODE = _env_text("KG_TICK_ROUND_MODE", "floor").lower()
+RETURN_ALERT_POLL_SECONDS = _env_int("RETURN_ALERT_POLL_SECONDS", 30)
+NW_JUMP_ALERTS_ENABLED = _env_bool("NW_JUMP_ALERTS_ENABLED", True)
+NW_JUMP_ALERT_POLL_SECONDS = _env_int("NW_JUMP_ALERT_POLL_SECONDS", 60)
+NW_JUMP_ALERT_DEFAULT_THRESHOLD = _env_int("NW_JUMP_ALERT_DEFAULT_THRESHOLD", 5000)
+NW_JUMP_ALERT_SILENT_NO_SUBS = _env_bool("NW_JUMP_ALERT_SILENT_NO_SUBS", True)
+ALERT_SMS_ENABLED = _env_bool("ALERT_SMS_ENABLED", False)
+ALERT_SMS_TWILIO_ACCOUNT_SID = _env_text("ALERT_SMS_TWILIO_ACCOUNT_SID", "")
+ALERT_SMS_TWILIO_AUTH_TOKEN = _env_text("ALERT_SMS_TWILIO_AUTH_TOKEN", "")
+ALERT_SMS_TWILIO_FROM = _env_text("ALERT_SMS_TWILIO_FROM", "")
+ALERT_SMS_TO = _env_text("ALERT_SMS_TO", "")
+ALERT_SMS_MAX_PER_ALERT = _env_int("ALERT_SMS_MAX_PER_ALERT", 10)
+PREMIUM_GATE_ENABLED = _env_bool("PREMIUM_GATE_ENABLED", True)
 BATTLE_RETURNS_LOOP_STARTED = False
 NW_JUMP_ALERTS_LOOP_STARTED = False
 
