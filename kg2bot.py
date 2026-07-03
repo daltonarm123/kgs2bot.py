@@ -2517,12 +2517,12 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
 
         for cont_id in ordered:
             payload = {
-                "accountId": int(auth_row.get("account_id") or 0),
+                "accountId": str(auth_row.get("account_id") or 0),
                 "token": str(auth_row.get("token") or ""),
                 "kingdomId": int(auth_row.get("search_kingdom_id") or 0),
                 "continentId": int(cont_id),
-                # Some clients include this; harmless if ignored server-side.
-                "worldId": int(KG_GAME_WORLD_ID or 1),
+                # Required by the ASMX endpoint for pagination; missing it returns HTTP 500.
+                "startingRank": 0,
             }
             data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", payload)
             data = data or {}
