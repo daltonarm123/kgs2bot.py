@@ -6163,10 +6163,33 @@ async def nwjumpcheck(ctx):
 async def nwjumppulltest(ctx):
     """Admin-only: perform a live rankings pull and print top rows + API attempts."""
     try:
+        async def _send_with_fallback(text: str):
+            chunks = split_for_discord(str(text or ""), 1800)
+            sent = False
+            for chunk in chunks:
+                try:
+                    await ctx.send(chunk)
+                    sent = True
+                except Exception:
+                    sent = False
+                    break
+            if sent:
+                return True
+
+            if ctx.guild:
+                ch = get_updates_channel(ctx.guild, ctx.channel)
+                if ch and can_send(ch, ctx.guild):
+                    for chunk in chunks:
+                        await ch.send(chunk)
+                    return True
+            return False
+
         if not _is_admin(ctx):
-            return await ctx.send("❌ You don’t have permission to use this command.")
+            return await _send_with_fallback("❌ You don’t have permission to use this command.")
         if ctx.guild and not is_target_guild(ctx.guild):
-            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+            return await _send_with_fallback(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        await _send_with_fallback("⏳ Running live rankings pull test now...")
 
         rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
         attempts = dbg.get("attempts") or []
@@ -6192,10 +6215,16 @@ async def nwjumppulltest(ctx):
         if attempts:
             lines.append(f"Attempts: `{json.dumps(attempts)[:1200]}`")
 
-        await ctx.send("\n".join(lines))
+        await _send_with_fallback("\n".join(lines))
     except Exception as e:
         tb = traceback.format_exc()
-        await ctx.send("⚠️ nwjumppulltest failed.")
+        try:
+            await ctx.send("⚠️ nwjumppulltest failed.")
+        except Exception:
+            if ctx.guild:
+                ch = get_updates_channel(ctx.guild, ctx.channel)
+                if ch and can_send(ch, ctx.guild):
+                    await ch.send("⚠️ nwjumppulltest failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"nwjumppulltest error: {e}", tb=tb)
 
