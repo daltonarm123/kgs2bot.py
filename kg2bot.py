@@ -242,8 +242,11 @@ NW_JUMP_ALERT_SILENT_NO_SUBS = _env_bool("NW_JUMP_ALERT_SILENT_NO_SUBS", True)
 ALERT_SMS_ENABLED = _env_bool("ALERT_SMS_ENABLED", False)
 ALERT_SMS_TWILIO_ACCOUNT_SID = _env_text("ALERT_SMS_TWILIO_ACCOUNT_SID", "")
 ALERT_SMS_TWILIO_AUTH_TOKEN = _env_text("ALERT_SMS_TWILIO_AUTH_TOKEN", "")
+ALERT_SMS_TWILIO_API_KEY_SID = _env_text("ALERT_SMS_TWILIO_API_KEY_SID", "")
+ALERT_SMS_TWILIO_API_KEY_SECRET = _env_text("ALERT_SMS_TWILIO_API_KEY_SECRET", "")
 ALERT_SMS_TWILIO_FROM = _env_text("ALERT_SMS_TWILIO_FROM", "")
 ALERT_SMS_TO = _env_text("ALERT_SMS_TO", "")
+ALERT_SMS_WATCHLIST = _env_text("ALERT_SMS_WATCHLIST", "")
 ALERT_SMS_MAX_PER_ALERT = _env_int("ALERT_SMS_MAX_PER_ALERT", 10)
 PREMIUM_GATE_ENABLED = _env_bool("PREMIUM_GATE_ENABLED", True)
 BATTLE_RETURNS_LOOP_STARTED = False
@@ -2798,10 +2801,47 @@ def _normalize_phone_number(s: str) -> str:
     return "".join(out)
 
 
+def _normalize_watch_target(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip().casefold())
+
+
+def _parse_alert_sms_watchlist() -> dict[str, set[str]]:
+    """
+    Env format:
+      ALERT_SMS_WATCHLIST="+15551234567=Magic Dude|Northeast|Galileo; +15557654321=123|456"
+    Targets can be kingdom names or kingdom IDs.
+    """
+    raw = str(ALERT_SMS_WATCHLIST or "").strip()
+    if not raw:
+        return {}
+
+    out = {}
+    for entry in raw.replace("\n", ";").split(";"):
+        part = str(entry or "").strip()
+        if not part or "=" not in part:
+            continue
+        phone_raw, targets_raw = part.split("=", 1)
+        phone = _normalize_phone_number(phone_raw)
+        if not phone:
+            continue
+        targets = set()
+        for token in str(targets_raw or "").replace(",", "|").split("|"):
+            t = _normalize_watch_target(token)
+            if t:
+                targets.add(t)
+        if not targets:
+            continue
+        out[phone] = targets
+    return out
+
+
 def _get_alert_sms_recipients() -> list[str]:
     nums = []
     for piece in str(ALERT_SMS_TO or "").replace(";", ",").split(","):
         n = _normalize_phone_number(piece)
+        if n:
+            nums.append(n)
+    for n in _parse_alert_sms_watchlist().keys():
         if n:
             nums.append(n)
     deduped = []
@@ -2815,33 +2855,76 @@ def _get_alert_sms_recipients() -> list[str]:
     return deduped[:lim]
 
 
+def _twilio_auth_credentials() -> tuple[str, str] | None:
+    api_key_sid = str(ALERT_SMS_TWILIO_API_KEY_SID or "").strip()
+    api_key_secret = str(ALERT_SMS_TWILIO_API_KEY_SECRET or "").strip()
+    if api_key_sid and api_key_secret:
+        return api_key_sid, api_key_secret
+
+    sid = str(ALERT_SMS_TWILIO_ACCOUNT_SID or "").strip()
+    token = str(ALERT_SMS_TWILIO_AUTH_TOKEN or "").strip()
+    if sid and token:
+        return sid, token
+    return None
+
+
+def _event_matches_sms_watch(event: dict, targets: set[str]) -> bool:
+    if not targets:
+        return False
+    kid = _safe_int_or_none(event.get("kingdom_id"))
+    name = _normalize_watch_target(event.get("kingdom_name"))
+    for t in targets:
+        if not t:
+            continue
+        if t.isdigit() and kid and int(t) == int(kid):
+            return True
+        if name and t == name:
+            return True
+    return False
+
+
+def _build_nw_jump_sms_text(events: list[dict]) -> str:
+    top = list(events or [])[:5]
+    sms_lines = [f"KG2 NW jump alert ({len(events or [])} hits)"]
+    for e in top:
+        sms_lines.append(
+            f"{e.get('kingdom_name')}: +{fmt_int(e.get('delta'))} ({fmt_int(e.get('old_networth'))}->{fmt_int(e.get('new_networth'))})"
+        )
+    if len(events or []) > len(top):
+        sms_lines.append(f"+{len(events) - len(top)} more")
+    return " | ".join(sms_lines)
+
+
 def _twilio_sms_configured() -> bool:
     return bool(
         ALERT_SMS_ENABLED
         and ALERT_SMS_TWILIO_ACCOUNT_SID
-        and ALERT_SMS_TWILIO_AUTH_TOKEN
+        and _twilio_auth_credentials()
         and ALERT_SMS_TWILIO_FROM
         and _get_alert_sms_recipients()
     )
 
 
-def _twilio_send_sms_sync(message: str) -> dict:
+def _twilio_send_sms_sync(message: str, recipients_override: list[str] | None = None) -> dict:
     """
     Sends SMS alerts via Twilio REST API (sync; call from thread).
     Returns summary counters and first error string.
     """
-    recipients = _get_alert_sms_recipients()
+    recipients = recipients_override if recipients_override is not None else _get_alert_sms_recipients()
     if not _twilio_sms_configured():
         return {"ok": False, "sent": 0, "attempted": len(recipients), "error": "sms_not_configured"}
 
-    sid = ALERT_SMS_TWILIO_ACCOUNT_SID
-    token = ALERT_SMS_TWILIO_AUTH_TOKEN
+    account_sid = str(ALERT_SMS_TWILIO_ACCOUNT_SID or "").strip()
+    creds = _twilio_auth_credentials()
+    if not account_sid or not creds:
+        return {"ok": False, "sent": 0, "attempted": len(recipients), "error": "missing_twilio_credentials"}
+    user, secret = creds
     from_num = _normalize_phone_number(ALERT_SMS_TWILIO_FROM)
     if not from_num:
         return {"ok": False, "sent": 0, "attempted": len(recipients), "error": "invalid_from_number"}
 
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-    auth = base64.b64encode(f"{sid}:{token}".encode("utf-8")).decode("ascii")
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    auth = base64.b64encode(f"{user}:{secret}".encode("utf-8")).decode("ascii")
     headers = {
         "Authorization": f"Basic {auth}",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -3045,22 +3128,36 @@ async def send_nw_jump_alerts(events: list[dict]):
                     logging.exception("Failed to send NW jump alert to fallback channel guild=%s", guild.id)
 
     if _twilio_sms_configured():
-        top = events[:5]
-        sms_lines = [f"KG2 NW jump alert ({len(events)} hits)"]
-        for e in top:
-            sms_lines.append(
-                f"{e.get('kingdom_name')}: +{fmt_int(e.get('delta'))} ({fmt_int(e.get('old_networth'))}->{fmt_int(e.get('new_networth'))})"
-            )
-        if len(events) > len(top):
-            sms_lines.append(f"+{len(events) - len(top)} more")
-        sms_result = await asyncio.to_thread(_twilio_send_sms_sync, " | ".join(sms_lines))
-        if not sms_result.get("ok"):
-            logging.warning(
-                "NW jump SMS dispatch had issues: sent=%s attempted=%s err=%s",
-                sms_result.get("sent"),
-                sms_result.get("attempted"),
-                sms_result.get("error"),
-            )
+        watch = _parse_alert_sms_watchlist()
+        if watch:
+            total_sent = 0
+            total_attempted = 0
+            first_err = None
+            for to_num, targets in watch.items():
+                matched = [e for e in events if _event_matches_sms_watch(e, targets)]
+                if not matched:
+                    continue
+                sms_result = await asyncio.to_thread(_twilio_send_sms_sync, _build_nw_jump_sms_text(matched), [to_num])
+                total_sent += int(sms_result.get("sent") or 0)
+                total_attempted += int(sms_result.get("attempted") or 0)
+                if not sms_result.get("ok") and first_err is None:
+                    first_err = sms_result.get("error")
+            if first_err:
+                logging.warning(
+                    "NW jump SMS watchlist dispatch had issues: sent=%s attempted=%s err=%s",
+                    total_sent,
+                    total_attempted,
+                    first_err,
+                )
+        else:
+            sms_result = await asyncio.to_thread(_twilio_send_sms_sync, _build_nw_jump_sms_text(events))
+            if not sms_result.get("ok"):
+                logging.warning(
+                    "NW jump SMS dispatch had issues: sent=%s attempted=%s err=%s",
+                    sms_result.get("sent"),
+                    sms_result.get("attempted"),
+                    sms_result.get("error"),
+                )
 
 
 async def nw_jump_alerts_loop():
