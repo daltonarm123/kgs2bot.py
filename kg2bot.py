@@ -2541,21 +2541,26 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
 
         def _variants(cont_id: int) -> list[tuple[str, dict]]:
             return [
-                ("str_acct+startingRank0", {
+                ("str_acct+startNumber0", {
                     "accountId": acct_str, "token": token, "kingdomId": kid,
-                    "continentId": int(cont_id), "startingRank": 0,
+                    "continentId": int(cont_id), "startNumber": 0,
                 }),
-                ("int_acct+startingRank0", {
+                ("int_acct+startNumber0", {
                     "accountId": acct_int, "token": token, "kingdomId": kid,
-                    "continentId": int(cont_id), "startingRank": 0,
+                    "continentId": int(cont_id), "startNumber": 0,
                 }),
-                ("str_acct+no_startingRank", {
+                ("str_acct+no_startNumber", {
                     "accountId": acct_str, "token": token, "kingdomId": kid,
                     "continentId": int(cont_id),
                 }),
-                ("str_acct+startingRank1", {
+                ("str_acct+startNumber1", {
                     "accountId": acct_str, "token": token, "kingdomId": kid,
-                    "continentId": int(cont_id), "startingRank": 1,
+                    "continentId": int(cont_id), "startNumber": 1,
+                }),
+                # Legacy fallback in case older servers still expect startingRank.
+                ("str_acct+startingRank0", {
+                    "accountId": acct_str, "token": token, "kingdomId": kid,
+                    "continentId": int(cont_id), "startingRank": 0,
                 }),
             ]
 
@@ -6334,14 +6339,29 @@ async def kgauthtest(ctx):
             out["search_reason"] = search_dbg.get("reason")
             out["search_body"] = str(search_dbg.get("body_preview") or "")[:160]
 
-            # 3) GetKingdomRankings with same auth
-            rank_data, rank_dbg = _kg_webservice_post_debug(
-                "Kingdoms", "GetKingdomRankings",
-                {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "continentId": -1, "startingRank": 0},
-            )
-            out["rank_status"] = rank_dbg.get("status")
-            out["rank_reason"] = rank_dbg.get("reason")
-            out["rank_body"] = str(rank_dbg.get("body_preview") or "")[:160]
+            # 3) GetKingdomRankings with same auth (probe multiple request body shapes)
+            rank_attempts = []
+            rank_variants = [
+                ("startNumber0", {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "continentId": -1, "startNumber": 0}),
+                ("no_startNumber", {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "continentId": -1}),
+                ("startNumber1", {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "continentId": -1, "startNumber": 1}),
+                ("startingRank0_legacy", {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "continentId": -1, "startingRank": 0}),
+            ]
+            for variant_name, payload in rank_variants:
+                rank_data, rank_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", payload)
+                _ = rank_data
+                rank_attempts.append({
+                    "variant": variant_name,
+                    "status": rank_dbg.get("status"),
+                    "reason": rank_dbg.get("reason"),
+                    "body": str(rank_dbg.get("body_preview") or "")[:120],
+                })
+
+            best = next((a for a in rank_attempts if int(a.get("status") or 0) == 200), rank_attempts[0] if rank_attempts else {})
+            out["rank_status"] = best.get("status")
+            out["rank_reason"] = best.get("reason")
+            out["rank_body"] = best.get("body")
+            out["rank_attempts"] = rank_attempts
             return out
 
         r = await asyncio.to_thread(_probe)
@@ -6355,6 +6375,13 @@ async def kgauthtest(ctx):
             f"GetKingdomRankings: status=`{r.get('rank_status')}` reason=`{r.get('rank_reason')}`",
             f"Rank body: `{r.get('rank_body')}`",
         ]
+        attempts = r.get("rank_attempts") or []
+        if attempts:
+            lines.append("Rank attempts:")
+            for a in attempts[:6]:
+                lines.append(
+                    f"- `{a.get('variant')}` status=`{a.get('status')}` reason=`{a.get('reason')}` body=`{a.get('body')}`"
+                )
         await ctx.send("\n".join(lines))
     except Exception as e:
         tb = traceback.format_exc()
