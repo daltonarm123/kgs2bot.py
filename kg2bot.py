@@ -53,6 +53,7 @@ import traceback
 import urllib.request
 import urllib.error
 import urllib.parse
+import base64
 from math import ceil
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
@@ -72,12 +73,14 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-06-19.1"
+BOT_VERSION = "2026-07-03.1"
 PATCH_NOTES = [
-    "Fixed DB initialization race: commands now lazy-bootstrap DB pool/schema when needed.",
-    "Improved Railway DB handling: DATABASE_URL/DATABASE_PUBLIC_URL failover and unresolved-template guardrails.",
-    "Backfill speedup: concurrent channel scanning, candidate prefiltering, and lower per-message DB overhead.",
-    "Backfill now reliably ingests Discord history first, then reparses saved reports for tech/troops/market rows.",
+    "Added NW jump alert monitoring from Kingdom rankings (GetKingdomRankings polling loop).",
+    "New !nwjumpalerts command: status, on [threshold], off (server-level subscription).",
+    "New !nwjumpcheck admin command for live rankings diagnostics + alert pipeline health.",
+    "Default jump threshold is 5,000 NW and can be changed per server/channel.",
+    "Optional SMS fanout via Twilio for NW jump alerts (team text notifications).",
+    "Added persistent rankings baseline + subscription tables for reliable alerts after restarts.",
 ]
 # -------------------------------------------------
 
@@ -89,6 +92,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_PUBLIC_URL = os.getenv("DATABASE_PUBLIC_URL", "").strip()
 DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer").strip().lower() or "prefer"
 ERROR_CHANNEL_NAME = os.getenv("ERROR_CHANNEL_NAME", "kg2recon-updates")
+TARGET_GUILD_ID = int(os.getenv("TARGET_GUILD_ID", "1405247393112395866") or "1405247393112395866")
+UPDATES_CHANNEL_ID = int(os.getenv("UPDATES_CHANNEL_ID", "0") or "0")
+UPDATES_CHANNEL_NAME = os.getenv("UPDATES_CHANNEL_NAME", ERROR_CHANNEL_NAME).strip() or ERROR_CHANNEL_NAME
 LIVE_BATTLE_CHANNEL_ID = int(os.getenv("LIVE_BATTLE_CHANNEL_ID", "1463579633449697334") or "1463579633449697334")
 KEEP_RAW_TEXT = os.getenv("KEEP_RAW_TEXT", "false").lower() in ("1", "true", "yes", "y")
 RECON_INGEST_URL = os.getenv("RECON_INGEST_URL", "https://recon-hub.onrender.com/api/reports/spy").strip()
@@ -110,6 +116,7 @@ KG_GAME_PASSWORD = os.getenv("KG_GAME_PASSWORD", "").strip()
 KG_GAME_WEB_COOKIE = os.getenv("KG_GAME_WEB_COOKIE", "").strip()
 KG_GAME_AUTH_CACHE_SECONDS = int(os.getenv("KG_GAME_AUTH_CACHE_SECONDS", "1800") or "1800")
 KG_GAME_SEARCH_KINGDOM_ID = int(os.getenv("KG_GAME_SEARCH_KINGDOM_ID", "0") or "0")
+KG_GAME_RANKINGS_CONTINENT_ID = int(os.getenv("KG_GAME_RANKINGS_CONTINENT_ID", "-1") or "-1")
 KG_REPORT_DEFAULT_TZ = os.getenv("KG_REPORT_DEFAULT_TZ", "UTC").strip()
 KG_REPORT_MAX_FUTURE_MINUTES = int(os.getenv("KG_REPORT_MAX_FUTURE_MINUTES", "10") or "10")
 KG_REPORT_AUTO_INFER_TZ = os.getenv("KG_REPORT_AUTO_INFER_TZ", "true").lower() in ("1", "true", "yes", "y")
@@ -182,8 +189,19 @@ KG_ROUND_TO_TICK = os.getenv("KG_ROUND_TO_TICK", "false").lower() in ("1", "true
 KG_TICK_MINUTES = int(os.getenv("KG_TICK_MINUTES", "5") or "5")
 KG_TICK_ROUND_MODE = os.getenv("KG_TICK_ROUND_MODE", "floor").strip().lower()
 RETURN_ALERT_POLL_SECONDS = int(os.getenv("RETURN_ALERT_POLL_SECONDS", "30") or "30")
+NW_JUMP_ALERTS_ENABLED = os.getenv("NW_JUMP_ALERTS_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+NW_JUMP_ALERT_POLL_SECONDS = int(os.getenv("NW_JUMP_ALERT_POLL_SECONDS", "60") or "60")
+NW_JUMP_ALERT_DEFAULT_THRESHOLD = int(os.getenv("NW_JUMP_ALERT_DEFAULT_THRESHOLD", "5000") or "5000")
+NW_JUMP_ALERT_SILENT_NO_SUBS = os.getenv("NW_JUMP_ALERT_SILENT_NO_SUBS", "true").lower() in ("1", "true", "yes", "y")
+ALERT_SMS_ENABLED = os.getenv("ALERT_SMS_ENABLED", "false").lower() in ("1", "true", "yes", "y")
+ALERT_SMS_TWILIO_ACCOUNT_SID = os.getenv("ALERT_SMS_TWILIO_ACCOUNT_SID", "").strip()
+ALERT_SMS_TWILIO_AUTH_TOKEN = os.getenv("ALERT_SMS_TWILIO_AUTH_TOKEN", "").strip()
+ALERT_SMS_TWILIO_FROM = os.getenv("ALERT_SMS_TWILIO_FROM", "").strip()
+ALERT_SMS_TO = os.getenv("ALERT_SMS_TO", "").strip()
+ALERT_SMS_MAX_PER_ALERT = int(os.getenv("ALERT_SMS_MAX_PER_ALERT", "10") or "10")
 PREMIUM_GATE_ENABLED = os.getenv("PREMIUM_GATE_ENABLED", "true").lower() in ("1", "true", "yes", "y")
 BATTLE_RETURNS_LOOP_STARTED = False
+NW_JUMP_ALERTS_LOOP_STARTED = False
 
 
 def parse_utc_dt(s: str) -> datetime:
@@ -1657,6 +1675,57 @@ def can_read_history(channel: discord.abc.GuildChannel, guild: discord.Guild) ->
         return False
 
 
+def is_target_guild(guild: discord.Guild | None) -> bool:
+    if not guild:
+        return False
+    if int(TARGET_GUILD_ID or 0) <= 0:
+        return True
+    return int(guild.id) == int(TARGET_GUILD_ID)
+
+
+def get_updates_channel(guild: discord.Guild, fallback: discord.abc.GuildChannel | None = None):
+    """
+    Preferred channel for bot updates/errors.
+    Resolution order:
+    1) exact ERROR_CHANNEL_NAME
+    2) case-insensitive name match
+    3) configured live battle channel
+    4) provided fallback
+    """
+    if not guild:
+        return None
+
+    # If a target guild is configured, keep update routing scoped to that guild.
+    if int(TARGET_GUILD_ID or 0) > 0 and int(guild.id) != int(TARGET_GUILD_ID):
+        return None
+
+    try:
+        if int(UPDATES_CHANNEL_ID or 0) > 0:
+            by_id = guild.get_channel(int(UPDATES_CHANNEL_ID))
+            if by_id and can_send(by_id, guild):
+                return by_id
+
+        preferred_name = str(UPDATES_CHANNEL_NAME or ERROR_CHANNEL_NAME or "").strip()
+        ch = discord.utils.get(guild.text_channels, name=preferred_name)
+        if ch and can_send(ch, guild):
+            return ch
+
+        wanted = preferred_name.lower()
+        if wanted:
+            for t in guild.text_channels:
+                if str(getattr(t, "name", "")).strip().lower() == wanted and can_send(t, guild):
+                    return t
+    except Exception:
+        pass
+
+    ch = get_live_battle_channel(guild, fallback)
+    if ch and can_send(ch, guild):
+        return ch
+    if fallback and can_send(fallback, guild):
+        return fallback
+    return None
+
+
 def looks_like_spy_report(text: str) -> bool:
     ll = (text or "").lower()
     if "target:" not in ll:
@@ -1932,7 +2001,7 @@ def parse_track_day_arg(arg: str | None) -> datetime:
 async def send_error(guild: discord.Guild, msg: str, tb: str | None = None):
     """Send safe, truncated error logs to your error channel + log full stack to console."""
     try:
-        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
+        ch = get_updates_channel(guild, None)
         if ch and can_send(ch, guild):
             payload = msg
             if tb:
@@ -2108,6 +2177,30 @@ def init_db():
         );
         """)
 
+        # Rankings baseline state for NW jump detection.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kingdom_rankings_state (
+            world_id INTEGER NOT NULL,
+            kingdom_id BIGINT NOT NULL,
+            kingdom_name TEXT,
+            rank_pos INTEGER,
+            networth BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (world_id, kingdom_id)
+        );
+        """)
+
+        # Per-guild alert routing for NW jump alerts.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS nw_jump_alert_subscriptions (
+            guild_id BIGINT PRIMARY KEY,
+            channel_id BIGINT NOT NULL,
+            min_jump BIGINT NOT NULL DEFAULT 5000,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at TIMESTAMPTZ NOT NULL
+        );
+        """)
+
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
             SELECT column_name, is_nullable
@@ -2263,6 +2356,14 @@ def init_db():
             CREATE INDEX IF NOT EXISTS market_transactions_seller_captured_idx
             ON market_transactions (seller_kingdom, captured_at DESC, id DESC);
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS kingdom_rankings_state_updated_idx
+            ON kingdom_rankings_state (updated_at DESC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS nw_jump_alert_subscriptions_enabled_idx
+            ON nw_jump_alert_subscriptions (enabled, updated_at DESC);
+        """)
 
 
 def heal_sequences():
@@ -2272,6 +2373,410 @@ def heal_sequences():
                 f"SELECT setval(pg_get_serial_sequence('{table}','id'), "
                 f"COALESCE((SELECT MAX(id) FROM {table}), 1), true);"
             )
+
+
+def _kg_extract_rankings_rows(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    for k in ("kingdoms", "Kingdoms", "rankings", "Rankings", "rows", "Rows", "data", "Data"):
+        v = payload.get(k)
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, dict)]
+    for v in payload.values():
+        if isinstance(v, list) and v and all(isinstance(x, dict) for x in v[: min(5, len(v))]):
+            return v
+    return []
+
+
+def _kg_normalize_rankings_rows(rows: list[dict]) -> list[dict]:
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        kid = _safe_int_or_none(_dict_pick(r, "kingdomId", "KingdomId", "id", "Id"))
+        if not kid:
+            continue
+        name = str(_dict_pick(r, "name", "Name", "kingdom", "Kingdom", "kingdomName", "KingdomName") or "").strip()
+        nw = _safe_int_or_none(_dict_pick(r, "networth", "Networth", "netWorth", "NetWorth", "net_worth"))
+        if nw is None:
+            continue
+        rank = _safe_int_or_none(_dict_pick(r, "rank", "Rank", "position", "Position", "ranking", "Ranking"))
+        out.append({
+            "kingdom_id": int(kid),
+            "kingdom_name": name or f"Kingdom #{kid}",
+            "rank": int(rank) if rank else None,
+            "networth": int(nw),
+        })
+    out.sort(key=lambda x: (x.get("rank") is None, int(x.get("rank") or 10**9), -int(x.get("networth") or 0), str(x.get("kingdom_name") or "")))
+    for i, row in enumerate(out, start=1):
+        if not row.get("rank"):
+            row["rank"] = i
+    return out
+
+
+def fetch_world_kingdom_rankings() -> list[dict]:
+    auth = _kg_get_auth(force_refresh=False)
+    if not auth:
+        return []
+    payload = {
+        "accountId": int(auth.get("account_id") or 0),
+        "token": str(auth.get("token") or ""),
+        "kingdomId": int(auth.get("search_kingdom_id") or 0),
+        "continentId": int(KG_GAME_RANKINGS_CONTINENT_ID or -1),
+    }
+    data = _kg_webservice_post("Kingdoms", "GetKingdomRankings", payload) or {}
+    rows = _kg_extract_rankings_rows(data)
+    norm = _kg_normalize_rankings_rows(rows)
+    if norm:
+        return norm
+
+    # Retry once with refreshed auth in case token expired.
+    auth = _kg_get_auth(force_refresh=True)
+    if not auth:
+        return []
+    payload.update({
+        "accountId": int(auth.get("account_id") or 0),
+        "token": str(auth.get("token") or ""),
+        "kingdomId": int(auth.get("search_kingdom_id") or 0),
+    })
+    data = _kg_webservice_post("Kingdoms", "GetKingdomRankings", payload) or {}
+    rows = _kg_extract_rankings_rows(data)
+    return _kg_normalize_rankings_rows(rows)
+
+
+def sync_upsert_nw_jump_subscription(guild_id: int, channel_id: int, min_jump: int, enabled: bool):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nw_jump_alert_subscriptions (guild_id, channel_id, min_jump, enabled, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id) DO UPDATE
+            SET channel_id=EXCLUDED.channel_id,
+                min_jump=EXCLUDED.min_jump,
+                enabled=EXCLUDED.enabled,
+                updated_at=EXCLUDED.updated_at;
+            """,
+            (int(guild_id), int(channel_id), max(1, int(min_jump)), bool(enabled), now_utc()),
+        )
+
+
+def sync_get_nw_jump_subscription(guild_id: int):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT guild_id, channel_id, min_jump, enabled, updated_at
+            FROM nw_jump_alert_subscriptions
+            WHERE guild_id=%s
+            LIMIT 1;
+            """,
+            (int(guild_id),),
+        )
+        return cur.fetchone()
+
+
+def sync_disable_nw_jump_subscription(guild_id: int):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nw_jump_alert_subscriptions
+            SET enabled=FALSE, updated_at=%s
+            WHERE guild_id=%s;
+            """,
+            (now_utc(), int(guild_id)),
+        )
+        return int(cur.rowcount or 0)
+
+
+def sync_get_enabled_nw_jump_subscriptions() -> list[dict]:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT guild_id, channel_id, min_jump, enabled
+            FROM nw_jump_alert_subscriptions
+            WHERE enabled=TRUE;
+            """
+        )
+        return cur.fetchall() or []
+
+
+def _normalize_phone_number(s: str) -> str:
+    txt = str(s or "").strip()
+    if not txt:
+        return ""
+    # Keep a leading '+' and digits; drop other characters.
+    out = []
+    for i, ch in enumerate(txt):
+        if ch.isdigit():
+            out.append(ch)
+        elif ch == "+" and i == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def _get_alert_sms_recipients() -> list[str]:
+    nums = []
+    for piece in str(ALERT_SMS_TO or "").replace(";", ",").split(","):
+        n = _normalize_phone_number(piece)
+        if n:
+            nums.append(n)
+    deduped = []
+    seen = set()
+    for n in nums:
+        if n in seen:
+            continue
+        seen.add(n)
+        deduped.append(n)
+    lim = max(1, int(ALERT_SMS_MAX_PER_ALERT or 10))
+    return deduped[:lim]
+
+
+def _twilio_sms_configured() -> bool:
+    return bool(
+        ALERT_SMS_ENABLED
+        and ALERT_SMS_TWILIO_ACCOUNT_SID
+        and ALERT_SMS_TWILIO_AUTH_TOKEN
+        and ALERT_SMS_TWILIO_FROM
+        and _get_alert_sms_recipients()
+    )
+
+
+def _twilio_send_sms_sync(message: str) -> dict:
+    """
+    Sends SMS alerts via Twilio REST API (sync; call from thread).
+    Returns summary counters and first error string.
+    """
+    recipients = _get_alert_sms_recipients()
+    if not _twilio_sms_configured():
+        return {"ok": False, "sent": 0, "attempted": len(recipients), "error": "sms_not_configured"}
+
+    sid = ALERT_SMS_TWILIO_ACCOUNT_SID
+    token = ALERT_SMS_TWILIO_AUTH_TOKEN
+    from_num = _normalize_phone_number(ALERT_SMS_TWILIO_FROM)
+    if not from_num:
+        return {"ok": False, "sent": 0, "attempted": len(recipients), "error": "invalid_from_number"}
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    auth = base64.b64encode(f"{sid}:{token}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "kg2bot/1.0",
+    }
+
+    body_text = str(message or "").strip()
+    if len(body_text) > 1500:
+        body_text = body_text[:1497] + "..."
+
+    sent = 0
+    first_err = None
+    for to_num in recipients:
+        payload = urllib.parse.urlencode({"To": to_num, "From": from_num, "Body": body_text}).encode("utf-8")
+        try:
+            req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+            with urllib.request.urlopen(req, timeout=max(2.0, float(KG_GAME_API_TIMEOUT))) as resp:
+                if int(getattr(resp, "status", 0) or 0) in (200, 201):
+                    sent += 1
+                else:
+                    if first_err is None:
+                        first_err = f"twilio_http_{getattr(resp, 'status', 0)}"
+        except urllib.error.HTTPError as e:
+            if first_err is None:
+                first_err = f"twilio_http_{int(getattr(e, 'code', 0) or 0)}"
+        except Exception as e:
+            if first_err is None:
+                first_err = e.__class__.__name__
+
+    return {
+        "ok": sent > 0,
+        "sent": int(sent),
+        "attempted": int(len(recipients)),
+        "error": first_err,
+    }
+
+
+def sync_get_nw_rankings_state_stats(world_id: int) -> dict:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS cnt, MAX(updated_at) AS last_updated
+            FROM kingdom_rankings_state
+            WHERE world_id=%s;
+            """,
+            (int(world_id),),
+        )
+        row = cur.fetchone() or {}
+        return {
+            "count": int(row.get("cnt") or 0),
+            "last_updated": row.get("last_updated"),
+        }
+
+
+def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_threshold: int) -> list[dict]:
+    if not rows:
+        return []
+
+    threshold = max(1, int(default_threshold or 5000))
+    now_ts = now_utc()
+    row_by_id = {int(r["kingdom_id"]): r for r in rows if isinstance(r, dict) and r.get("kingdom_id")}
+    kingdom_ids = list(row_by_id.keys())
+    if not kingdom_ids:
+        return []
+
+    events = []
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kingdom_id, kingdom_name, rank_pos, networth
+            FROM kingdom_rankings_state
+            WHERE world_id=%s AND kingdom_id = ANY(%s);
+            """,
+            (int(world_id), kingdom_ids),
+        )
+        prev = {int(r["kingdom_id"]): r for r in (cur.fetchall() or [])}
+
+        for kid, current in row_by_id.items():
+            old = prev.get(kid)
+            if not old:
+                continue
+            old_nw = _safe_int_or_none(old.get("networth"))
+            new_nw = _safe_int_or_none(current.get("networth"))
+            if old_nw is None or new_nw is None:
+                continue
+            delta = int(new_nw) - int(old_nw)
+            if delta >= threshold:
+                events.append({
+                    "kingdom_id": kid,
+                    "kingdom_name": str(current.get("kingdom_name") or old.get("kingdom_name") or f"Kingdom #{kid}"),
+                    "old_networth": int(old_nw),
+                    "new_networth": int(new_nw),
+                    "delta": int(delta),
+                    "old_rank": _safe_int_or_none(old.get("rank_pos")),
+                    "new_rank": _safe_int_or_none(current.get("rank")),
+                })
+
+        upsert_rows = [
+            (
+                int(world_id),
+                int(r["kingdom_id"]),
+                str(r.get("kingdom_name") or "").strip() or None,
+                int(r.get("rank") or 0) if r.get("rank") else None,
+                int(r.get("networth") or 0),
+                now_ts,
+            )
+            for r in row_by_id.values()
+        ]
+        cur.executemany(
+            """
+            INSERT INTO kingdom_rankings_state (world_id, kingdom_id, kingdom_name, rank_pos, networth, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (world_id, kingdom_id) DO UPDATE
+            SET kingdom_name=EXCLUDED.kingdom_name,
+                rank_pos=EXCLUDED.rank_pos,
+                networth=EXCLUDED.networth,
+                updated_at=EXCLUDED.updated_at;
+            """,
+            upsert_rows,
+        )
+
+    events.sort(key=lambda e: (-int(e.get("delta") or 0), str(e.get("kingdom_name") or "")))
+    return events
+
+
+async def send_nw_jump_alerts(events: list[dict]):
+    if not events:
+        return
+
+    subs = await run_db(sync_get_enabled_nw_jump_subscriptions)
+    if not subs:
+        if not NW_JUMP_ALERT_SILENT_NO_SUBS:
+            logging.info("NW jump detected but no enabled subscriptions: events=%s", len(events))
+        return
+
+    by_guild = {}
+    for s in subs:
+        gid = int(s.get("guild_id") or 0)
+        if gid > 0:
+            by_guild[gid] = s
+
+    for guild in bot.guilds:
+        sub = by_guild.get(int(guild.id))
+        if not sub:
+            continue
+        min_jump = max(1, int(sub.get("min_jump") or NW_JUMP_ALERT_DEFAULT_THRESHOLD))
+        hits = [e for e in events if int(e.get("delta") or 0) >= min_jump]
+        if not hits:
+            continue
+
+        cid = int(sub.get("channel_id") or 0)
+        ch = guild.get_channel(cid) if cid > 0 else None
+        if not (ch and can_send(ch, guild)):
+            ch = get_live_battle_channel(guild, None)
+        if not (ch and can_send(ch, guild)):
+            continue
+
+        lines = [f"🚨 **NW Jump Alert** (threshold: `{fmt_int(min_jump)}`)"]
+        for e in hits[:12]:
+            old_rank = _safe_int_or_none(e.get("old_rank"))
+            new_rank = _safe_int_or_none(e.get("new_rank"))
+            rank_part = ""
+            if old_rank and new_rank:
+                rank_part = f" • rank {old_rank} → {new_rank}"
+            lines.append(
+                f"- **{e.get('kingdom_name')}** +`{fmt_int(e.get('delta'))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))}){rank_part}"
+            )
+        extra = len(hits) - 12
+        if extra > 0:
+            lines.append(f"... +{extra} more")
+
+        try:
+            await ch.send("\n".join(lines))
+        except Exception:
+            logging.exception("Failed to send NW jump alert to guild=%s channel=%s", guild.id, cid)
+
+    if _twilio_sms_configured():
+        top = events[:5]
+        sms_lines = [f"KG2 NW jump alert ({len(events)} hits)"]
+        for e in top:
+            sms_lines.append(
+                f"{e.get('kingdom_name')}: +{fmt_int(e.get('delta'))} ({fmt_int(e.get('old_networth'))}->{fmt_int(e.get('new_networth'))})"
+            )
+        if len(events) > len(top):
+            sms_lines.append(f"+{len(events) - len(top)} more")
+        sms_result = await asyncio.to_thread(_twilio_send_sms_sync, " | ".join(sms_lines))
+        if not sms_result.get("ok"):
+            logging.warning(
+                "NW jump SMS dispatch had issues: sent=%s attempted=%s err=%s",
+                sms_result.get("sent"),
+                sms_result.get("attempted"),
+                sms_result.get("error"),
+            )
+
+
+async def nw_jump_alerts_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            rows = await asyncio.to_thread(fetch_world_kingdom_rankings)
+            await run_db(sync_meta_set, "nw_jump_last_poll_ts", str(int(time.time())))
+            await run_db(sync_meta_set, "nw_jump_last_poll_rows", str(len(rows or [])))
+            if rows:
+                events = await run_db(
+                    sync_detect_rankings_nw_jumps,
+                    int(KG_GAME_WORLD_ID or 1),
+                    rows,
+                    int(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000),
+                )
+                await run_db(sync_meta_set, "nw_jump_last_events", str(len(events or [])))
+                await run_db(sync_meta_set, "nw_jump_last_ok_ts", str(int(time.time())))
+                if events:
+                    await send_nw_jump_alerts(events)
+        except Exception:
+            logging.exception("nw_jump_alerts_loop failed")
+            try:
+                await run_db(sync_meta_set, "nw_jump_last_error_ts", str(int(time.time())))
+            except Exception:
+                pass
+        await asyncio.sleep(max(15, int(NW_JUMP_ALERT_POLL_SECONDS or 60)))
 
 
 # ---------- DB Helpers (sync; call via run_db) ----------
@@ -2287,6 +2792,16 @@ def _meta_set(cur, key: str, value: str):
         VALUES (%s, %s, %s)
         ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=EXCLUDED.updated_at;
     """, (key, value, now_utc()))
+
+
+def sync_meta_set(key: str, value: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        _meta_set(cur, str(key), str(value))
+
+
+def sync_meta_get(key: str):
+    with db_conn() as conn, conn.cursor() as cur:
+        return _meta_get(cur, str(key))
 
 
 def sync_fuzzy_kingdom(query: str):
@@ -3883,6 +4398,7 @@ async def battle_returns_loop():
 async def on_ready():
     global ANNOUNCED_READY_THIS_PROCESS
     global BATTLE_RETURNS_LOOP_STARTED
+    global NW_JUMP_ALERTS_LOOP_STARTED
 
     try:
         await run_db(init_db_pool, 1, 10)
@@ -3894,6 +4410,9 @@ async def on_ready():
     if KG_TROOP_TRACKING_ENABLED and not BATTLE_RETURNS_LOOP_STARTED:
         BATTLE_RETURNS_LOOP_STARTED = True
         asyncio.create_task(battle_returns_loop())
+    if NW_JUMP_ALERTS_ENABLED and not NW_JUMP_ALERTS_LOOP_STARTED:
+        NW_JUMP_ALERTS_LOOP_STARTED = True
+        asyncio.create_task(nw_jump_alerts_loop())
 
     if ANNOUNCED_READY_THIS_PROCESS:
         logging.info("on_ready called again (same process) - announcement suppressed.")
@@ -3926,16 +4445,29 @@ async def on_ready():
 
     patch_lines = "\n".join([f"• {x}" for x in PATCH_NOTES])
     for guild in bot.guilds:
-        ch = discord.utils.get(guild.text_channels, name=ERROR_CHANNEL_NAME)
-        if ch and can_send(ch, guild):
-            try:
-                await ch.send(
-                    f"✅ **KG2 Recon Bot restarted**\n"
-                    f"Version: `{BOT_VERSION}`\n"
-                    f"Patch:\n{patch_lines}"
-                )
-            except Exception:
-                pass
+        if int(TARGET_GUILD_ID or 0) > 0 and int(guild.id) != int(TARGET_GUILD_ID):
+            continue
+        ch = get_updates_channel(guild, None)
+        if not ch:
+            logging.warning(
+                "Startup announcement skipped: no sendable updates channel in guild=%s (wanted name=%s)",
+                guild.id,
+                ERROR_CHANNEL_NAME,
+            )
+            continue
+        try:
+            await ch.send(
+                f"✅ **KG2 Recon Bot merged + restarted**\n"
+                f"Version: `{BOT_VERSION}`\n"
+                f"Patch:\n{patch_lines}"
+            )
+        except Exception as e:
+            logging.warning(
+                "Startup announcement send failed for guild=%s channel=%s (%s)",
+                guild.id,
+                getattr(ch, "id", "?"),
+                e.__class__.__name__,
+            )
 
 
 @bot.event
@@ -5287,6 +5819,11 @@ async def help_cmd(ctx):
             "`!spyhistory <kingdom>` - Show last 5 saved spy reports",
             "`!spies <kingdom>` - Show last 10 spy reports + send recommendation",
             "`!supply <kingdom> [days]` - Premium: show supplier kingdoms from market transactions + TSV",
+            "`!nwjumpalerts status` - Show NW jump alert config for this server",
+            "`!nwjumpalerts on [threshold]` - Admin: enable NW jump alerts in this channel (default threshold 5000)",
+            "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
+            "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
+            "`!whereupdates` - Show configured target server/channel + bot send permissions",
             "`!battle <kingdom>` - Estimate current home troops (available when troop tracking is enabled)",
             "`!track` - Daily attack tracker for today (UTC) + TSV export",
             "`!track yesterday` - Daily attack tracker for yesterday (UTC)",
@@ -5306,6 +5843,7 @@ async def help_cmd(ctx):
             "`!troops <kingdom>` - Latest saved troop snapshot",
             "`!troopsdelta <kingdom>` - Troop delta from last two snapshots",
             "`!troopdelta <kingdom>` - Alias of !troopsdelta",
+            "`!announcepatch` - Admin: force-post current patch notes to update channel",
             "`!refresh` - Admin: restart bot process",
         ]
         await ctx.send("\n".join(lines))
@@ -5314,6 +5852,174 @@ async def help_cmd(ctx):
         await ctx.send("help failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"help error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumpalerts")
+async def nwjumpalerts(ctx, action: str = "status", threshold: str = ""):
+    """
+    Configure per-server NW jump alerts sourced from GetKingdomRankings.
+    Usage:
+    !nwjumpalerts status
+    !nwjumpalerts on [threshold]
+    !nwjumpalerts off
+    """
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        action_norm = str(action or "status").strip().lower()
+        guild_id = int(ctx.guild.id)
+
+        if action_norm in ("status", "show"):
+            row = await run_db(sync_get_nw_jump_subscription, guild_id)
+            if not row:
+                return await ctx.send(
+                    f"ℹ️ NW jump alerts are **not configured** for this server. "
+                    f"Use `!nwjumpalerts on {NW_JUMP_ALERT_DEFAULT_THRESHOLD}` in the channel that should receive alerts."
+                )
+            enabled = bool(row.get("enabled"))
+            cid = int(row.get("channel_id") or 0)
+            threshold_v = max(1, int(row.get("min_jump") or NW_JUMP_ALERT_DEFAULT_THRESHOLD))
+            ch_text = f"<#{cid}>" if cid > 0 else "(unknown channel)"
+            state = "enabled" if enabled else "disabled"
+            return await ctx.send(
+                f"📡 NW jump alerts are **{state}** for this server.\n"
+                f"Channel: {ch_text}\n"
+                f"Threshold: `{fmt_int(threshold_v)}`"
+            )
+
+        if action_norm == "off":
+            if not _is_admin(ctx):
+                return await ctx.send("❌ You don’t have permission to use this command.")
+            changed = await run_db(sync_disable_nw_jump_subscription, guild_id)
+            if changed <= 0:
+                return await ctx.send("ℹ️ NW jump alerts were already off (or not configured) for this server.")
+            return await ctx.send("🛑 NW jump alerts disabled for this server.")
+
+        if action_norm == "on":
+            if not _is_admin(ctx):
+                return await ctx.send("❌ You don’t have permission to use this command.")
+            min_jump = _safe_int_or_none(threshold)
+            if min_jump is None:
+                min_jump = int(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000)
+            min_jump = max(1, int(min_jump))
+            await run_db(
+                sync_upsert_nw_jump_subscription,
+                guild_id,
+                int(ctx.channel.id),
+                min_jump,
+                True,
+            )
+            return await ctx.send(
+                f"✅ NW jump alerts enabled in {ctx.channel.mention} with threshold `{fmt_int(min_jump)}`.\n"
+                "Alerts trigger when a kingdom gains at least this much net worth between ranking polls."
+            )
+
+        return await ctx.send("Usage: `!nwjumpalerts status` | `!nwjumpalerts on [threshold]` | `!nwjumpalerts off`")
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumpalerts failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumpalerts error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumpcheck")
+async def nwjumpcheck(ctx):
+    """Admin-only: run a live rankings pull and summarize NW jump pipeline health."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+        if ctx.guild and not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        rows = await asyncio.to_thread(fetch_world_kingdom_rankings)
+        world_id = int(KG_GAME_WORLD_ID or 1)
+        stats = await run_db(sync_get_nw_rankings_state_stats, world_id)
+
+        poll_ts = await run_db(sync_meta_get, "nw_jump_last_poll_ts")
+        poll_rows = await run_db(sync_meta_get, "nw_jump_last_poll_rows")
+        ev_last = await run_db(sync_meta_get, "nw_jump_last_events")
+        ok_ts = await run_db(sync_meta_get, "nw_jump_last_ok_ts")
+        err_ts = await run_db(sync_meta_get, "nw_jump_last_error_ts")
+
+        sub = await run_db(sync_get_nw_jump_subscription, int(ctx.guild.id)) if ctx.guild else None
+        sms_recipients = _get_alert_sms_recipients()
+
+        auth = await asyncio.to_thread(_kg_get_auth, False)
+        auth_mode = str((auth or {}).get("auth_mode") or "none")
+        has_auth = bool(auth and auth.get("account_id") and auth.get("token"))
+
+        lines = [
+            "🧪 **NW Jump Check**",
+            f"World: `{world_id}` | Rankings pulled now: `{len(rows or [])}`",
+            f"Auth: `{auth_mode}` ({'ok' if has_auth else 'missing'})",
+            f"Baseline rows in DB: `{fmt_int(stats.get('count'))}` | Last baseline update: `{stats.get('last_updated') or 'never'}`",
+            f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last events: `{ev_last or 'n/a'}`",
+            f"Loop last ok ts: `{ok_ts or 'n/a'}` | last error ts: `{err_ts or 'n/a'}`",
+        ]
+
+        if sub:
+            lines.append(
+                f"Guild subscription: `enabled={bool(sub.get('enabled'))}` channel=<#{int(sub.get('channel_id') or 0)}> threshold=`{fmt_int(sub.get('min_jump'))}`"
+            )
+        else:
+            lines.append("Guild subscription: `not configured` (run `!nwjumpalerts on 5000`)")
+
+        if ALERT_SMS_ENABLED:
+            lines.append(
+                f"SMS: `enabled` provider=`twilio` recipients=`{len(sms_recipients)}` configured=`{_twilio_sms_configured()}`"
+            )
+        else:
+            lines.append("SMS: `disabled`")
+
+        preview = rows[:5]
+        if preview:
+            lines.append("Top rankings sample:")
+            for r in preview:
+                lines.append(f"- #{int(r.get('rank') or 0)} {r.get('kingdom_name')} (NW {fmt_int(r.get('networth'))})")
+
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumpcheck failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumpcheck error: {e}", tb=tb)
+
+
+@bot.command(name="whereupdates")
+async def whereupdates(ctx):
+    """Show update-routing target and send permissions for current server."""
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+
+        is_target = is_target_guild(ctx.guild)
+        target_txt = f"{TARGET_GUILD_ID}" if int(TARGET_GUILD_ID or 0) > 0 else "(all guilds)"
+        ch = get_updates_channel(ctx.guild, ctx.channel)
+        can_here = can_send(ctx.channel, ctx.guild)
+        ch_name = getattr(ch, "name", "none") if ch else "none"
+        ch_id = int(getattr(ch, "id", 0) or 0) if ch else 0
+        can_target = can_send(ch, ctx.guild) if ch else False
+
+        await ctx.send(
+            "📍 **Update Routing**\n"
+            f"Current guild: `{ctx.guild.id}`\n"
+            f"Target guild: `{target_txt}`\n"
+            f"This guild is target: `{is_target}`\n"
+            f"Configured updates name: `{UPDATES_CHANNEL_NAME}`\n"
+            f"Configured updates id: `{int(UPDATES_CHANNEL_ID or 0)}`\n"
+            f"Resolved updates channel: `<#{ch_id}>` ({ch_name})\n"
+            f"Can send in resolved channel: `{can_target}`\n"
+            f"Can send in current channel: `{can_here}`"
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ whereupdates failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"whereupdates error: {e}", tb=tb)
 
 
 @bot.command(name="refresh")
@@ -5330,7 +6036,7 @@ async def refresh(ctx):
 
         if ctx.guild:
             try:
-                ch = discord.utils.get(ctx.guild.text_channels, name=ERROR_CHANNEL_NAME)
+                ch = get_updates_channel(ctx.guild, ctx.channel)
                 if ch and can_send(ch, ctx.guild):
                     await ch.send(f"🔄 Manual refresh requested by **{ctx.author.display_name}**")
             except Exception:
@@ -5344,6 +6050,40 @@ async def refresh(ctx):
         await ctx.send("⚠️ Refresh failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"refresh error: {e}", tb=tb)
+
+
+@bot.command(name="announcepatch")
+async def announcepatch(ctx):
+    """Admin-only: force post current version patch notes to updates channel."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        ch = get_updates_channel(ctx.guild, ctx.channel)
+        if not ch:
+            return await ctx.send(
+                f"❌ Could not find a sendable updates channel. Expected name: `{ERROR_CHANNEL_NAME}`."
+            )
+
+        patch_lines = "\n".join([f"• {x}" for x in PATCH_NOTES])
+        await ch.send(
+            f"📢 **KG2 Recon Bot patch announcement**\n"
+            f"Version: `{BOT_VERSION}`\n"
+            f"Patch:\n{patch_lines}"
+        )
+        if int(getattr(ch, "id", 0) or 0) != int(getattr(ctx.channel, "id", 0) or 0):
+            await ctx.send(f"✅ Posted patch announcement in {ch.mention}.")
+        else:
+            await ctx.send("✅ Posted patch announcement.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ announcepatch failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"announcepatch error: {e}", tb=tb)
 
 
 # ---------- START ----------

@@ -16,6 +16,39 @@ Watches for attack reports in chat and automatically posts an estimated updated 
 
 Includes admin/debug tools to rescan reports if parsing missed anything and to toggle auto-capture per channel or server.
 
+New: NW jump alerts from live rankings.
+
+The bot can poll KingdomGame rankings and alert your Discord when a kingdom gains net worth by a configured amount (default 5,000+) between polls.
+
+Command usage:
+
+!nwjumpalerts status
+!nwjumpalerts on [threshold]
+!nwjumpalerts off
+!nwjumpcheck
+
+Example:
+
+!nwjumpalerts on 5000
+
+When enabled, alerts are posted in the channel where you ran the command.
+
+Environment variables for this feature:
+
+NW_JUMP_ALERTS_ENABLED=true
+NW_JUMP_ALERT_POLL_SECONDS=60
+NW_JUMP_ALERT_DEFAULT_THRESHOLD=5000
+KG_GAME_RANKINGS_CONTINENT_ID=-1
+
+Optional SMS fanout (Twilio):
+
+ALERT_SMS_ENABLED=true
+ALERT_SMS_TWILIO_ACCOUNT_SID=...
+ALERT_SMS_TWILIO_AUTH_TOKEN=...
+ALERT_SMS_TWILIO_FROM=+1XXXXXXXXXX
+ALERT_SMS_TO=+1XXXXXXXXXX,+1YYYYYYYYYY
+ALERT_SMS_MAX_PER_ALERT=10
+
 ⚙️ How it works:
 
 It listens for messages in Discord.
