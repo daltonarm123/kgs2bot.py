@@ -943,7 +943,21 @@ def _kg_get_auth(force_refresh: bool = False) -> dict | None:
     static_auth = _kg_get_static_auth(now_ts)
     if static_auth:
         return static_auth
-    if not force_refresh and KG_API_AUTH_CACHE and float(KG_API_AUTH_CACHE.get("expires_at", 0) or 0) > now_ts:
+    return _kg_get_login_auth(force_refresh)
+
+
+def _kg_get_login_auth(force_refresh: bool = False) -> dict | None:
+    """
+    Mint a fresh token via email/password login.
+    Used as a fallback when the static token is expired/invalid.
+    """
+    now_ts = time.time()
+    if (
+        not force_refresh
+        and KG_API_AUTH_CACHE
+        and str(KG_API_AUTH_CACHE.get("auth_mode") or "") == "login"
+        and float(KG_API_AUTH_CACHE.get("expires_at", 0) or 0) > now_ts
+    ):
         return KG_API_AUTH_CACHE
     if not KG_GAME_EMAIL or not KG_GAME_PASSWORD:
         return None
@@ -954,6 +968,8 @@ def _kg_get_auth(force_refresh: bool = False) -> dict | None:
         return None
 
     search_kingdom_id = int(KG_GAME_SEARCH_KINGDOM_ID or 0)
+    if search_kingdom_id <= 0:
+        search_kingdom_id = _safe_int_or_none(KG_GAME_TOKEN_KINGDOM_ID) or 0
     if search_kingdom_id <= 0:
         kingdoms_payload = _kg_webservice_post(
             "Kingdoms",
@@ -2557,15 +2573,18 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
     if rows:
         return rows, meta
 
-    # Retry once with refreshed auth in case token expired.
-    auth = _kg_get_auth(force_refresh=True)
-    if not auth:
-        meta["error"] = "missing_auth_after_refresh"
+    # Static token likely expired/invalid (KG returns HTTP 500 on bad tokens).
+    # Fall back to a fresh email/password login token if credentials are configured.
+    login_auth = _kg_get_login_auth(force_refresh=True)
+    if not login_auth:
+        meta["error"] = "static_token_failed_and_no_login_credentials"
+        meta["login_configured"] = bool(KG_GAME_EMAIL and KG_GAME_PASSWORD)
+        meta["auth_mode"] = str(auth.get("auth_mode") or "none")
         return [], meta
-    rows = _attempt_with_auth(auth, "refreshed_auth")
+    rows = _attempt_with_auth(login_auth, "login_auth")
     if rows:
         return rows, meta
-    meta["auth_mode"] = str(auth.get("auth_mode") or "none")
+    meta["auth_mode"] = str(login_auth.get("auth_mode") or "none")
     return [], meta
 
 
