@@ -849,9 +849,14 @@ def _decode_kg_asmx_response(body_text: str) -> dict | None:
 
 
 def _kg_webservice_post(service: str, method: str, payload: dict) -> dict | None:
+    data, _dbg = _kg_webservice_post_debug(service, method, payload)
+    return data
+
+
+def _kg_webservice_post_debug(service: str, method: str, payload: dict) -> tuple[dict | None, dict]:
     base = str(KG_GAME_API_BASE or "").strip().rstrip("/")
     if not base:
-        return None
+        return None, {"ok": False, "reason": "no_base_url"}
     url = f"{base}/WebService/{service}.asmx/{method}"
     body = json.dumps(payload or {}).encode("utf-8")
     headers = {
@@ -859,6 +864,7 @@ def _kg_webservice_post(service: str, method: str, payload: dict) -> dict | None
         "Content-Type": "application/json",
         "User-Agent": "kg2bot/1.0",
         "World-Id": str(max(1, int(KG_GAME_WORLD_ID or 1))),
+        "world-id": str(max(1, int(KG_GAME_WORLD_ID or 1))),
         "Origin": "https://kingdomgame.net",
         "Referer": "https://kingdomgame.net/",
     }
@@ -868,16 +874,31 @@ def _kg_webservice_post(service: str, method: str, payload: dict) -> dict | None
         req = urllib.request.Request(url, data=body, method="POST", headers=headers)
         with urllib.request.urlopen(req, timeout=max(1.0, float(KG_GAME_API_TIMEOUT))) as resp:
             text = resp.read().decode("utf-8", errors="replace")
-            return _decode_kg_asmx_response(text)
+            parsed = _decode_kg_asmx_response(text)
+            dbg = {
+                "ok": bool(parsed is not None),
+                "status": int(getattr(resp, "status", 0) or 0),
+                "body_preview": (text or "")[:220],
+                "reason": "ok" if parsed is not None else "decode_failed",
+            }
+            return parsed, dbg
     except urllib.error.HTTPError as e:
         try:
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             err_body = ""
         logging.debug("KG webservice %s/%s failed: %s %s", service, method, e.code, err_body[:200])
-        return None
+        return None, {
+            "ok": False,
+            "status": int(getattr(e, "code", 0) or 0),
+            "reason": "http_error",
+            "body_preview": (err_body or "")[:220],
+        }
     except Exception:
-        return None
+        return None, {
+            "ok": False,
+            "reason": "request_exception",
+        }
 
 
 def _kg_extract_auth_credentials(login_payload: dict) -> tuple[int | None, str]:
@@ -2503,7 +2524,8 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                 # Some clients include this; harmless if ignored server-side.
                 "worldId": int(KG_GAME_WORLD_ID or 1),
             }
-            data = _kg_webservice_post("Kingdoms", "GetKingdomRankings", payload) or {}
+            data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", payload)
+            data = data or {}
             rows = _kg_extract_rankings_rows(data)
             norm = _kg_normalize_rankings_rows(rows)
             ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
@@ -2516,6 +2538,9 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                 "return_value": ret_val,
                 "return_string": ret_str,
                 "keys": keys,
+                "http_status": req_dbg.get("status"),
+                "http_reason": req_dbg.get("reason"),
+                "body_preview": str(req_dbg.get("body_preview") or "")[:180],
             })
             if norm:
                 meta["auth_mode"] = str(auth_row.get("auth_mode") or "none")
