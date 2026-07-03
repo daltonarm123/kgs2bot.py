@@ -73,7 +73,7 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-03.1"
+BOT_VERSION = "2026-07-03.2"
 PATCH_NOTES = [
     "Added NW jump alert monitoring from Kingdom rankings (GetKingdomRankings polling loop).",
     "New !nwjumpalerts command: status, on [threshold], off (server-level subscription).",
@@ -2541,6 +2541,9 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                 "http_status": req_dbg.get("status"),
                 "http_reason": req_dbg.get("reason"),
                 "body_preview": str(req_dbg.get("body_preview") or "")[:180],
+                "sent_account_id": payload.get("accountId"),
+                "sent_kingdom_id": payload.get("kingdomId"),
+                "sent_fields": ",".join(sorted(payload.keys())),
             })
             if norm:
                 meta["auth_mode"] = str(auth_row.get("auth_mode") or "none")
@@ -6295,6 +6298,7 @@ async def nwjumppulltest(ctx):
 
         lines = [
             "🧪 **NW Jump Pull Test**",
+            f"Bot version: `{BOT_VERSION}`",
             f"Rows pulled: `{len(rows)}`",
             f"Auth mode: `{dbg.get('auth_mode') or 'n/a'}`",
             f"Configured continent: `{dbg.get('configured_continent_id')}` | used: `{dbg.get('continent_id_used', 'n/a')}`",
