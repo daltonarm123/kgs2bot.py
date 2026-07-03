@@ -2887,8 +2887,10 @@ def _build_nw_jump_sms_text(events: list[dict]) -> str:
     top = list(events or [])[:5]
     sms_lines = [f"KG2 NW jump alert ({len(events or [])} hits)"]
     for e in top:
+        delta_v = int(e.get("delta") or 0)
+        sign = "+" if delta_v >= 0 else "-"
         sms_lines.append(
-            f"{e.get('kingdom_name')}: +{fmt_int(e.get('delta'))} ({fmt_int(e.get('old_networth'))}->{fmt_int(e.get('new_networth'))})"
+            f"{e.get('kingdom_name')}: {sign}{fmt_int(abs(delta_v))} ({fmt_int(e.get('old_networth'))}->{fmt_int(e.get('new_networth'))})"
         )
     if len(events or []) > len(top):
         sms_lines.append(f"+{len(events) - len(top)} more")
@@ -3011,7 +3013,7 @@ def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_thres
             if old_nw is None or new_nw is None:
                 continue
             delta = int(new_nw) - int(old_nw)
-            if delta >= threshold:
+            if abs(delta) >= threshold:
                 events.append({
                     "kingdom_id": kid,
                     "kingdom_name": str(current.get("kingdom_name") or old.get("kingdom_name") or f"Kingdom #{kid}"),
@@ -3071,19 +3073,21 @@ async def send_nw_jump_alerts(events: list[dict]):
         if not sub:
             continue
         min_jump = max(1, int(sub.get("min_jump") or NW_JUMP_ALERT_DEFAULT_THRESHOLD))
-        hits = [e for e in events if int(e.get("delta") or 0) >= min_jump]
+        hits = [e for e in events if abs(int(e.get("delta") or 0)) >= min_jump]
         if not hits:
             continue
 
         lines = [f"🚨 **NW Jump Alert** (threshold: `{fmt_int(min_jump)}`)"]
         for e in hits[:12]:
+            delta_v = int(e.get("delta") or 0)
+            sign = "+" if delta_v >= 0 else "-"
             old_rank = _safe_int_or_none(e.get("old_rank"))
             new_rank = _safe_int_or_none(e.get("new_rank"))
             rank_part = ""
             if old_rank and new_rank:
                 rank_part = f" • rank {old_rank} → {new_rank}"
             lines.append(
-                f"- **{e.get('kingdom_name')}** +`{fmt_int(e.get('delta'))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))}){rank_part}"
+                f"- **{e.get('kingdom_name')}** {sign}`{fmt_int(abs(delta_v))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))}){rank_part}"
             )
         extra = len(hits) - 12
         if extra > 0:
