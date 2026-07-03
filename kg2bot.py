@@ -165,6 +165,8 @@ KG_GAME_WEB_COOKIE = _env_text("KG_GAME_WEB_COOKIE", "")
 KG_GAME_AUTH_CACHE_SECONDS = _env_int("KG_GAME_AUTH_CACHE_SECONDS", 1800)
 KG_GAME_SEARCH_KINGDOM_ID = _env_int("KG_GAME_SEARCH_KINGDOM_ID", 0)
 KG_GAME_RANKINGS_CONTINENT_ID = _env_int("KG_GAME_RANKINGS_CONTINENT_ID", -1)
+KG_GAME_RANKINGS_PAGE_SIZE = max(1, _env_int("KG_GAME_RANKINGS_PAGE_SIZE", 20))
+KG_GAME_RANKINGS_TARGET_ROWS = max(1, _env_int("KG_GAME_RANKINGS_TARGET_ROWS", 100))
 KG_REPORT_DEFAULT_TZ = _env_text("KG_REPORT_DEFAULT_TZ", "UTC")
 KG_REPORT_MAX_FUTURE_MINUTES = _env_int("KG_REPORT_MAX_FUTURE_MINUTES", 10)
 KG_REPORT_AUTO_INFER_TZ = _env_bool("KG_REPORT_AUTO_INFER_TZ", True)
@@ -2516,11 +2518,22 @@ def _kg_normalize_rankings_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
+def _kg_sort_normalized_rankings_rows(rows: list[dict]) -> list[dict]:
+    out = [dict(r) for r in (rows or []) if isinstance(r, dict)]
+    out.sort(key=lambda x: (x.get("rank") is None, int(x.get("rank") or 10**9), -int(x.get("networth") or 0), str(x.get("kingdom_name") or "")))
+    for i, row in enumerate(out, start=1):
+        if not row.get("rank"):
+            row["rank"] = i
+    return out
+
+
 def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
     meta = {
         "auth_mode": "none",
         "attempts": [],
         "configured_continent_id": int(KG_GAME_RANKINGS_CONTINENT_ID or -1),
+        "target_rows": int(KG_GAME_RANKINGS_TARGET_ROWS or 100),
+        "page_size": int(KG_GAME_RANKINGS_PAGE_SIZE or 20),
     }
 
     auth = _kg_get_auth(force_refresh=False)
@@ -2568,31 +2581,73 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                 }),
             ]
 
+        page_size = max(1, int(KG_GAME_RANKINGS_PAGE_SIZE or 20))
+        target_rows = max(page_size, int(KG_GAME_RANKINGS_TARGET_ROWS or 100))
+
         for cont_id in ordered:
             for variant_name, payload in _variants(cont_id):
-                data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", payload)
-                data = data or {}
-                rows = _kg_extract_rankings_rows(data)
-                norm = _kg_normalize_rankings_rows(rows)
-                ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
-                ret_str = str(_dict_pick(data, "ReturnString", "returnString") or "").strip()
-                keys = ",".join(sorted([str(k) for k in data.keys()])[:10]) if isinstance(data, dict) else ""
-                meta["attempts"].append({
-                    "label": label,
-                    "variant": variant_name,
-                    "continent_id": int(cont_id),
-                    "rows": int(len(norm or [])),
-                    "http_status": req_dbg.get("status"),
-                    "http_reason": req_dbg.get("reason"),
-                    "body_preview": str(req_dbg.get("body_preview") or "")[:120],
-                })
-                if norm:
+                start_seed = _safe_int_or_none(payload.get("startNumber"))
+                start_numbers = [None]
+                if start_seed is not None:
+                    pages = max(1, ceil(float(target_rows) / float(page_size)))
+                    start_numbers = [int(start_seed + (i * page_size)) for i in range(pages)]
+
+                merged_by_kingdom = {}
+                ret_val = None
+                ret_str = ""
+                for start_number in start_numbers:
+                    req_payload = dict(payload)
+                    if start_number is None:
+                        req_payload.pop("startNumber", None)
+                    else:
+                        req_payload["startNumber"] = int(start_number)
+
+                    data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", req_payload)
+                    data = data or {}
+                    rows = _kg_extract_rankings_rows(data)
+                    norm = _kg_normalize_rankings_rows(rows)
+                    if ret_val is None:
+                        ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
+                        ret_str = str(_dict_pick(data, "ReturnString", "returnString") or "").strip()
+                    meta["attempts"].append({
+                        "label": label,
+                        "variant": variant_name,
+                        "continent_id": int(cont_id),
+                        "start_number": start_number,
+                        "rows": int(len(norm or [])),
+                        "http_status": req_dbg.get("status"),
+                        "http_reason": req_dbg.get("reason"),
+                        "body_preview": str(req_dbg.get("body_preview") or "")[:120],
+                    })
+
+                    for row in norm:
+                        kid2 = int(row.get("kingdom_id") or 0)
+                        if kid2 <= 0:
+                            continue
+                        prev = merged_by_kingdom.get(kid2)
+                        if prev is None:
+                            merged_by_kingdom[kid2] = row
+                            continue
+                        prev_rank = _safe_int_or_none(prev.get("rank"))
+                        new_rank = _safe_int_or_none(row.get("rank"))
+                        if prev_rank is None and new_rank is not None:
+                            merged_by_kingdom[kid2] = row
+                        elif prev_rank is not None and new_rank is not None and new_rank < prev_rank:
+                            merged_by_kingdom[kid2] = row
+
+                    if not norm:
+                        break
+
+                merged = _kg_sort_normalized_rankings_rows(list(merged_by_kingdom.values()))
+                if merged:
+                    merged = merged[:target_rows]
                     meta["auth_mode"] = str(auth_row.get("auth_mode") or "none")
                     meta["continent_id_used"] = int(cont_id)
                     meta["variant_used"] = variant_name
                     meta["return_value"] = ret_val
                     meta["return_string"] = ret_str
-                    return norm
+                    meta["rows_collected"] = int(len(merged))
+                    return merged
         return []
 
     rows = _attempt_with_auth(auth, "cached_auth")
