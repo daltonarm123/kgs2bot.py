@@ -5960,6 +5960,7 @@ async def help_cmd(ctx):
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
             "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
+            "`!nwjumppulltest` - Admin: pull rankings now and print top sample rows",
             "`!whereupdates` - Show configured target server/channel + bot send permissions",
             "`!battle <kingdom>` - Estimate current home troops (available when troop tracking is enabled)",
             "`!track` - Daily attack tracker for today (UTC) + TSV export",
@@ -6156,6 +6157,47 @@ async def nwjumpcheck(ctx):
         await ctx.send("⚠️ nwjumpcheck failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"nwjumpcheck error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumppulltest")
+async def nwjumppulltest(ctx):
+    """Admin-only: perform a live rankings pull and print top rows + API attempts."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+        if ctx.guild and not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
+        attempts = dbg.get("attempts") or []
+        top = rows[:10]
+
+        lines = [
+            "🧪 **NW Jump Pull Test**",
+            f"Rows pulled: `{len(rows)}`",
+            f"Auth mode: `{dbg.get('auth_mode') or 'n/a'}`",
+            f"Configured continent: `{dbg.get('configured_continent_id')}` | used: `{dbg.get('continent_id_used', 'n/a')}`",
+            f"ReturnValue: `{dbg.get('return_value', 'n/a')}` | ReturnString: `{dbg.get('return_string', 'n/a')}`",
+        ]
+
+        if top:
+            lines.append("Top sample rows:")
+            for r in top:
+                lines.append(
+                    f"- #{int(r.get('rank') or 0)} {r.get('kingdom_name')} (id {int(r.get('kingdom_id') or 0)}) NW {fmt_int(r.get('networth'))}"
+                )
+        else:
+            lines.append("Top sample rows: (none)")
+
+        if attempts:
+            lines.append(f"Attempts: `{json.dumps(attempts)[:1200]}`")
+
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumppulltest failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumppulltest error: {e}", tb=tb)
 
 
 @bot.command(name="whereupdates")
