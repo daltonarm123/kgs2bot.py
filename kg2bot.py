@@ -6296,6 +6296,73 @@ async def nwjumpcheck(ctx):
             await send_error(ctx.guild, f"nwjumpcheck error: {e}", tb=tb)
 
 
+@bot.command(name="kgauthtest")
+async def kgauthtest(ctx):
+    """Admin-only: probe KG login + a known-good authenticated endpoint to isolate auth vs endpoint issues."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+
+        def _probe() -> dict:
+            out = {}
+            # 1) Login with email/password
+            login_data, login_dbg = _kg_webservice_post_debug(
+                "User", "Login", {"email": KG_GAME_EMAIL, "password": KG_GAME_PASSWORD}
+            )
+            login_data = login_data or {}
+            acct, tok = _kg_extract_auth_credentials(login_data)
+            out["login_status"] = login_dbg.get("status")
+            out["login_reason"] = login_dbg.get("reason")
+            out["login_body"] = str(login_dbg.get("body_preview") or "")[:160]
+            out["login_account_id"] = acct
+            out["login_token_len"] = len(tok or "")
+
+            # Decide which auth to use for endpoint probes
+            account_id = acct or _safe_int_or_none(KG_GAME_ACCOUNT_ID)
+            token = tok or str(KG_GAME_TOKEN or "")
+            kid = _safe_int_or_none(KG_GAME_TOKEN_KINGDOM_ID) or 0
+            out["used_account_id"] = account_id
+            out["used_token_len"] = len(token or "")
+            out["used_kingdom_id"] = kid
+
+            # 2) SearchByName (known-good authenticated endpoint)
+            search_data, search_dbg = _kg_webservice_post_debug(
+                "Kingdoms", "SearchByName",
+                {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "searchTerm": "a"},
+            )
+            out["search_status"] = search_dbg.get("status")
+            out["search_reason"] = search_dbg.get("reason")
+            out["search_body"] = str(search_dbg.get("body_preview") or "")[:160]
+
+            # 3) GetKingdomRankings with same auth
+            rank_data, rank_dbg = _kg_webservice_post_debug(
+                "Kingdoms", "GetKingdomRankings",
+                {"accountId": str(account_id or 0), "token": token, "kingdomId": int(kid or 0), "continentId": -1, "startingRank": 0},
+            )
+            out["rank_status"] = rank_dbg.get("status")
+            out["rank_reason"] = rank_dbg.get("reason")
+            out["rank_body"] = str(rank_dbg.get("body_preview") or "")[:160]
+            return out
+
+        r = await asyncio.to_thread(_probe)
+        lines = [
+            "🔐 **KG Auth Test**",
+            f"Login: status=`{r.get('login_status')}` reason=`{r.get('login_reason')}` accountId=`{r.get('login_account_id')}` tokenLen=`{r.get('login_token_len')}`",
+            f"Login body: `{r.get('login_body')}`",
+            f"Using: accountId=`{r.get('used_account_id')}` tokenLen=`{r.get('used_token_len')}` kingdomId=`{r.get('used_kingdom_id')}`",
+            f"SearchByName: status=`{r.get('search_status')}` reason=`{r.get('search_reason')}`",
+            f"Search body: `{r.get('search_body')}`",
+            f"GetKingdomRankings: status=`{r.get('rank_status')}` reason=`{r.get('rank_reason')}`",
+            f"Rank body: `{r.get('rank_body')}`",
+        ]
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ kgauthtest failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"kgauthtest error: {e}", tb=tb)
+
+
 @bot.command(name="nwjumppulltest")
 async def nwjumppulltest(ctx):
     """Admin-only: perform a live rankings pull and print top rows + API attempts."""
