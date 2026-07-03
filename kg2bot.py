@@ -2201,6 +2201,16 @@ def init_db():
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS nw_jump_alert_channels (
+            guild_id BIGINT NOT NULL,
+            channel_id BIGINT NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (guild_id, channel_id)
+        );
+        """)
+
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
             SELECT column_name, is_nullable
@@ -2364,6 +2374,10 @@ def init_db():
             CREATE INDEX IF NOT EXISTS nw_jump_alert_subscriptions_enabled_idx
             ON nw_jump_alert_subscriptions (enabled, updated_at DESC);
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS nw_jump_alert_channels_enabled_idx
+            ON nw_jump_alert_channels (guild_id, enabled, updated_at DESC);
+        """)
 
 
 def heal_sequences():
@@ -2414,34 +2428,78 @@ def _kg_normalize_rankings_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
-def fetch_world_kingdom_rankings() -> list[dict]:
+def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
+    meta = {
+        "auth_mode": "none",
+        "attempts": [],
+        "configured_continent_id": int(KG_GAME_RANKINGS_CONTINENT_ID or -1),
+    }
+
     auth = _kg_get_auth(force_refresh=False)
     if not auth:
+        meta["error"] = "missing_auth"
+        return [], meta
+
+    def _attempt_with_auth(auth_row: dict, label: str):
+        continent_candidates = [int(KG_GAME_RANKINGS_CONTINENT_ID or -1), 1, -1]
+        seen = set()
+        ordered = []
+        for c in continent_candidates:
+            if c in seen:
+                continue
+            seen.add(c)
+            ordered.append(c)
+
+        for cont_id in ordered:
+            payload = {
+                "accountId": int(auth_row.get("account_id") or 0),
+                "token": str(auth_row.get("token") or ""),
+                "kingdomId": int(auth_row.get("search_kingdom_id") or 0),
+                "continentId": int(cont_id),
+                # Some clients include this; harmless if ignored server-side.
+                "worldId": int(KG_GAME_WORLD_ID or 1),
+            }
+            data = _kg_webservice_post("Kingdoms", "GetKingdomRankings", payload) or {}
+            rows = _kg_extract_rankings_rows(data)
+            norm = _kg_normalize_rankings_rows(rows)
+            ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
+            ret_str = str(_dict_pick(data, "ReturnString", "returnString") or "").strip()
+            keys = ",".join(sorted([str(k) for k in data.keys()])[:10]) if isinstance(data, dict) else ""
+            meta["attempts"].append({
+                "label": label,
+                "continent_id": int(cont_id),
+                "rows": int(len(norm or [])),
+                "return_value": ret_val,
+                "return_string": ret_str,
+                "keys": keys,
+            })
+            if norm:
+                meta["auth_mode"] = str(auth_row.get("auth_mode") or "none")
+                meta["continent_id_used"] = int(cont_id)
+                meta["return_value"] = ret_val
+                meta["return_string"] = ret_str
+                return norm
         return []
-    payload = {
-        "accountId": int(auth.get("account_id") or 0),
-        "token": str(auth.get("token") or ""),
-        "kingdomId": int(auth.get("search_kingdom_id") or 0),
-        "continentId": int(KG_GAME_RANKINGS_CONTINENT_ID or -1),
-    }
-    data = _kg_webservice_post("Kingdoms", "GetKingdomRankings", payload) or {}
-    rows = _kg_extract_rankings_rows(data)
-    norm = _kg_normalize_rankings_rows(rows)
-    if norm:
-        return norm
+
+    rows = _attempt_with_auth(auth, "cached_auth")
+    if rows:
+        return rows, meta
 
     # Retry once with refreshed auth in case token expired.
     auth = _kg_get_auth(force_refresh=True)
     if not auth:
-        return []
-    payload.update({
-        "accountId": int(auth.get("account_id") or 0),
-        "token": str(auth.get("token") or ""),
-        "kingdomId": int(auth.get("search_kingdom_id") or 0),
-    })
-    data = _kg_webservice_post("Kingdoms", "GetKingdomRankings", payload) or {}
-    rows = _kg_extract_rankings_rows(data)
-    return _kg_normalize_rankings_rows(rows)
+        meta["error"] = "missing_auth_after_refresh"
+        return [], meta
+    rows = _attempt_with_auth(auth, "refreshed_auth")
+    if rows:
+        return rows, meta
+    meta["auth_mode"] = str(auth.get("auth_mode") or "none")
+    return [], meta
+
+
+def fetch_world_kingdom_rankings() -> list[dict]:
+    rows, _meta = fetch_world_kingdom_rankings_debug()
+    return rows
 
 
 def sync_upsert_nw_jump_subscription(guild_id: int, channel_id: int, min_jump: int, enabled: bool):
@@ -2458,6 +2516,46 @@ def sync_upsert_nw_jump_subscription(guild_id: int, channel_id: int, min_jump: i
             """,
             (int(guild_id), int(channel_id), max(1, int(min_jump)), bool(enabled), now_utc()),
         )
+
+
+def sync_add_nw_jump_channel(guild_id: int, channel_id: int):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nw_jump_alert_channels (guild_id, channel_id, enabled, updated_at)
+            VALUES (%s, %s, TRUE, %s)
+            ON CONFLICT (guild_id, channel_id) DO UPDATE
+            SET enabled=TRUE, updated_at=EXCLUDED.updated_at;
+            """,
+            (int(guild_id), int(channel_id), now_utc()),
+        )
+
+
+def sync_remove_nw_jump_channel(guild_id: int, channel_id: int) -> int:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE nw_jump_alert_channels
+            SET enabled=FALSE, updated_at=%s
+            WHERE guild_id=%s AND channel_id=%s;
+            """,
+            (now_utc(), int(guild_id), int(channel_id)),
+        )
+        return int(cur.rowcount or 0)
+
+
+def sync_get_nw_jump_channels(guild_id: int) -> list[int]:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT channel_id
+            FROM nw_jump_alert_channels
+            WHERE guild_id=%s AND enabled=TRUE
+            ORDER BY channel_id ASC;
+            """,
+            (int(guild_id),),
+        )
+        return [int(r.get("channel_id") or 0) for r in (cur.fetchall() or []) if int(r.get("channel_id") or 0) > 0]
 
 
 def sync_get_nw_jump_subscription(guild_id: int):
@@ -2491,9 +2589,16 @@ def sync_get_enabled_nw_jump_subscriptions() -> list[dict]:
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT guild_id, channel_id, min_jump, enabled
-            FROM nw_jump_alert_subscriptions
-            WHERE enabled=TRUE;
+            SELECT
+                s.guild_id,
+                s.channel_id,
+                s.min_jump,
+                s.enabled,
+                COALESCE(array_agg(c.channel_id) FILTER (WHERE c.enabled=TRUE), '{}') AS extra_channel_ids
+            FROM nw_jump_alert_subscriptions s
+            LEFT JOIN nw_jump_alert_channels c ON c.guild_id=s.guild_id
+            WHERE s.enabled=TRUE
+            GROUP BY s.guild_id, s.channel_id, s.min_jump, s.enabled;
             """
         )
         return cur.fetchall() or []
@@ -2707,13 +2812,6 @@ async def send_nw_jump_alerts(events: list[dict]):
         if not hits:
             continue
 
-        cid = int(sub.get("channel_id") or 0)
-        ch = guild.get_channel(cid) if cid > 0 else None
-        if not (ch and can_send(ch, guild)):
-            ch = get_live_battle_channel(guild, None)
-        if not (ch and can_send(ch, guild)):
-            continue
-
         lines = [f"🚨 **NW Jump Alert** (threshold: `{fmt_int(min_jump)}`)"]
         for e in hits[:12]:
             old_rank = _safe_int_or_none(e.get("old_rank"))
@@ -2728,10 +2826,43 @@ async def send_nw_jump_alerts(events: list[dict]):
         if extra > 0:
             lines.append(f"... +{extra} more")
 
-        try:
-            await ch.send("\n".join(lines))
-        except Exception:
-            logging.exception("Failed to send NW jump alert to guild=%s channel=%s", guild.id, cid)
+        target_ids = []
+        primary_id = int(sub.get("channel_id") or 0)
+        if primary_id > 0:
+            target_ids.append(primary_id)
+        for c in (sub.get("extra_channel_ids") or []):
+            try:
+                cid = int(c)
+                if cid > 0:
+                    target_ids.append(cid)
+            except Exception:
+                continue
+        dedup_ids = []
+        seen = set()
+        for cid in target_ids:
+            if cid in seen:
+                continue
+            seen.add(cid)
+            dedup_ids.append(cid)
+
+        sent_any = False
+        for cid in dedup_ids:
+            ch = guild.get_channel(int(cid))
+            if not (ch and can_send(ch, guild)):
+                continue
+            try:
+                await ch.send("\n".join(lines))
+                sent_any = True
+            except Exception:
+                logging.exception("Failed to send NW jump alert to guild=%s channel=%s", guild.id, cid)
+
+        if not sent_any:
+            ch = get_live_battle_channel(guild, None)
+            if ch and can_send(ch, guild):
+                try:
+                    await ch.send("\n".join(lines))
+                except Exception:
+                    logging.exception("Failed to send NW jump alert to fallback channel guild=%s", guild.id)
 
     if _twilio_sms_configured():
         top = events[:5]
@@ -2756,9 +2887,13 @@ async def nw_jump_alerts_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            rows = await asyncio.to_thread(fetch_world_kingdom_rankings)
+            rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
             await run_db(sync_meta_set, "nw_jump_last_poll_ts", str(int(time.time())))
             await run_db(sync_meta_set, "nw_jump_last_poll_rows", str(len(rows or [])))
+            await run_db(sync_meta_set, "nw_jump_last_auth_mode", str(dbg.get("auth_mode") or ""))
+            await run_db(sync_meta_set, "nw_jump_last_return_value", str(dbg.get("return_value") or ""))
+            await run_db(sync_meta_set, "nw_jump_last_return_string", str(dbg.get("return_string") or ""))
+            await run_db(sync_meta_set, "nw_jump_last_attempts", json.dumps(dbg.get("attempts") or []))
             if rows:
                 events = await run_db(
                     sync_detect_rankings_nw_jumps,
@@ -5821,6 +5956,8 @@ async def help_cmd(ctx):
             "`!supply <kingdom> [days]` - Premium: show supplier kingdoms from market transactions + TSV",
             "`!nwjumpalerts status` - Show NW jump alert config for this server",
             "`!nwjumpalerts on [threshold]` - Admin: enable NW jump alerts in this channel (default threshold 5000)",
+            "`!nwjumpalerts addhere` - Admin: add current room to NW jump alert fanout",
+            "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
             "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
             "`!whereupdates` - Show configured target server/channel + bot send permissions",
@@ -5855,7 +5992,7 @@ async def help_cmd(ctx):
 
 
 @bot.command(name="nwjumpalerts")
-async def nwjumpalerts(ctx, action: str = "status", threshold: str = ""):
+async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
     """
     Configure per-server NW jump alerts sourced from GetKingdomRankings.
     Usage:
@@ -5882,13 +6019,30 @@ async def nwjumpalerts(ctx, action: str = "status", threshold: str = ""):
             enabled = bool(row.get("enabled"))
             cid = int(row.get("channel_id") or 0)
             threshold_v = max(1, int(row.get("min_jump") or NW_JUMP_ALERT_DEFAULT_THRESHOLD))
+            extra_channels = await run_db(sync_get_nw_jump_channels, guild_id)
             ch_text = f"<#{cid}>" if cid > 0 else "(unknown channel)"
             state = "enabled" if enabled else "disabled"
+            extra_txt = ", ".join([f"<#{int(x)}>" for x in extra_channels]) if extra_channels else "(none)"
             return await ctx.send(
                 f"📡 NW jump alerts are **{state}** for this server.\n"
                 f"Channel: {ch_text}\n"
-                f"Threshold: `{fmt_int(threshold_v)}`"
+                f"Threshold: `{fmt_int(threshold_v)}`\n"
+                f"Fanout rooms: {extra_txt}"
             )
+
+        if action_norm == "addhere":
+            if not _is_admin(ctx):
+                return await ctx.send("❌ You don’t have permission to use this command.")
+            await run_db(sync_add_nw_jump_channel, guild_id, int(ctx.channel.id))
+            return await ctx.send(f"✅ Added {ctx.channel.mention} to NW jump alert fanout rooms.")
+
+        if action_norm == "removehere":
+            if not _is_admin(ctx):
+                return await ctx.send("❌ You don’t have permission to use this command.")
+            changed = await run_db(sync_remove_nw_jump_channel, guild_id, int(ctx.channel.id))
+            if changed <= 0:
+                return await ctx.send("ℹ️ This room was not in the NW jump fanout list.")
+            return await ctx.send(f"🛑 Removed {ctx.channel.mention} from NW jump alert fanout rooms.")
 
         if action_norm == "off":
             if not _is_admin(ctx):
@@ -5901,7 +6055,7 @@ async def nwjumpalerts(ctx, action: str = "status", threshold: str = ""):
         if action_norm == "on":
             if not _is_admin(ctx):
                 return await ctx.send("❌ You don’t have permission to use this command.")
-            min_jump = _safe_int_or_none(threshold)
+            min_jump = _safe_int_or_none(arg)
             if min_jump is None:
                 min_jump = int(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000)
             min_jump = max(1, int(min_jump))
@@ -5912,12 +6066,16 @@ async def nwjumpalerts(ctx, action: str = "status", threshold: str = ""):
                 min_jump,
                 True,
             )
+            await run_db(sync_add_nw_jump_channel, guild_id, int(ctx.channel.id))
             return await ctx.send(
                 f"✅ NW jump alerts enabled in {ctx.channel.mention} with threshold `{fmt_int(min_jump)}`.\n"
                 "Alerts trigger when a kingdom gains at least this much net worth between ranking polls."
             )
 
-        return await ctx.send("Usage: `!nwjumpalerts status` | `!nwjumpalerts on [threshold]` | `!nwjumpalerts off`")
+        return await ctx.send(
+            "Usage: `!nwjumpalerts status` | `!nwjumpalerts on [threshold]` | "
+            "`!nwjumpalerts addhere` | `!nwjumpalerts removehere` | `!nwjumpalerts off`"
+        )
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -5935,7 +6093,7 @@ async def nwjumpcheck(ctx):
         if ctx.guild and not is_target_guild(ctx.guild):
             return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
 
-        rows = await asyncio.to_thread(fetch_world_kingdom_rankings)
+        rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
         world_id = int(KG_GAME_WORLD_ID or 1)
         stats = await run_db(sync_get_nw_rankings_state_stats, world_id)
 
@@ -5944,8 +6102,13 @@ async def nwjumpcheck(ctx):
         ev_last = await run_db(sync_meta_get, "nw_jump_last_events")
         ok_ts = await run_db(sync_meta_get, "nw_jump_last_ok_ts")
         err_ts = await run_db(sync_meta_get, "nw_jump_last_error_ts")
+        last_auth_mode = await run_db(sync_meta_get, "nw_jump_last_auth_mode")
+        last_return_value = await run_db(sync_meta_get, "nw_jump_last_return_value")
+        last_return_string = await run_db(sync_meta_get, "nw_jump_last_return_string")
+        last_attempts = await run_db(sync_meta_get, "nw_jump_last_attempts")
 
         sub = await run_db(sync_get_nw_jump_subscription, int(ctx.guild.id)) if ctx.guild else None
+        fanout = await run_db(sync_get_nw_jump_channels, int(ctx.guild.id)) if ctx.guild else []
         sms_recipients = _get_alert_sms_recipients()
 
         auth = await asyncio.to_thread(_kg_get_auth, False)
@@ -5959,12 +6122,18 @@ async def nwjumpcheck(ctx):
             f"Baseline rows in DB: `{fmt_int(stats.get('count'))}` | Last baseline update: `{stats.get('last_updated') or 'never'}`",
             f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last events: `{ev_last or 'n/a'}`",
             f"Loop last ok ts: `{ok_ts or 'n/a'}` | last error ts: `{err_ts or 'n/a'}`",
+            f"Last API mode: `{last_auth_mode or 'n/a'}` | ReturnValue: `{last_return_value or 'n/a'}` | ReturnString: `{last_return_string or 'n/a'}`",
+            f"This check attempts: `{json.dumps(dbg.get('attempts') or [])[:900]}`",
         ]
 
         if sub:
             lines.append(
                 f"Guild subscription: `enabled={bool(sub.get('enabled'))}` channel=<#{int(sub.get('channel_id') or 0)}> threshold=`{fmt_int(sub.get('min_jump'))}`"
             )
+            if fanout:
+                lines.append("Fanout rooms: " + ", ".join([f"<#{int(x)}>" for x in fanout]))
+            else:
+                lines.append("Fanout rooms: (none)")
         else:
             lines.append("Guild subscription: `not configured` (run `!nwjumpalerts on 5000`)")
 
