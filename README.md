@@ -1,4 +1,8 @@
-KG2 Recon Bot is a Discord tool for your game that:
+# KG2 Recon Bot
+
+KG2 Recon Bot is a Discord worker for KingdomGame recon, planning, and alerts.
+
+## What It Does
 
 Auto-captures spy reports when players paste them in chat and saves them into a database.
 
@@ -56,6 +60,46 @@ Notes:
 - You must set ALERT_SMS_TWILIO_ACCOUNT_SID (starts with AC...).
 - Auth can be either ALERT_SMS_TWILIO_AUTH_TOKEN or ALERT_SMS_TWILIO_API_KEY_SID + ALERT_SMS_TWILIO_API_KEY_SECRET.
 - If ALERT_SMS_WATCHLIST is set, each phone only receives alerts for matching watched kingdoms (by exact name or kingdom ID).
+
+## Railway Deployment
+
+This repo includes [railway.json](railway.json) so Railway runs the bot as a worker with:
+
+```bash
+python kg2bot.py
+```
+
+Required Railway variables:
+
+```text
+DISCORD_TOKEN=...
+DATABASE_URL=...
+```
+
+Recommended variables for this bot:
+
+```text
+TARGET_GUILD_ID=1405247393112395866
+UPDATES_CHANNEL_ID=...
+LIVE_BATTLE_CHANNEL_ID=...
+KG_REPORT_DEFAULT_TZ=UTC
+NW_JUMP_ALERTS_ENABLED=true
+```
+
+To link this checkout to the existing Railway project, run:
+
+```bash
+railway link
+railway status
+```
+
+Then deploy with:
+
+```bash
+railway up
+```
+
+The local `.railway/` folder is ignored because it contains machine-specific project link metadata. Configure secrets in Railway, not in git.
 
 ⚙️ How it works:
 

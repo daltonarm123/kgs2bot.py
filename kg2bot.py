@@ -4834,9 +4834,7 @@ async def on_ready():
     global NW_JUMP_ALERTS_LOOP_STARTED
 
     try:
-        await run_db(init_db_pool, 1, 10)
-        await run_db(init_db)
-        await run_db(heal_sequences)
+        await ensure_db_ready()
     except Exception:
         logging.exception("DB init failed")
 
@@ -6717,7 +6715,7 @@ async def whereupdates(ctx):
 
 @bot.command(name="refresh")
 async def refresh(ctx):
-    """Admin-only manual restart (Render will restart the service)."""
+    """Admin-only manual restart; the hosting platform will restart the worker."""
     try:
         if not _is_admin(ctx):
             return await ctx.send("❌ You don’t have permission to use this command.")
