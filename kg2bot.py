@@ -73,11 +73,11 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-04.1"
+BOT_VERSION = "2026-07-04.2"
 PATCH_NOTES = [
-    "Fixed !spy kingdom lookup so names with underscores, spaces, or dashes resolve to the same saved kingdom.",
-    "Fixed !spy, !spyhistory, and !spies returning the wrong report when a loose fuzzy match picked an unrelated kingdom.",
-    "Tightened fallback fuzzy matching so small typos still work without drifting to the wrong target.",
+    "Fixed !spy, !spyhistory, and !spies kingdom matching so separator variants resolve correctly and unrelated fuzzy matches do not pull the wrong report.",
+    "Fixed !help exceeding Discord's 2,000-character message limit by splitting the command list into multiple messages.",
+    "Updated !spy report summaries so the report date and time appear at the top of the output.",
 ]
 # -------------------------------------------------
 
