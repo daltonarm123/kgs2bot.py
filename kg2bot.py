@@ -1498,6 +1498,8 @@ def build_spy_text_report(row) -> tuple[str, str]:
     spies_lost = details.get("spies_lost")
     spy_result = details.get("result") or "N/A"
     net_worth = details.get("net_worth")
+    captured_at = row.get("created_at")
+    captured_txt = str(captured_at).replace("T", " ").split(".", 1)[0] if captured_at else "Unknown"
 
     dp = int(row.get("defense_power") or 0) if row.get("defense_power") is not None else 0
     castles = int(row.get("castles") or 0)
@@ -1509,6 +1511,7 @@ def build_spy_text_report(row) -> tuple[str, str]:
     cav_to_counter_pike = (4 * enemy_pike) + 1 if enemy_pike > 0 else 0
 
     lines = [
+        f"Report Date/Time: {captured_txt}",
         f"Kingdom: {kingdom}",
         f"Alliance: {alliance}",
         f"Spies Sent/Lost/Result: {fmt_int(spies_sent)} / {fmt_int(spies_lost)} / {spy_result}",
@@ -1519,7 +1522,7 @@ def build_spy_text_report(row) -> tuple[str, str]:
         f"Enemy Pike (parsed): {fmt_int(enemy_pike)}",
         f"Pike to send (1/4 cav + 1): {fmt_int(pike_to_send)}",
         f"Cav to counter enemy pike (4x enemy pike + 1): {fmt_int(cav_to_counter_pike)}",
-        f"Report ID: {row.get('id')} | Captured: {row.get('created_at')}",
+        f"Report ID: {row.get('id')}",
     ]
     return "\n".join(lines), text
 
