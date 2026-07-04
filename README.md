@@ -26,7 +26,7 @@ The bot can poll KingdomGame rankings and alert your Discord when a kingdom gain
 
 Oven/training inference:
 
-When the bot has at least two recent SR troop snapshots for a kingdom, it can compare missing Peasants/Population against a NW jump and estimate likely troops in training.
+When the bot has at least two recent SR reports for a kingdom, it can compare missing Peasants/Population against a NW jump and estimate likely troops in training. It uses the report Date/Received timestamp when present, so stale reports pasted later do not count as fresh oven data.
 
 Command usage:
 
@@ -44,20 +44,27 @@ OVEN_ESTIMATOR_ENABLED=true
 OVEN_LOOKBACK_HOURS=36
 OVEN_MAX_ALERT_LINES=3
 OVEN_LIGHT_CAVALRY_PEASANTS=1
-OVEN_LIGHT_CAVALRY_NW=0.25
+OVEN_LIGHT_CAVALRY_NW=0.50
 OVEN_LIGHT_CAVALRY_MINUTES_PER_1000=90
 OVEN_PIKEMEN_PEASANTS=1
-OVEN_PIKEMEN_NW=0.25
+OVEN_PIKEMEN_NW=0.50
+OVEN_ARCHERS_PEASANTS=1
+OVEN_ARCHERS_NW=0.50
+OVEN_CROSSBOWMEN_PEASANTS=1
+OVEN_CROSSBOWMEN_NW=0.38
 OVEN_FOOTMEN_PEASANTS=1
-OVEN_FOOTMEN_NW=0.10
+OVEN_FOOTMEN_NW=0.38
 OVEN_HEAVY_CAVALRY_PEASANTS=1
-OVEN_HEAVY_CAVALRY_NW=0.40
+OVEN_HEAVY_CAVALRY_NW=0.63
 OVEN_HEAVY_CAVALRY_MINUTES_PER_1000=120
+OVEN_KNIGHTS_PEASANTS=1
+OVEN_KNIGHTS_NW=1.63
 
 Notes:
 - The default constants are useful starting points, not guaranteed game truth.
 - If several units have the same Peasant/NW footprint, the bot intentionally lists multiple likely outcomes.
 - Accuracy is best when SRs are fresh and the target did not dump NW, fight, or receive returning armies between reports.
+- The default oven lookback is 36 hours; set OVEN_LOOKBACK_HOURS higher/lower if your alert cycle needs it.
 
 Command usage:
 

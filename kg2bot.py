@@ -1596,10 +1596,14 @@ def _oven_unit_models() -> dict[str, dict]:
       OVEN_LIGHT_CAVALRY_MINUTES_PER_1000=90
     """
     defaults = {
-        "light_cavalry": ("Light Cavalry", 1.0, 0.25, 90.0, "If this is LC, pike timing matters."),
-        "pikemen": ("Pikemen", 1.0, 0.25, 90.0, "LC/Pike are NW/peas fungible; verify by later SR."),
-        "footmen": ("Footmen", 1.0, 0.10, 60.0, "If this is foot, usually sit/wait or avoid cav trades."),
-        "heavy_cavalry": ("Heavy Cavalry", 1.0, 0.40, 120.0, "If this is HC, pop/train Footmen into it."),
+        # NW defaults are from the KG troop stats table. Peasant use and train minutes stay env-tunable.
+        "footmen": ("Footmen", 1.0, 0.38, 60.0, "If this is foot, usually sit/wait or avoid cav trades."),
+        "pikemen": ("Pikemen", 1.0, 0.50, 90.0, "LC/Pike/Archers have similar NW footprints; verify by later SR."),
+        "archers": ("Archers", 1.0, 0.50, 90.0, "If this is archers, cav pressure can punish it."),
+        "crossbowmen": ("Crossbowmen", 1.0, 0.38, 90.0, "Crossbow/Foot have similar NW footprints; verify by later SR."),
+        "light_cavalry": ("Light Cavalry", 1.0, 0.50, 90.0, "If this is LC, pike timing matters."),
+        "heavy_cavalry": ("Heavy Cavalry", 1.0, 0.63, 120.0, "If this is HC, pop/train Footmen into it."),
+        "knights": ("Knights", 1.0, 1.63, 180.0, "If this is Knights, expect a high-NW cavalry pop."),
     }
     out = {}
     for key, (display, peasants, nw, minutes_per_1000, counter) in defaults.items():
@@ -4305,45 +4309,47 @@ def sync_build_oven_estimate(kingdom: str, nw_delta: int | None = None, event_ti
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT DISTINCT report_id, captured_at
-            FROM troop_snapshots
-            WHERE LOWER(BTRIM(kingdom)) = LOWER(BTRIM(%s))
-              AND captured_at >= %s
-            ORDER BY captured_at DESC, report_id DESC
-            LIMIT 2;
+            SELECT id, kingdom, created_at, raw, raw_gz
+            FROM spy_reports
+            WHERE LOWER(BTRIM(COALESCE(kingdom, ''))) = LOWER(BTRIM(%s))
+              AND created_at >= %s
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT 25;
             """,
             (kingdom, lookback_since),
         )
-        heads = cur.fetchall() or []
-        if len(heads) < 2:
-            return {"ok": False, "reason": "need_two_recent_sr", "kingdom": kingdom}
+        report_rows = cur.fetchall() or []
 
-        newest = heads[0]
-        prev = heads[1]
+    snapshots = []
+    for row in report_rows:
+        raw_text = extract_report_text_for_row(row)
+        troops = parse_sr_troops(raw_text)
+        if not troops:
+            continue
+        signal_value, _signal_name = _snapshot_peasant_signal(troops)
+        if signal_value is None:
+            continue
+        report_ts, has_explicit_tz = parse_report_datetime_from_line(raw_text)
+        effective_at = coerce_report_time(report_ts, row.get("created_at"), has_explicit_tz) or row.get("created_at")
+        if effective_at and normalize_to_utc(effective_at) < lookback_since:
+            continue
+        snapshots.append({
+            "report_id": int(row["id"]),
+            "captured_at": effective_at or row.get("created_at"),
+            "troops": troops,
+            "raw_text": raw_text,
+        })
 
-        def load_troops(report_id: int) -> dict:
-            cur.execute(
-                """
-                SELECT unit_name, unit_count
-                FROM troop_snapshots
-                WHERE LOWER(BTRIM(kingdom)) = LOWER(BTRIM(%s)) AND report_id=%s;
-                """,
-                (kingdom, int(report_id)),
-            )
-            return {str(r["unit_name"]): int(r["unit_count"] or 0) for r in (cur.fetchall() or [])}
+    snapshots.sort(key=lambda s: (normalize_to_utc(s.get("captured_at")) if s.get("captured_at") else datetime.min.replace(tzinfo=timezone.utc), int(s.get("report_id") or 0)), reverse=True)
 
-        old_troops = load_troops(int(prev["report_id"]))
-        new_troops = load_troops(int(newest["report_id"]))
+    if len(snapshots) < 2:
+        return {"ok": False, "reason": "need_two_recent_sr", "kingdom": kingdom}
 
-        cur.execute(
-            """
-            SELECT id, raw, raw_gz
-            FROM spy_reports
-            WHERE id = ANY(%s);
-            """,
-            ([int(prev["report_id"]), int(newest["report_id"])],),
-        )
-        raw_by_id = {int(r["id"]): extract_report_text_for_row(r) for r in (cur.fetchall() or [])}
+    newest = snapshots[0]
+    prev = snapshots[1]
+
+    old_troops = prev["troops"]
+    new_troops = newest["troops"]
 
     old_peas, old_signal = _snapshot_peasant_signal(old_troops)
     new_peas, new_signal = _snapshot_peasant_signal(new_troops)
@@ -4364,8 +4370,8 @@ def sync_build_oven_estimate(kingdom: str, nw_delta: int | None = None, event_ti
     old_nw = None
     new_nw = None
     try:
-        old_nw = parse_spy_details(raw_by_id.get(int(prev["report_id"]), "")).get("net_worth")
-        new_nw = parse_spy_details(raw_by_id.get(int(newest["report_id"]), "")).get("net_worth")
+        old_nw = parse_spy_details(prev.get("raw_text") or "").get("net_worth")
+        new_nw = parse_spy_details(newest.get("raw_text") or "").get("net_worth")
         if old_nw is not None and new_nw is not None and int(new_nw) > int(old_nw):
             inferred_nw_delta = int(new_nw) - int(old_nw)
     except Exception:
@@ -6444,10 +6450,10 @@ async def oven(ctx, *, kingdom: str):
             reason = str(est.get("reason") or "unknown")
             if reason == "need_two_recent_sr":
                 return await ctx.send(
-                    f"❌ Need at least **2 recent SR troop snapshots** for **{real}** within `{OVEN_LOOKBACK_HOURS}` hours. Paste fresh SRs first."
+                    f"❌ Need at least **2 recent SR reports** for **{real}** within `{OVEN_LOOKBACK_HOURS}` hours. Paste fresh SRs first."
                 )
             if reason == "missing_peasant_signal":
-                return await ctx.send(f"❌ Could not find Peasants or Population lines in the last two SR snapshots for **{real}**.")
+                return await ctx.send(f"❌ Could not find Peasants or Population lines in the last two recent SR reports for **{real}**.")
             if reason == "no_missing_peasants":
                 return await ctx.send(
                     f"ℹ️ No missing peasants/population detected for **{real}** between the last two SRs "
