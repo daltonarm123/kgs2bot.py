@@ -73,15 +73,11 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-03.3"
+BOT_VERSION = "2026-07-04.1"
 PATCH_NOTES = [
-    "Added NW jump alert monitoring from Kingdom rankings (GetKingdomRankings polling loop).",
-    "NW jump alerts now trigger on both +5,000 and -5,000 NW changes (or your configured threshold).",
-    "New !nwjumpalerts command: status, on [threshold], off (server-level subscription).",
-    "New !nwjumpcheck admin command for live rankings diagnostics + alert pipeline health.",
-    "Default jump threshold is 5,000 NW and can be changed per server/channel.",
-    "Optional SMS fanout via Twilio for NW jump alerts (team text notifications).",
-    "Added persistent rankings baseline + subscription tables for reliable alerts after restarts.",
+    "Fixed !spy kingdom lookup so names with underscores, spaces, or dashes resolve to the same saved kingdom.",
+    "Fixed !spy, !spyhistory, and !spies returning the wrong report when a loose fuzzy match picked an unrelated kingdom.",
+    "Tightened fallback fuzzy matching so small typos still work without drifting to the wrong target.",
 ]
 # -------------------------------------------------
 
@@ -632,6 +628,14 @@ def parse_first_int_from_value_line(line: str):
         return int(m.group(1).replace(",", ""))
     except Exception:
         return None
+
+
+def normalize_kingdom_lookup_key(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _safe_int_or_none(v) -> int | None:
@@ -3230,19 +3234,24 @@ def sync_fuzzy_kingdom(query: str):
     if not names:
         return None
 
-    q = query.strip()
-    q_low = q.lower()
-    by_low = {str(n).lower(): n for n in names}
+    q_key = normalize_kingdom_lookup_key(query)
+    if not q_key:
+        return None
+    by_key = {}
+    for name in names:
+        key = normalize_kingdom_lookup_key(name)
+        if key and key not in by_key:
+            by_key[key] = name
 
-    # Exact case-insensitive hit first.
-    if q_low in by_low:
-        return by_low[q_low]
+    # Exact normalized hit first so separators like _, -, and spaces all match.
+    if q_key in by_key:
+        return by_key[q_key]
 
-    # Fuzzy match on lowercase keys, then map back to canonical casing.
-    match = difflib.get_close_matches(q_low, list(by_low.keys()), 1, 0.5)
+    # Keep fuzzy fallback available for small typos, but avoid unrelated matches.
+    match = difflib.get_close_matches(q_key, list(by_key.keys()), 1, 0.8)
     if not match:
         return None
-    return by_low.get(match[0])
+    return by_key.get(match[0])
 
 
 def sync_get_spy_by_id(report_id: int):
@@ -3257,26 +3266,28 @@ def sync_get_spy_by_id(report_id: int):
 
 
 def sync_get_latest_spy_for_kingdom(kingdom: str):
+    lookup_key = normalize_kingdom_lookup_key(kingdom)
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE LOWER(BTRIM(kingdom))=LOWER(BTRIM(%s))
+            WHERE REGEXP_REPLACE(LOWER(BTRIM(COALESCE(kingdom, ''))), '[^a-z0-9]+', ' ', 'g')=%s
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
-        """, (kingdom,))
+        """, (lookup_key,))
         return cur.fetchone()
 
 
 def sync_get_latest_dp_spy_for_kingdom(kingdom: str):
+    lookup_key = normalize_kingdom_lookup_key(kingdom)
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE LOWER(BTRIM(kingdom))=LOWER(BTRIM(%s)) AND defense_power IS NOT NULL AND defense_power > 0
+            WHERE REGEXP_REPLACE(LOWER(BTRIM(COALESCE(kingdom, ''))), '[^a-z0-9]+', ' ', 'g')=%s AND defense_power IS NOT NULL AND defense_power > 0
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT 1;
-        """, (kingdom,))
+        """, (lookup_key,))
         return cur.fetchone()
 
 
@@ -3293,26 +3304,28 @@ def sync_get_latest_dp_spy_any():
 
 
 def sync_get_spy_history(kingdom: str, limit: int = 5):
+    lookup_key = normalize_kingdom_lookup_key(kingdom)
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, defense_power, castles, created_at
             FROM spy_reports
-            WHERE LOWER(kingdom)=LOWER(%s)
+            WHERE REGEXP_REPLACE(LOWER(BTRIM(COALESCE(kingdom, ''))), '[^a-z0-9]+', ' ', 'g')=%s
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT %s;
-        """, (kingdom, int(limit)))
+        """, (lookup_key, int(limit)))
         return cur.fetchall()
 
 
 def sync_get_spy_history_with_raw(kingdom: str, limit: int = 10):
+    lookup_key = normalize_kingdom_lookup_key(kingdom)
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT id, kingdom, created_at, raw, raw_gz
             FROM spy_reports
-            WHERE LOWER(kingdom)=LOWER(%s)
+            WHERE REGEXP_REPLACE(LOWER(BTRIM(COALESCE(kingdom, ''))), '[^a-z0-9]+', ' ', 'g')=%s
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT %s;
-        """, (kingdom, int(limit)))
+        """, (lookup_key, int(limit)))
         return cur.fetchall()
 
 
