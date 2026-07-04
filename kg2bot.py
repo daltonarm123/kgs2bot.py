@@ -73,11 +73,11 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-04.2"
+BOT_VERSION = "2026-07-04.3"
 PATCH_NOTES = [
-    "Fixed !spy, !spyhistory, and !spies kingdom matching so separator variants resolve correctly and unrelated fuzzy matches do not pull the wrong report.",
-    "Fixed !help exceeding Discord's 2,000-character message limit by splitting the command list into multiple messages.",
-    "Updated !spy report summaries so the report date and time appear at the top of the output.",
+    "Added !oven training inference from SR peasant/population deltas plus NW jump data.",
+    "NW jump alerts now append likely oven/training guesses when recent SR history exists.",
+    "SR snapshots now preserve Population lines so peasant-missing inference has a fallback signal.",
 ]
 # -------------------------------------------------
 
@@ -236,6 +236,12 @@ NW_JUMP_ALERTS_ENABLED = _env_bool("NW_JUMP_ALERTS_ENABLED", True)
 NW_JUMP_ALERT_POLL_SECONDS = _env_int("NW_JUMP_ALERT_POLL_SECONDS", 60)
 NW_JUMP_ALERT_DEFAULT_THRESHOLD = _env_int("NW_JUMP_ALERT_DEFAULT_THRESHOLD", 5000)
 NW_JUMP_ALERT_SILENT_NO_SUBS = _env_bool("NW_JUMP_ALERT_SILENT_NO_SUBS", True)
+OVEN_ESTIMATOR_ENABLED = _env_bool("OVEN_ESTIMATOR_ENABLED", True)
+OVEN_LOOKBACK_HOURS = _env_int("OVEN_LOOKBACK_HOURS", 36)
+OVEN_MAX_ALERT_LINES = _env_int("OVEN_MAX_ALERT_LINES", 3)
+OVEN_MAX_RESULTS = _env_int("OVEN_MAX_RESULTS", 6)
+OVEN_NW_TOLERANCE_PCT = _env_float("OVEN_NW_TOLERANCE_PCT", 12.0)
+OVEN_PEASANT_TOLERANCE_PCT = _env_float("OVEN_PEASANT_TOLERANCE_PCT", 3.0)
 ALERT_SMS_ENABLED = _env_bool("ALERT_SMS_ENABLED", False)
 ALERT_SMS_TWILIO_ACCOUNT_SID = _env_text("ALERT_SMS_TWILIO_ACCOUNT_SID", "")
 ALERT_SMS_TWILIO_AUTH_TOKEN = _env_text("ALERT_SMS_TWILIO_AUTH_TOKEN", "")
@@ -1567,14 +1573,151 @@ def parse_sr_troops(text: str) -> dict:
         name = m.group(1).strip()
         val = int(m.group(2).replace(",", ""))
 
-        if name.lower().startswith("population"):
-            continue
         if len(name) < 2 or val < 0:
             continue
 
         troops[name] = val
 
     return troops
+
+
+def _oven_float_env(unit_key: str, suffix: str, default: float) -> float:
+    env_name = f"OVEN_{unit_key.upper()}_{suffix}"
+    return _env_float(env_name, default)
+
+
+def _oven_unit_models() -> dict[str, dict]:
+    """
+    Training inference constants.
+
+    Defaults are configurable because KG balance values may change. Override per unit with env vars like:
+      OVEN_LIGHT_CAVALRY_PEASANTS=1
+      OVEN_LIGHT_CAVALRY_NW=0.25
+      OVEN_LIGHT_CAVALRY_MINUTES_PER_1000=90
+    """
+    defaults = {
+        "light_cavalry": ("Light Cavalry", 1.0, 0.25, 90.0, "If this is LC, pike timing matters."),
+        "pikemen": ("Pikemen", 1.0, 0.25, 90.0, "LC/Pike are NW/peas fungible; verify by later SR."),
+        "footmen": ("Footmen", 1.0, 0.10, 60.0, "If this is foot, usually sit/wait or avoid cav trades."),
+        "heavy_cavalry": ("Heavy Cavalry", 1.0, 0.40, 120.0, "If this is HC, pop/train Footmen into it."),
+    }
+    out = {}
+    for key, (display, peasants, nw, minutes_per_1000, counter) in defaults.items():
+        env_key = key.upper()
+        out[key] = {
+            "display": display,
+            "peasants": max(0.01, _oven_float_env(env_key, "PEASANTS", peasants)),
+            "nw": max(0.0, _oven_float_env(env_key, "NW", nw)),
+            "minutes_per_1000": max(0.0, _oven_float_env(env_key, "MINUTES_PER_1000", minutes_per_1000)),
+            "counter": counter,
+        }
+    return out
+
+
+OVEN_UNIT_MODELS = _oven_unit_models()
+
+
+def _snapshot_count(troops: dict, normalized_names: set[str], contains_names: set[str] | None = None) -> int | None:
+    contains_names = contains_names or set()
+    total = 0
+    found = False
+    for raw_name, raw_count in (troops or {}).items():
+        name = str(raw_name or "").strip()
+        norm = normalize_unit_name(name)
+        low = name.lower()
+        if norm in normalized_names or any(part in low for part in contains_names):
+            try:
+                total += int(raw_count or 0)
+                found = True
+            except Exception:
+                continue
+    return total if found else None
+
+
+def _snapshot_peasant_signal(troops: dict) -> tuple[int | None, str]:
+    peasants = _snapshot_count(troops, {"peasants"}, {"peasant"})
+    if peasants is not None:
+        return peasants, "Peasants"
+    population = _snapshot_count(troops, set(), {"population"})
+    if population is not None:
+        return population, "Population"
+    return None, "Peasants/Population"
+
+
+def _format_dt_short(ts) -> str:
+    if not ts:
+        return "unknown"
+    try:
+        return normalize_to_utc(ts).strftime("%b %-d %H:%M UTC")
+    except Exception:
+        return str(ts).replace("T", " ").split(".", 1)[0]
+
+
+def _oven_completion_window(old_ts, new_ts, count: int, model: dict, event_time=None) -> str:
+    mins_per_1000 = float(model.get("minutes_per_1000") or 0.0)
+    if mins_per_1000 <= 0 or count <= 0:
+        return "pop time unknown"
+    duration = timedelta(minutes=(float(count) / 1000.0) * mins_per_1000)
+    if event_time:
+        return f"popped/detected around {_format_dt_short(event_time)}"
+    if old_ts and new_ts:
+        return f"pop window {_format_dt_short(normalize_to_utc(old_ts) + duration)} - {_format_dt_short(normalize_to_utc(new_ts) + duration)}"
+    if new_ts:
+        return f"possible pop by {_format_dt_short(normalize_to_utc(new_ts) + duration)}"
+    return "pop time unknown"
+
+
+def _oven_confidence(score: float, has_nw: bool) -> str:
+    if has_nw and score <= 0.08:
+        return "High"
+    if score <= 0.18:
+        return "Medium"
+    return "Low"
+
+
+def build_oven_candidates(peasant_delta: int, nw_delta: int | None, old_ts=None, new_ts=None, event_time=None) -> list[dict]:
+    missing = max(0, int(peasant_delta or 0))
+    if missing <= 0:
+        return []
+    has_nw = nw_delta is not None and int(nw_delta or 0) > 0
+    target_nw = int(nw_delta or 0)
+    peas_tol = max(1.0, missing * max(0.0, float(OVEN_PEASANT_TOLERANCE_PCT or 0.0)) / 100.0)
+    nw_tol = max(1.0, target_nw * max(0.0, float(OVEN_NW_TOLERANCE_PCT or 0.0)) / 100.0) if has_nw else 0.0
+
+    candidates = []
+    for unit_key, model in OVEN_UNIT_MODELS.items():
+        peas_per = float(model.get("peasants") or 0.0)
+        nw_per = float(model.get("nw") or 0.0)
+        if peas_per <= 0:
+            continue
+        count = max(1, int(round(float(missing) / peas_per)))
+        expected_peas = count * peas_per
+        expected_nw = count * nw_per
+        peas_err = abs(expected_peas - missing)
+        nw_err = abs(expected_nw - target_nw) if has_nw else 0.0
+        if peas_err > peas_tol:
+            continue
+        peas_score = peas_err / max(1.0, float(missing))
+        nw_score = (nw_err / max(1.0, float(target_nw))) if has_nw else 0.10
+        score = (nw_score * 0.75) + (peas_score * 0.25) if has_nw else peas_score + 0.10
+        if has_nw and nw_err > (nw_tol * 3):
+            score += 1.0
+        candidates.append({
+            "unit_key": unit_key,
+            "unit": str(model.get("display") or unit_key),
+            "count": int(count),
+            "expected_peasants": int(round(expected_peas)),
+            "expected_nw": int(round(expected_nw)),
+            "peas_error": int(round(peas_err)),
+            "nw_error": int(round(nw_err)),
+            "score": float(score),
+            "confidence": _oven_confidence(float(score), has_nw),
+            "time_text": _oven_completion_window(old_ts, new_ts, int(count), model, event_time=event_time),
+            "counter": str(model.get("counter") or ""),
+        })
+
+    candidates.sort(key=lambda c: (float(c.get("score") if c.get("score") is not None else 999.0), -int(c.get("expected_nw") or 0), str(c.get("unit") or "")))
+    return candidates[: max(1, int(OVEN_MAX_RESULTS or 6))]
 
 
 def parse_tech(text: str):
@@ -3030,6 +3173,7 @@ def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_thres
                     "delta": int(delta),
                     "old_rank": _safe_int_or_none(old.get("rank_pos")),
                     "new_rank": _safe_int_or_none(current.get("rank")),
+                    "detected_at": now_ts,
                 })
 
         upsert_rows = [
@@ -3097,6 +3241,17 @@ async def send_nw_jump_alerts(events: list[dict]):
             lines.append(
                 f"- **{e.get('kingdom_name')}** {sign}`{fmt_int(abs(delta_v))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))}){rank_part}"
             )
+            if OVEN_ESTIMATOR_ENABLED and delta_v > 0:
+                try:
+                    oven_est = await run_db(
+                        sync_build_oven_estimate,
+                        str(e.get("kingdom_name") or ""),
+                        int(delta_v),
+                        e.get("detected_at") or now_utc(),
+                    )
+                    lines.extend(format_oven_summary_lines(oven_est, limit=int(OVEN_MAX_ALERT_LINES or 3), compact=True))
+                except Exception:
+                    logging.exception("Failed to build oven estimate for NW jump kingdom=%s", e.get("kingdom_name"))
         extra = len(hits) - 12
         if extra > 0:
             lines.append(f"... +{extra} more")
@@ -4141,6 +4296,140 @@ def format_out_annotation(rows: list[dict]) -> str:
     _, notes = aggregate_out_rows(rows)
     if not notes:
         return ""
+
+
+def sync_build_oven_estimate(kingdom: str, nw_delta: int | None = None, event_time=None) -> dict:
+    if not OVEN_ESTIMATOR_ENABLED:
+        return {"ok": False, "reason": "disabled"}
+    lookback_since = now_utc() - timedelta(hours=max(1, int(OVEN_LOOKBACK_HOURS or 36)))
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT report_id, captured_at
+            FROM troop_snapshots
+            WHERE LOWER(BTRIM(kingdom)) = LOWER(BTRIM(%s))
+              AND captured_at >= %s
+            ORDER BY captured_at DESC, report_id DESC
+            LIMIT 2;
+            """,
+            (kingdom, lookback_since),
+        )
+        heads = cur.fetchall() or []
+        if len(heads) < 2:
+            return {"ok": False, "reason": "need_two_recent_sr", "kingdom": kingdom}
+
+        newest = heads[0]
+        prev = heads[1]
+
+        def load_troops(report_id: int) -> dict:
+            cur.execute(
+                """
+                SELECT unit_name, unit_count
+                FROM troop_snapshots
+                WHERE LOWER(BTRIM(kingdom)) = LOWER(BTRIM(%s)) AND report_id=%s;
+                """,
+                (kingdom, int(report_id)),
+            )
+            return {str(r["unit_name"]): int(r["unit_count"] or 0) for r in (cur.fetchall() or [])}
+
+        old_troops = load_troops(int(prev["report_id"]))
+        new_troops = load_troops(int(newest["report_id"]))
+
+        cur.execute(
+            """
+            SELECT id, raw, raw_gz
+            FROM spy_reports
+            WHERE id = ANY(%s);
+            """,
+            ([int(prev["report_id"]), int(newest["report_id"])],),
+        )
+        raw_by_id = {int(r["id"]): extract_report_text_for_row(r) for r in (cur.fetchall() or [])}
+
+    old_peas, old_signal = _snapshot_peasant_signal(old_troops)
+    new_peas, new_signal = _snapshot_peasant_signal(new_troops)
+    if old_peas is None or new_peas is None:
+        return {"ok": False, "reason": "missing_peasant_signal", "kingdom": kingdom}
+
+    peasant_delta = int(old_peas) - int(new_peas)
+    if peasant_delta <= 0:
+        return {
+            "ok": False,
+            "reason": "no_missing_peasants",
+            "kingdom": kingdom,
+            "old_peasants": int(old_peas),
+            "new_peasants": int(new_peas),
+        }
+
+    inferred_nw_delta = None
+    old_nw = None
+    new_nw = None
+    try:
+        old_nw = parse_spy_details(raw_by_id.get(int(prev["report_id"]), "")).get("net_worth")
+        new_nw = parse_spy_details(raw_by_id.get(int(newest["report_id"]), "")).get("net_worth")
+        if old_nw is not None and new_nw is not None and int(new_nw) > int(old_nw):
+            inferred_nw_delta = int(new_nw) - int(old_nw)
+    except Exception:
+        inferred_nw_delta = None
+
+    use_nw_delta = int(nw_delta) if nw_delta is not None and int(nw_delta or 0) > 0 else inferred_nw_delta
+    candidates = build_oven_candidates(
+        peasant_delta,
+        use_nw_delta,
+        old_ts=prev.get("captured_at"),
+        new_ts=newest.get("captured_at"),
+        event_time=event_time,
+    )
+
+    return {
+        "ok": bool(candidates),
+        "reason": "ok" if candidates else "no_candidates",
+        "kingdom": kingdom,
+        "old_report_id": int(prev["report_id"]),
+        "new_report_id": int(newest["report_id"]),
+        "old_captured_at": prev.get("captured_at"),
+        "new_captured_at": newest.get("captured_at"),
+        "old_peasants": int(old_peas),
+        "new_peasants": int(new_peas),
+        "peasant_delta": int(peasant_delta),
+        "peasant_signal": old_signal if old_signal == new_signal else f"{old_signal}/{new_signal}",
+        "nw_delta": use_nw_delta,
+        "old_networth": old_nw,
+        "new_networth": new_nw,
+        "candidates": candidates,
+    }
+
+
+def format_oven_summary_lines(est: dict, limit: int = 3, compact: bool = False) -> list[str]:
+    if not est or not est.get("ok"):
+        return []
+    missing = int(est.get("peasant_delta") or 0)
+    nw_delta = est.get("nw_delta")
+    signal = str(est.get("peasant_signal") or "Peasants")
+    prefix = "Oven guess" if compact else f"🧁 **Oven Estimate • {est.get('kingdom')}**"
+    header = f"{prefix}: {signal} -`{fmt_int(missing)}`"
+    if nw_delta is not None:
+        header += f" | NW +`{fmt_int(nw_delta)}`"
+    lines = [header]
+    for c in (est.get("candidates") or [])[: max(1, int(limit or 3))]:
+        unit = str(c.get("unit") or "Unit")
+        count = int(c.get("count") or 0)
+        conf = str(c.get("confidence") or "Low")
+        expected_nw = int(c.get("expected_nw") or 0)
+        time_txt = str(c.get("time_text") or "pop time unknown")
+        if compact:
+            lines.append(f"  • {conf}: {fmt_int(count)} {unit} (NW ~{fmt_int(expected_nw)})")
+        else:
+            lines.append(f"• **{conf}**: `{fmt_int(count)}` {unit} | NW ~`{fmt_int(expected_nw)}` | {time_txt}")
+            counter = str(c.get("counter") or "").strip()
+            if counter:
+                lines.append(f"  Counter note: {counter}")
+    if not compact:
+        lines.append(
+            f"Based on SR `#{est.get('old_report_id')}` ({_format_dt_short(est.get('old_captured_at'))}) "
+            f"→ `#{est.get('new_report_id')}` ({_format_dt_short(est.get('new_captured_at'))})."
+        )
+    return lines
+
     lines = [
         "",
         "THIS sr likely did not contain the following troops expected to be out at SR time:",
@@ -6144,6 +6433,38 @@ async def attackbackfill(ctx, days: int = None):
         await send_error(ctx.guild, f"attackbackfill error: {e}", tb=tb)
 
 
+@bot.command(name="oven")
+async def oven(ctx, *, kingdom: str):
+    """!oven <kingdom> -> infer likely troops in training from last two SR snapshots."""
+    try:
+        real = await run_db(sync_fuzzy_kingdom, kingdom)
+        real = real or kingdom
+        est = await run_db(sync_build_oven_estimate, real, None, None)
+        if not est.get("ok"):
+            reason = str(est.get("reason") or "unknown")
+            if reason == "need_two_recent_sr":
+                return await ctx.send(
+                    f"❌ Need at least **2 recent SR troop snapshots** for **{real}** within `{OVEN_LOOKBACK_HOURS}` hours. Paste fresh SRs first."
+                )
+            if reason == "missing_peasant_signal":
+                return await ctx.send(f"❌ Could not find Peasants or Population lines in the last two SR snapshots for **{real}**.")
+            if reason == "no_missing_peasants":
+                return await ctx.send(
+                    f"ℹ️ No missing peasants/population detected for **{real}** between the last two SRs "
+                    f"({fmt_int(est.get('old_peasants'))} → {fmt_int(est.get('new_peasants'))})."
+                )
+            return await ctx.send(f"❌ Oven estimate unavailable for **{real}** (`{reason}`).")
+
+        lines = format_oven_summary_lines(est, limit=int(OVEN_MAX_RESULTS or 6), compact=False)
+        lines.append("Tune constants with Railway env vars like `OVEN_HEAVY_CAVALRY_NW` and `OVEN_HEAVY_CAVALRY_MINUTES_PER_1000` as game values are verified.")
+        for chunk in split_for_discord("\n".join(lines), 1900):
+            await ctx.send(chunk)
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ oven failed.")
+        await send_error(ctx.guild, f"oven error: {e}", tb=tb)
+
+
 @bot.command()
 async def troops(ctx, *, kingdom: str):
     """!troops <kingdom> -> latest SR troop snapshot (home troops) for a kingdom."""
@@ -6275,6 +6596,7 @@ async def help_cmd(ctx):
             "`!techpull <kingdom>` - Rebuild indexed tech for one kingdom",
             "`!backfill [days]` - Admin: reprocess saved reports for indexing",
             "`!attackbackfill [days]` - Admin: pull attack/spy reports from Discord history for track data",
+            "`!oven <kingdom>` - Estimate likely troops in training from SR peasant loss + NW delta",
             "`!troops <kingdom>` - Latest saved troop snapshot",
             "`!troopsdelta <kingdom>` - Troop delta from last two snapshots",
             "`!troopdelta <kingdom>` - Alias of !troopsdelta",

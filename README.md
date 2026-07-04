@@ -24,6 +24,41 @@ New: NW jump alerts from live rankings.
 
 The bot can poll KingdomGame rankings and alert your Discord when a kingdom gains net worth by a configured amount (default 5,000+) between polls.
 
+Oven/training inference:
+
+When the bot has at least two recent SR troop snapshots for a kingdom, it can compare missing Peasants/Population against a NW jump and estimate likely troops in training.
+
+Command usage:
+
+!oven <kingdom>
+
+Example:
+
+!oven Seven
+
+NW jump alerts also append a compact oven guess when a positive NW jump matches recent SR history.
+
+Tuning variables for inference constants:
+
+OVEN_ESTIMATOR_ENABLED=true
+OVEN_LOOKBACK_HOURS=36
+OVEN_MAX_ALERT_LINES=3
+OVEN_LIGHT_CAVALRY_PEASANTS=1
+OVEN_LIGHT_CAVALRY_NW=0.25
+OVEN_LIGHT_CAVALRY_MINUTES_PER_1000=90
+OVEN_PIKEMEN_PEASANTS=1
+OVEN_PIKEMEN_NW=0.25
+OVEN_FOOTMEN_PEASANTS=1
+OVEN_FOOTMEN_NW=0.10
+OVEN_HEAVY_CAVALRY_PEASANTS=1
+OVEN_HEAVY_CAVALRY_NW=0.40
+OVEN_HEAVY_CAVALRY_MINUTES_PER_1000=120
+
+Notes:
+- The default constants are useful starting points, not guaranteed game truth.
+- If several units have the same Peasant/NW footprint, the bot intentionally lists multiple likely outcomes.
+- Accuracy is best when SRs are fresh and the target did not dump NW, fight, or receive returning armies between reports.
+
 Command usage:
 
 !nwjumpalerts status
