@@ -6280,7 +6280,8 @@ async def help_cmd(ctx):
             "`!announcepatch` - Admin: force-post current patch notes to update channel",
             "`!refresh` - Admin: restart bot process",
         ]
-        await ctx.send("\n".join(lines))
+        for chunk in split_for_discord("\n".join(lines), 1900):
+            await ctx.send(chunk)
     except Exception as e:
         tb = traceback.format_exc()
         await ctx.send("help failed.")
