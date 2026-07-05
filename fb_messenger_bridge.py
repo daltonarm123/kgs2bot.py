@@ -71,6 +71,22 @@ def _preview(text: str, limit: int = 220) -> str:
     return compact[: limit - 3] + "..."
 
 
+def _page_debug_state(page) -> str:
+    try:
+        data = page.evaluate(
+            """
+() => ({
+  url: location.href,
+  title: document.title,
+  text: (document.body && document.body.innerText || '').slice(0, 1200),
+})
+"""
+        )
+        return f"url={data.get('url')} title={data.get('title')} text={_preview(data.get('text'), 500)}"
+    except Exception as e:
+        return f"page_state_error={e}"
+
+
 def _is_report_text(text: str) -> bool:
     t = str(text or "").strip()
     if len(t) < 20:
@@ -283,6 +299,8 @@ def _open_chat(page, chat_name: str) -> bool:
                 return True
         except Exception:
             continue
+    if FB_DEBUG_REPORTS:
+        print(f"DEBUG: open chat failed chat={chat_name}: {_page_debug_state(page)}")
     return False
 
 
@@ -436,6 +454,8 @@ def main() -> int:
 
                     messages = _extract_recent_messages(page, FB_LOOKBACK_MESSAGES)
                     print(f"INFO: scanned chat={chat_name} messages={len(messages)}")
+                    if FB_DEBUG_REPORTS and not messages:
+                        print(f"DEBUG: no messages chat={chat_name}: {_page_debug_state(page)}")
                     if not messages:
                         continue
 
