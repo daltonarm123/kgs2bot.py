@@ -226,6 +226,43 @@ def _open_chat(page, chat_name: str) -> bool:
                 return True
         except Exception:
             continue
+
+    # Fallback: use Messenger search to surface the conversation, then open first hit.
+    search_selectors = [
+        "input[aria-label*='Search']",
+        "input[placeholder*='Search']",
+        "input[type='search']",
+    ]
+    for sel in search_selectors:
+        try:
+            search_box = page.locator(sel).first
+            if not search_box.count():
+                continue
+            search_box.click(timeout=1200)
+            search_box.fill("")
+            search_box.fill(chat_name)
+            page.wait_for_timeout(1200)
+
+            # Try matching a visible result row/link containing the chat name.
+            result = page.get_by_role("link", name=re.compile(re.escape(chat_name), re.IGNORECASE)).first
+            if result.count() and result.is_visible(timeout=1200):
+                result.click(timeout=2500)
+                page.wait_for_timeout(700)
+                return True
+
+            result = page.get_by_text(chat_name, exact=False).first
+            if result.count() and result.is_visible(timeout=1200):
+                result.click(timeout=2500)
+                page.wait_for_timeout(700)
+                return True
+
+            # Some UIs let Enter open top search result.
+            search_box.press("Enter")
+            page.wait_for_timeout(1000)
+            if page.locator("[role='main']").first.count():
+                return True
+        except Exception:
+            continue
     return False
 
 
