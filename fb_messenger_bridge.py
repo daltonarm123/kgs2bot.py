@@ -71,6 +71,12 @@ def _preview(text: str, limit: int = 220) -> str:
     return compact[: limit - 3] + "..."
 
 
+def _chat_name_pattern(chat_name: str) -> re.Pattern:
+    escaped = re.escape(chat_name).replace(r"\'", r"['\u2019]")
+    escaped = re.sub(r"\\\s+", r"\\s+", escaped)
+    return re.compile(escaped, re.IGNORECASE)
+
+
 def _page_debug_state(page) -> str:
     try:
         data = page.evaluate(
@@ -262,6 +268,8 @@ def _looks_like_open_thread(page) -> bool:
             return False
         if "/messages/" not in url:
             return False
+        if re.search(r"/messages/t/\d+", url):
+            return True
         if page.locator("[contenteditable='true'], textarea, [aria-label*='Message']").first.count():
             return True
         return page.locator("[role='main'] div[dir='auto'], [role='main'] span[dir='auto']").first.count() > 0
@@ -280,8 +288,8 @@ def _open_from_search_results(page, chat_name: str) -> bool:
     except Exception:
         pass
     for get_locator in (
-        lambda: page.get_by_role("link", name=re.compile(re.escape(chat_name), re.IGNORECASE)).first,
-        lambda: page.get_by_text(chat_name, exact=False).first,
+        lambda: page.get_by_role("link", name=_chat_name_pattern(chat_name)).first,
+        lambda: page.get_by_text(_chat_name_pattern(chat_name)).first,
     ):
         try:
             result = get_locator()
@@ -296,10 +304,11 @@ def _open_from_search_results(page, chat_name: str) -> bool:
 
 def _open_chat(page, chat_name: str) -> bool:
     _ensure_messages_home(page)
+    chat_pattern = _chat_name_pattern(chat_name)
 
     strategies = [
-        lambda: page.get_by_role("link", name=re.compile(re.escape(chat_name), re.IGNORECASE)).first,
-        lambda: page.get_by_text(chat_name, exact=False).first,
+        lambda: page.get_by_role("link", name=chat_pattern).first,
+        lambda: page.get_by_text(chat_pattern).first,
     ]
     for get_locator in strategies:
         try:
@@ -332,14 +341,14 @@ def _open_chat(page, chat_name: str) -> bool:
             page.wait_for_timeout(1200)
 
             # Try matching a visible result row/link containing the chat name.
-            result = page.get_by_role("link", name=re.compile(re.escape(chat_name), re.IGNORECASE)).first
+            result = page.get_by_role("link", name=chat_pattern).first
             if result.count() and result.is_visible(timeout=1200):
                 result.click(timeout=2500)
                 page.wait_for_timeout(700)
                 if _looks_like_open_thread(page):
                     return True
 
-            result = page.get_by_text(chat_name, exact=False).first
+            result = page.get_by_text(chat_pattern).first
             if result.count() and result.is_visible(timeout=1200):
                 result.click(timeout=2500)
                 page.wait_for_timeout(700)
