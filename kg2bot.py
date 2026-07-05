@@ -2484,6 +2484,27 @@ def init_db():
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS nw_jump_user_prefs (
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            muted BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS nw_jump_user_blocks (
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            kingdom_key TEXT NOT NULL,
+            kingdom_name TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (guild_id, user_id, kingdom_key)
+        );
+        """)
+
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
             SELECT column_name, is_nullable
@@ -2673,6 +2694,14 @@ def init_db():
         cur.execute("""
             CREATE INDEX IF NOT EXISTS nw_jump_alert_channels_enabled_idx
             ON nw_jump_alert_channels (guild_id, enabled, updated_at DESC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS nw_jump_user_prefs_lookup_idx
+            ON nw_jump_user_prefs (guild_id, user_id, muted);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS nw_jump_user_blocks_lookup_idx
+            ON nw_jump_user_blocks (guild_id, user_id, kingdom_key);
         """)
 
 
@@ -3187,6 +3216,128 @@ def sync_get_enabled_nw_jump_subscriptions() -> list[dict]:
         return cur.fetchall() or []
 
 
+def sync_set_nw_jump_user_muted(guild_id: int, user_id: int, muted: bool):
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nw_jump_user_prefs (guild_id, user_id, muted, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET muted=EXCLUDED.muted, updated_at=EXCLUDED.updated_at;
+            """,
+            (int(guild_id), int(user_id), bool(muted), now_utc()),
+        )
+
+
+def sync_get_nw_jump_user_pref(guild_id: int, user_id: int) -> dict:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT guild_id, user_id, muted, updated_at
+            FROM nw_jump_user_prefs
+            WHERE guild_id=%s AND user_id=%s
+            LIMIT 1;
+            """,
+            (int(guild_id), int(user_id)),
+        )
+        return cur.fetchone() or {"guild_id": int(guild_id), "user_id": int(user_id), "muted": False, "updated_at": None}
+
+
+def sync_add_nw_jump_user_block(guild_id: int, user_id: int, kingdom_name: str) -> dict:
+    name = re.sub(r"\s+", " ", str(kingdom_name or "").strip())
+    key = normalize_kingdom_lookup_key(name)
+    if not key:
+        return {"ok": False, "reason": "empty_name"}
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO nw_jump_user_prefs (guild_id, user_id, muted, updated_at)
+            VALUES (%s, %s, FALSE, %s)
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET updated_at=EXCLUDED.updated_at;
+            """,
+            (int(guild_id), int(user_id), now_utc()),
+        )
+        cur.execute(
+            """
+            INSERT INTO nw_jump_user_blocks (guild_id, user_id, kingdom_key, kingdom_name, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id, user_id, kingdom_key) DO UPDATE
+            SET kingdom_name=EXCLUDED.kingdom_name;
+            """,
+            (int(guild_id), int(user_id), key, name, now_utc()),
+        )
+    return {"ok": True, "kingdom_name": name, "kingdom_key": key}
+
+
+def sync_remove_nw_jump_user_block(guild_id: int, user_id: int, kingdom_name: str) -> dict:
+    key = normalize_kingdom_lookup_key(kingdom_name)
+    if not key:
+        return {"ok": False, "reason": "empty_name", "removed": 0}
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM nw_jump_user_blocks
+            WHERE guild_id=%s AND user_id=%s AND kingdom_key=%s;
+            """,
+            (int(guild_id), int(user_id), key),
+        )
+        return {"ok": True, "removed": int(cur.rowcount or 0), "kingdom_key": key}
+
+
+def sync_clear_nw_jump_user_blocks(guild_id: int, user_id: int) -> int:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM nw_jump_user_blocks
+            WHERE guild_id=%s AND user_id=%s;
+            """,
+            (int(guild_id), int(user_id)),
+        )
+        return int(cur.rowcount or 0)
+
+
+def sync_list_nw_jump_user_blocks(guild_id: int, user_id: int) -> list[dict]:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kingdom_name, kingdom_key, created_at
+            FROM nw_jump_user_blocks
+            WHERE guild_id=%s AND user_id=%s
+            ORDER BY kingdom_name ASC;
+            """,
+            (int(guild_id), int(user_id)),
+        )
+        return cur.fetchall() or []
+
+
+def sync_get_nw_jump_user_settings_for_guild(guild_id: int) -> list[dict]:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                p.user_id,
+                p.muted,
+                COALESCE(array_agg(b.kingdom_key) FILTER (WHERE b.kingdom_key IS NOT NULL), '{}') AS blocked_keys
+            FROM nw_jump_user_prefs p
+            LEFT JOIN nw_jump_user_blocks b ON b.guild_id=p.guild_id AND b.user_id=p.user_id
+            WHERE p.guild_id=%s
+            GROUP BY p.user_id, p.muted
+            ORDER BY p.user_id ASC;
+            """,
+            (int(guild_id),),
+        )
+        return cur.fetchall() or []
+
+
+def _nw_jump_event_blocked_for_user(event: dict, blocked_keys) -> bool:
+    keys = {str(k or "").strip() for k in (blocked_keys or []) if str(k or "").strip()}
+    if not keys:
+        return False
+    kingdom_key = normalize_kingdom_lookup_key(event.get("kingdom_name"))
+    return bool(kingdom_key and kingdom_key in keys)
+
+
 def _normalize_phone_number(s: str) -> str:
     txt = str(s or "").strip()
     if not txt:
@@ -3602,6 +3753,35 @@ async def send_nw_jump_alerts(events: list[dict]):
                     await ch.send("\n".join(lines))
                 except Exception:
                     logging.exception("Failed to send NW jump alert to fallback channel guild=%s", guild.id)
+
+        try:
+            settings = await run_db(sync_get_nw_jump_user_settings_for_guild, int(guild.id))
+            for pref in settings:
+                if bool(pref.get("muted")):
+                    continue
+                user_hits = [e for e in hits if not _nw_jump_event_blocked_for_user(e, pref.get("blocked_keys") or [])]
+                if not user_hits:
+                    continue
+                member = guild.get_member(int(pref.get("user_id") or 0))
+                if not member or getattr(member, "bot", False):
+                    continue
+                dm_lines = [f"🚨 **NW Jumper** (threshold: `{fmt_int(min_jump)}`)"]
+                for e in user_hits[:12]:
+                    delta_v = int(e.get("delta") or 0)
+                    sign = "+" if delta_v >= 0 else "-"
+                    dm_lines.append(
+                        f"- **{e.get('kingdom_name')}** {sign}`{fmt_int(abs(delta_v))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))})"
+                    )
+                extra_dm = len(user_hits) - 12
+                if extra_dm > 0:
+                    dm_lines.append(f"... +{extra_dm} more")
+                dm_lines.append("Use `!nwjumpblock <kingdom>` or `!mutenwjumper` in the server to adjust these.")
+                try:
+                    await member.send("\n".join(dm_lines))
+                except Exception:
+                    logging.info("Could not DM NW jumper alert to guild=%s user=%s", guild.id, member.id)
+        except Exception:
+            logging.exception("Failed to dispatch personal NW jumper alerts for guild=%s", guild.id)
 
     if _twilio_sms_configured():
         watch = _parse_alert_sms_watchlist()
@@ -7301,6 +7481,8 @@ async def help_cmd(ctx):
             "`!nwjumpalerts addhere` - Admin: add current room to NW jump alert fanout",
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
+            "`!nwjumpblock [name|list|remove <name>|clear]` - Manage your personal blocked kingdoms for NW jumper alerts",
+            "`!mutenwjumper [on|off|status]` - Mute/unmute your personal NW jumper notifications",
             "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
             "`!rankingsrefresh` - Admin: force a live top-100 rankings refresh into DB/history now",
             "`!nwjumptestalert` - Admin: send a marked test NW jump alert to all configured rooms",
@@ -7430,6 +7612,123 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
         await ctx.send("⚠️ nwjumpalerts failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"nwjumpalerts error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumpblock")
+async def nwjumpblock(ctx, action: str = "list", *, kingdom: str = ""):
+    """Manage a user's personal kingdom block list for NW jumper notifications."""
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        guild_id = int(ctx.guild.id)
+        user_id = int(ctx.author.id)
+        action_norm = str(action or "list").strip().lower()
+
+        if action_norm in ("list", "show", "status"):
+            pref = await run_db(sync_get_nw_jump_user_pref, guild_id, user_id)
+            blocks = await run_db(sync_list_nw_jump_user_blocks, guild_id, user_id)
+            muted = bool((pref or {}).get("muted"))
+            lines = [
+                f"🧰 **NW Jumper Settings for {ctx.author.display_name}**",
+                f"Muted: `{'yes' if muted else 'no'}`",
+                f"Blocked kingdoms: `{len(blocks)}`",
+            ]
+            if blocks:
+                for row in blocks[:25]:
+                    lines.append(f"- {row.get('kingdom_name')}")
+                extra = len(blocks) - 25
+                if extra > 0:
+                    lines.append(f"... +{extra} more")
+            else:
+                lines.append("Blocked kingdoms: (none)")
+            lines.append("Use `!nwjumpblock <kingdom>` to add, `!nwjumpblock remove <kingdom>` to remove, or `!nwjumpblock clear` to reset.")
+            return await ctx.send("\n".join(lines))
+
+        if action_norm in ("clear", "reset"):
+            removed = await run_db(sync_clear_nw_jump_user_blocks, guild_id, user_id)
+            return await ctx.send(f"🧹 Cleared `{removed}` blocked kingdom(s) from your NW jumper list.")
+
+        if action_norm in ("remove", "rm", "delete", "del"):
+            name = str(kingdom or "").strip()
+            if not name:
+                return await ctx.send("Usage: `!nwjumpblock remove <kingdom name>`")
+            result = await run_db(sync_remove_nw_jump_user_block, guild_id, user_id, name)
+            if int((result or {}).get("removed") or 0) <= 0:
+                return await ctx.send(f"ℹ️ `{name}` was not on your NW jumper block list.")
+            return await ctx.send(f"✅ Removed `{name}` from your NW jumper block list.")
+
+        names_text = " ".join([str(action or "").strip(), str(kingdom or "").strip()]).strip()
+        names = [x.strip() for x in re.split(r"\s*,\s*", names_text) if x.strip()]
+        if not names:
+            return await ctx.send("Usage: `!nwjumpblock <kingdom name>` | `!nwjumpblock list` | `!nwjumpblock remove <kingdom name>` | `!nwjumpblock clear`")
+
+        added = []
+        skipped = []
+        for name in names[:50]:
+            result = await run_db(sync_add_nw_jump_user_block, guild_id, user_id, name)
+            if result and result.get("ok"):
+                added.append(str(result.get("kingdom_name") or name))
+            else:
+                skipped.append(name)
+
+        parts = []
+        if added:
+            shown = ", ".join(f"`{x}`" for x in added[:12])
+            extra = len(added) - 12
+            parts.append(f"✅ Added {shown}" + (f" and `{extra}` more" if extra > 0 else "") + " to your NW jumper block list.")
+        if skipped:
+            parts.append(f"⚠️ Skipped `{len(skipped)}` empty/invalid name(s).")
+        return await ctx.send("\n".join(parts) if parts else "ℹ️ No block list changes made.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumpblock failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumpblock error: {e}", tb=tb)
+
+
+@bot.command(name="mutenwjumper")
+async def mutenwjumper(ctx, action: str = "on"):
+    """Mute or unmute a user's personal NW jumper notifications."""
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        guild_id = int(ctx.guild.id)
+        user_id = int(ctx.author.id)
+        action_norm = str(action or "on").strip().lower()
+
+        if action_norm in ("status", "show"):
+            pref = await run_db(sync_get_nw_jump_user_pref, guild_id, user_id)
+            muted = bool((pref or {}).get("muted"))
+            return await ctx.send(f"🔕 NW jumper personal DMs are `{'muted' if muted else 'unmuted'}` for you.")
+
+        if action_norm in ("off", "unmute", "false", "0", "no"):
+            await run_db(sync_set_nw_jump_user_muted, guild_id, user_id, False)
+            return await ctx.send("🔔 NW jumper personal DMs are unmuted for you.")
+
+        if action_norm in ("on", "mute", "true", "1", "yes"):
+            await run_db(sync_set_nw_jump_user_muted, guild_id, user_id, True)
+            return await ctx.send("🔕 NW jumper personal DMs are muted for you.")
+
+        return await ctx.send("Usage: `!mutenwjumper` | `!mutenwjumper off` | `!mutenwjumper status`")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ mutenwjumper failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"mutenwjumper error: {e}", tb=tb)
+
+
+@bot.command(name="unmutenwjumper")
+async def unmutenwjumper(ctx):
+    cmd = bot.get_command("mutenwjumper")
+    if cmd:
+        return await ctx.invoke(cmd, action="off")
+    return await ctx.send("Usage: `!mutenwjumper off`")
 
 
 @bot.command(name="nwjumpcheck")
