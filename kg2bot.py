@@ -2703,6 +2703,7 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
         return {"active": False, "signature": "", "label": ""}
 
     candidates = {}
+    slice_candidates = {}
 
     def _looks_like_pie_key(key_norm: str) -> bool:
         if not key_norm:
@@ -2725,6 +2726,36 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
             return True
         return False
 
+    def _looks_like_slice_key(key_norm: str) -> bool:
+        if not key_norm:
+            return False
+        return (
+            "slice" in key_norm
+            or "slices" in key_norm
+            or "pieces" in key_norm
+            or "piecount" in key_norm
+            or "pielevel" in key_norm
+            or "protectioncount" in key_norm
+            or "protectionlevel" in key_norm
+        )
+
+    def _walk_values(value, path: str):
+        if value is None:
+            return
+        path_norm = re.sub(r"[^a-z0-9]+", "", str(path or "").casefold())
+        if path_norm and _looks_like_pie_key(path_norm):
+            candidates[path] = value
+        if path_norm and _looks_like_slice_key(path_norm):
+            slice_candidates[path] = value
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                child_path = f"{path}.{child_key}" if path else str(child_key)
+                _walk_values(child_value, child_path)
+        elif isinstance(value, (list, tuple)):
+            for idx, child_value in enumerate(value[:8]):
+                child_path = f"{path}[{idx}]" if path else f"[{idx}]"
+                _walk_values(child_value, child_path)
+
     for raw_key, raw_value in row.items():
         if raw_value is None:
             continue
@@ -2736,6 +2767,10 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
             continue
         if _looks_like_pie_key(key_norm):
             candidates[key] = raw_value
+        if _looks_like_slice_key(key_norm):
+            slice_candidates[key] = raw_value
+        if isinstance(raw_value, (dict, list, tuple)):
+            _walk_values(raw_value, key)
 
     # Fallback: some responses place pie/protection text into generic status
     # fields (e.g., "Status": "2 pie") without pie/protection key names.
@@ -2781,8 +2816,10 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
             return bool(value)
         if isinstance(value, (int, float)):
             return float(value) > 0
-        if isinstance(value, (list, tuple, set, dict)):
-            return len(value) > 0
+        if isinstance(value, dict):
+            return any(_is_active_value(v) for v in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(_is_active_value(v) for v in value)
 
         txt = str(value or "").strip()
         if not txt:
@@ -2795,14 +2832,40 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
             return int(num) > 0
         return True
 
-    active = any(_is_active_value(v) for v in candidates.values())
-    signature = json.dumps(candidates, sort_keys=True, separators=(",", ":"), default=str)
+    active = any(_is_active_value(v) for v in candidates.values()) or any(_is_active_value(v) for v in slice_candidates.values())
+    signature_data = dict(candidates)
+    for key, value in slice_candidates.items():
+        signature_data.setdefault(key, value)
+    signature = json.dumps(signature_data, sort_keys=True, separators=(",", ":"), default=str)
     label_parts = []
-    for key, value in sorted(candidates.items()):
+
+    def _format_pie_value(key: str, value) -> str:
+        if isinstance(value, (dict, list, tuple, set)):
+            text = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        else:
+            text = str(value).strip()
+        key_low = str(key or "").casefold()
+        text_low = text.casefold()
+        num = _safe_int_or_none(text.replace(",", ""))
+        if num is not None and ("missing" in key_low or "gone" in key_low or "lost" in key_low or "used" in key_low or "missing" in text_low):
+            return f"{num} slice{'s' if int(num) != 1 else ''} missing"
+        if num is not None and ("slice" in key_low or "pie" in key_low or "protection" in key_low):
+            return f"{num} slice{'s' if int(num) != 1 else ''}"
+        m = re.search(r"(\d+)\s*(?:slice|slices|piece|pieces)", text, re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            if "missing" in text_low or "gone" in text_low or "lost" in text_low or "used" in text_low:
+                return f"{n} slice{'s' if n != 1 else ''} missing"
+        return text
+
+    for key, value in sorted(signature_data.items()):
         if isinstance(value, (dict, list, tuple, set)):
             pretty = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
         else:
             pretty = str(value).strip()
+        formatted = _format_pie_value(key, value)
+        if formatted:
+            pretty = formatted
         if len(pretty) > 40:
             pretty = pretty[:37] + "..."
         label_parts.append(f"{key}={pretty}")
@@ -3671,6 +3734,8 @@ async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
         if dispatch_alerts:
             if nw_events:
                 await send_nw_jump_alerts(nw_events)
+            if pie_events:
+                await send_rankings_pie_alerts(pie_events)
 
     return {
         "rows": rows,
@@ -7738,6 +7803,13 @@ async def rankingspiedebug(ctx):
                 )
         else:
             lines.append("Detected pie rows: (none)")
+            sample_keys = []
+            for r in (rows or [])[:3]:
+                keys = ", ".join(str(k) for k in list((r or {}).keys())[:12])
+                if keys:
+                    sample_keys.append(keys)
+            if sample_keys:
+                lines.append(f"Normalized row keys sample: `{sample_keys[0][:350]}`")
 
         if first_non_empty_preview:
             lines.append(f"First API body preview: `{first_non_empty_preview[:450]}`")
