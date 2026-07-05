@@ -152,6 +152,27 @@ class BridgeReportFormattingTests(unittest.TestCase):
         self.assertIn("Approximate defensive power*: 16641\n*(without skill/prayer modifiers)", formatted)
         self.assertIn("Loose Order Formation lvl 5\nCrop Rotation lvl 6", formatted)
 
+    def test_format_bridge_report_text_strips_messenger_tail_after_tech(self):
+        raw = (
+            "Received: Jul 5, 2026, 5:45:16 PM Subject: Sevens house Spy Report "
+            "Target: Sevens house Alliance: Knights of the Fire Honour: 3.07 Ranking: 46 Networth: 14859 "
+            "Spies Sent: 3000 Spies Lost: 357 Result Level: Complete Infiltration Number of Castles: 49 "
+            "Our spies also found the following information about the kingdom's troops: "
+            "Footmen: 3345 Crossbowmen: 565 Peasants: 24049 "
+            "Approximate defensive power*: 40298*(without skill/prayer modifiers) "
+            "The following technology information was also discovered: Improved Military Buildings lvl 6 "
+            "Better Building Maintenance lvl 4 Leadership Training lvl 6 Military Encampment lvl 7 "
+            "Ufffffff glad I asked 11:18 PM @mk experiment tonight Mute Search Chat info Customize chat"
+        )
+
+        formatted = kg2bot.format_bridge_report_text(raw)
+
+        self.assertIn("Received: Jul 5, 2026, 5:45:16 PM\nSubject: Sevens house Spy Report", formatted)
+        self.assertIn("Footmen: 3345\nCrossbowmen: 565", formatted)
+        self.assertTrue(formatted.endswith("Military Encampment lvl 7"))
+        self.assertNotIn("Ufffffff", formatted)
+        self.assertNotIn("Mute Search Chat info", formatted)
+
 
 class FacebookBridgeStateTests(unittest.TestCase):
     def test_legacy_chat_hash_migrates_to_uninitialized_seen_state(self):
@@ -206,6 +227,27 @@ class FacebookBridgeStateTests(unittest.TestCase):
 
         self.assertEqual(1, len(unseen))
         self.assertEqual(report_hash, unseen[0][1])
+
+    def test_unseen_report_batch_dedupes_same_report_with_different_messenger_tails(self):
+        base = (
+            "Target: Sevens house Alliance: Knights of the Fire Honour: 3.07 Ranking: 46 Networth: 14859 "
+            "Spies Sent: 3000 Spies Lost: 357 Result Level: Complete Infiltration Number of Castles: 49 "
+            "Our spies also found the following information about the kingdom's troops: "
+            "Footmen: 3345 Crossbowmen: 565 Peasants: 24049 "
+            "The following technology information was also discovered: Improved Military Buildings lvl 6 "
+            "Better Building Maintenance lvl 4 Leadership Training lvl 6 Military Encampment lvl 7"
+        )
+        variants = [
+            base + " Ufffffff glad I asked Mute Search Chat info",
+            base + " Ufffffff glad I asked shhh don't tell Ant Mute Search Chat info",
+            base + " Mute Search Chat info Customize chat Chat members",
+        ]
+
+        unseen = fb_messenger_bridge._unseen_report_batch(variants, set())
+
+        self.assertEqual(1, len(unseen))
+        self.assertTrue(unseen[0][0].endswith("Military Encampment lvl 7"))
+        self.assertNotIn("Ufffffff", unseen[0][0])
 
 
 if __name__ == "__main__":

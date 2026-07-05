@@ -76,8 +76,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-05.5"
+BOT_VERSION = "2026-07-05.6"
 PATCH_NOTES = [
+    "Facebook Messenger bridge now strips trailing chat/UI text after report tech lines so the same report is not reposted when people chat after it.",
     "Facebook Messenger bridge now keeps per-chat seen report history and baselines old visible FB reports on startup to prevent replay/double posts.",
     "Rankings tracking now records pie-status changes silently during background refreshes while leaving NW alert posting unchanged.",
     "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
@@ -642,6 +643,7 @@ def normalized_report_hash(text: str) -> str:
 
 
 _BRIDGE_REPORT_BREAK_BEFORE = (
+    "Received:",
     "From:",
     "Date:",
     "To:",
@@ -675,6 +677,7 @@ _BRIDGE_REPORT_BREAK_BEFORE = (
     "Peasants:",
     "Pikemen:",
     "Footmen:",
+    "Crossbowmen:",
     "Horses:",
     "Green Gems:",
     "Blue Gems:",
@@ -688,6 +691,36 @@ _BRIDGE_REPORT_BREAK_BEFORE = (
     "Bought ",
     "Sold ",
 )
+
+
+def _trim_bridge_report_tail_lines(lines: list[str]) -> list[str]:
+    trimmed: list[str] = []
+    in_tech_section = False
+    chrome_re = re.compile(r"^(Mute|Search|Chat info|Customize chat|Chat members|Media, files and links|Privacy & support)\b", re.IGNORECASE)
+    tech_re = re.compile(r"^(.+?\blvl\s+\d+)\b.*$", re.IGNORECASE)
+
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if chrome_re.search(line):
+            break
+
+        if in_tech_section:
+            match = tech_re.match(line)
+            if not match:
+                break
+            line = match.group(1).strip()
+
+        trimmed.append(line)
+
+        if "the following technology information was also discovered" in line.lower():
+            match = tech_re.match(line)
+            if match:
+                trimmed[-1] = match.group(1).strip()
+            in_tech_section = True
+
+    return trimmed
 
 
 def format_bridge_report_text(text: str) -> str:
@@ -709,7 +742,8 @@ def format_bridge_report_text(text: str) -> str:
     value = re.sub(r"\s+(?=\d+ of your footsoldiers)", "\n", value, flags=re.IGNORECASE)
     value = re.sub(r"(?<=\))\s+(?=Attacked by |Launched an attack on |Bought |Sold )", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
-    return "\n".join(line.strip() for line in value.splitlines() if line.strip()).strip()
+    lines = _trim_bridge_report_tail_lines([line.strip() for line in value.splitlines() if line.strip()])
+    return "\n".join(lines).strip()
 
 
 def castle_bonus(c: int) -> float:

@@ -73,6 +73,7 @@ def _preview(text: str, limit: int = 220) -> str:
 
 
 _REPORT_BREAK_BEFORE = (
+    "Received:",
     "From:",
     "Date:",
     "To:",
@@ -106,6 +107,7 @@ _REPORT_BREAK_BEFORE = (
     "Peasants:",
     "Pikemen:",
     "Footmen:",
+    "Crossbowmen:",
     "Horses:",
     "Green Gems:",
     "Blue Gems:",
@@ -119,6 +121,36 @@ _REPORT_BREAK_BEFORE = (
     "Bought ",
     "Sold ",
 )
+
+
+def _trim_report_tail_lines(lines: List[str]) -> List[str]:
+    trimmed: List[str] = []
+    in_tech_section = False
+    chrome_re = re.compile(r"^(Mute|Search|Chat info|Customize chat|Chat members|Media, files and links|Privacy & support)\b", re.IGNORECASE)
+    tech_re = re.compile(r"^(.+?\blvl\s+\d+)\b.*$", re.IGNORECASE)
+
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if chrome_re.search(line):
+            break
+
+        if in_tech_section:
+            match = tech_re.match(line)
+            if not match:
+                break
+            line = match.group(1).strip()
+
+        trimmed.append(line)
+
+        if "the following technology information was also discovered" in line.lower():
+            match = tech_re.match(line)
+            if match:
+                trimmed[-1] = match.group(1).strip()
+            in_tech_section = True
+
+    return trimmed
 
 
 def _format_report_text(text: str) -> str:
@@ -139,7 +171,8 @@ def _format_report_text(text: str) -> str:
     value = re.sub(r"\s+(?=\d+ of your footsoldiers)", "\n", value, flags=re.IGNORECASE)
     value = re.sub(r"(?<=\))\s+(?=Attacked by |Launched an attack on |Bought |Sold )", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
-    return "\n".join(line.strip() for line in value.splitlines() if line.strip()).strip()
+    lines = _trim_report_tail_lines([line.strip() for line in value.splitlines() if line.strip()])
+    return "\n".join(lines).strip()
 
 
 def _split_report_blob(text: str) -> List[str]:
