@@ -333,9 +333,6 @@ def _open_chat(page, chat_name: str) -> bool:
     _ensure_messages_home(page)
     chat_pattern = _chat_name_pattern(chat_name)
 
-    if _looks_like_open_thread(page) and _current_thread_has_chat_report_preview(page, chat_name):
-        return True
-
     strategies = [
         lambda: page.get_by_role("link", name=chat_pattern).first,
         lambda: page.get_by_text(chat_pattern).first,
