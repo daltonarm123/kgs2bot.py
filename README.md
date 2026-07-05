@@ -296,7 +296,7 @@ railway up -y --service fb-messenger-bridge --environment production
 ```
 
 Note:
-- The shared `railway.json` start command auto-runs `python -m playwright install chromium` when `RUN_FB_MESSENGER_BRIDGE=true`.
+- The shared `railway.json` start command auto-runs `python -m playwright install --with-deps chromium` when `RUN_FB_MESSENGER_BRIDGE=true`.
 
 Recommended variables for this bot:
 
