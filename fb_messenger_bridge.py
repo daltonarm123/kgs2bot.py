@@ -68,25 +68,31 @@ def _is_report_text(text: str) -> bool:
     if len(t) < 20:
         return False
 
-    report_markers = [
-        r"Approximate defensive power",
-        r"Number of Castles",
-        r"The following technology information was also discovered",
-        r"Subject:\s*Attack Report",
-        r"Attack Report",
-        r"Attack Result",
-        r"Target:",
-        r"You have been attacked by",
-        r"attacked\s+.*\s+for\s+\d+\s+(?:land|acres)",
-        r"Stalemate",
-        r"Minor Victory",
-        r"Major Victory",
-        r"Overwhelming Victory",
-        r"Attacker Losses",
-        r"Defender Losses",
-        r"Land Taken",
-    ]
-    return any(re.search(pat, t, flags=re.IGNORECASE) for pat in report_markers)
+    ll = t.lower()
+
+    # Attack reports from FB should contain the core header + result sections.
+    looks_attack = (
+        ("subject: attack report:" in ll or "attack report:" in ll)
+        and "attack result:" in ll
+        and (
+            "you have gained the following during the attack" in ll
+            or "casualties during the attack" in ll
+        )
+    )
+
+    # Spy reports should contain target/spy metadata and troop/resource sections.
+    looks_spy = (
+        "target:" in ll
+        and "spies sent:" in ll
+        and "spies lost:" in ll
+        and (
+            "number of castles:" in ll
+            or "approximate defensive power" in ll
+        )
+        and "our spies also found" in ll
+    )
+
+    return looks_attack or looks_spy
 
 
 def _load_state() -> Dict[str, str]:
