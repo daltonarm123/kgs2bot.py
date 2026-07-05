@@ -4141,6 +4141,81 @@ def sync_get_live_kingdom_profile(kingdom_query: str, lookback_hours: int | None
     }
 
 
+def sync_get_live_nw_delta(kingdom_query: str, lookback_hours: int | None = None) -> dict:
+    """Return a recent live NW delta for a kingdom using rankings state/history only."""
+    requested = str(kingdom_query or "").strip()
+    if not requested:
+        return {"ok": False, "reason": "missing_kingdom"}
+
+    lookback_hours = max(1, min(168, int(lookback_hours or KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS or 1)))
+    resolved = sync_fuzzy_live_kingdom(requested) or requested
+    lookup_key = normalize_kingdom_lookup_key(resolved)
+    cutoff = now_utc() - timedelta(hours=lookback_hours)
+
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kingdom_name, networth, updated_at
+            FROM kingdom_rankings_state
+            WHERE REGEXP_REPLACE(LOWER(BTRIM(COALESCE(kingdom_name, ''))), '[^a-z0-9]+', ' ', 'g')=%s
+            ORDER BY updated_at DESC NULLS LAST, kingdom_id DESC
+            LIMIT 1;
+            """,
+            (lookup_key,),
+        )
+        current = cur.fetchone()
+        if not current:
+            cur.execute(
+                """
+                SELECT kingdom_name, networth, snapshot_at AS updated_at
+                FROM kingdom_rankings_history
+                WHERE lookup_key=%s
+                ORDER BY snapshot_at DESC, id DESC
+                LIMIT 1;
+                """,
+                (lookup_key,),
+            )
+            current = cur.fetchone()
+        if not current:
+            return {
+                "ok": False,
+                "reason": "no_rankings_data",
+                "kingdom": resolved,
+                "lookback_hours": lookback_hours,
+            }
+
+        kingdom_name = str(current.get("kingdom_name") or resolved).strip() or resolved
+        lookup_key = normalize_kingdom_lookup_key(kingdom_name)
+
+        cur.execute(
+            """
+            SELECT networth, snapshot_at AS updated_at
+            FROM kingdom_rankings_history
+            WHERE lookup_key=%s
+              AND snapshot_at <= %s
+            ORDER BY snapshot_at DESC, id DESC
+            LIMIT 1;
+            """,
+            (lookup_key, normalize_to_utc(cutoff)),
+        )
+        baseline = cur.fetchone()
+
+    current_nw = _safe_int_or_none((current or {}).get("networth"))
+    baseline_nw = _safe_int_or_none((baseline or {}).get("networth")) if baseline else None
+    nw_delta = (int(current_nw) - int(baseline_nw)) if current_nw is not None and baseline_nw is not None else None
+
+    return {
+        "ok": True,
+        "kingdom": kingdom_name,
+        "lookback_hours": lookback_hours,
+        "nw_delta": nw_delta,
+        "current_networth": current_nw,
+        "baseline_networth": baseline_nw,
+        "current_updated_at": (current or {}).get("updated_at"),
+        "baseline_updated_at": (baseline or {}).get("updated_at") if baseline else None,
+    }
+
+
 def sync_get_spy_by_id(report_id: int):
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute("""
@@ -7286,11 +7361,20 @@ async def attackbackfill(ctx, days: int = None):
 
 @bot.command(name="oven")
 async def oven(ctx, *, kingdom: str):
-    """!oven <kingdom> -> infer likely troops in training from last two SR snapshots."""
+    """!oven <kingdom> -> infer likely troops in training from recent SR snapshots + live NW jump when available."""
     try:
         real = await run_db(sync_fuzzy_kingdom, kingdom)
         real = real or kingdom
-        est = await run_db(sync_build_oven_estimate, real, None, None)
+
+        nw_ctx = await run_db(
+            sync_get_live_nw_delta,
+            real,
+            int(KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS or 1),
+        )
+        nw_delta = _safe_int_or_none((nw_ctx or {}).get("nw_delta"))
+        event_time = (nw_ctx or {}).get("current_updated_at") if nw_delta else None
+
+        est = await run_db(sync_build_oven_estimate, real, nw_delta, event_time)
         if not est.get("ok"):
             reason = str(est.get("reason") or "unknown")
             if reason == "need_two_recent_sr":
@@ -7307,6 +7391,12 @@ async def oven(ctx, *, kingdom: str):
             return await ctx.send(f"❌ Oven estimate unavailable for **{real}** (`{reason}`).")
 
         lines = format_oven_summary_lines(est, limit=int(OVEN_MAX_RESULTS or 6), compact=False)
+        if nw_delta:
+            lines.append(
+                f"Live NW jump input: +`{fmt_int(nw_delta)}` over `{int((nw_ctx or {}).get('lookback_hours') or KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS or 1)}h` rankings window."
+            )
+        else:
+            lines.append("Live NW jump input not available; estimate used SR-derived NW/peasant deltas only.")
         lines.append("Tune constants with Railway env vars like `OVEN_HEAVY_CAVALRY_NW` and `OVEN_HEAVY_CAVALRY_MINUTES_PER_1000` as game values are verified.")
         for chunk in split_for_discord("\n".join(lines), 1900):
             await ctx.send(chunk)
