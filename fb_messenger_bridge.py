@@ -314,15 +314,18 @@ def _open_chat(page, chat_name: str) -> bool:
 
     # Fallback: use Messenger search to surface the conversation, then open first hit.
     search_selectors = [
-        "input[aria-label*='Search']",
-        "input[placeholder*='Search']",
-        "input[type='search']",
+        "input[aria-label*='Search Messenger']",
+        "input[placeholder*='Search Messenger']",
+        "[aria-label='Search Messenger']",
+        "[aria-label*='Search Messenger']",
     ]
     for sel in search_selectors:
         try:
             search_box = page.locator(sel).first
             if not search_box.count():
                 continue
+            if FB_DEBUG_REPORTS:
+                print(f"DEBUG: using messenger search selector={sel} chat={chat_name}")
             search_box.click(timeout=1200)
             search_box.fill("")
             search_box.fill(chat_name)
