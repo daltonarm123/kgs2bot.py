@@ -73,12 +73,13 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-05.2"
+BOT_VERSION = "2026-07-05.3"
 PATCH_NOTES = [
     "Rankings alerts now track pie-status changes and can notify when kingdoms appear to have been hit.",
     "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
     "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
-    "Documented the new live-intel command and lookback tuning env vars in the README.",
+    "NW jump diagnostics now show current state rows, rankings history rows, and live pie detections from the current pull.",
+    "Rankings tracking now always keeps at least the top 100 kingdoms in scope.",
 ]
 # -------------------------------------------------
 
@@ -164,7 +165,7 @@ KG_GAME_AUTH_CACHE_SECONDS = _env_int("KG_GAME_AUTH_CACHE_SECONDS", 1800)
 KG_GAME_SEARCH_KINGDOM_ID = _env_int("KG_GAME_SEARCH_KINGDOM_ID", 0)
 KG_GAME_RANKINGS_CONTINENT_ID = _env_int("KG_GAME_RANKINGS_CONTINENT_ID", -1)
 KG_GAME_RANKINGS_PAGE_SIZE = max(1, _env_int("KG_GAME_RANKINGS_PAGE_SIZE", 20))
-KG_GAME_RANKINGS_TARGET_ROWS = max(1, _env_int("KG_GAME_RANKINGS_TARGET_ROWS", 100))
+KG_GAME_RANKINGS_TARGET_ROWS = max(100, _env_int("KG_GAME_RANKINGS_TARGET_ROWS", 100))
 KG_REPORT_DEFAULT_TZ = _env_text("KG_REPORT_DEFAULT_TZ", "UTC")
 KG_REPORT_MAX_FUTURE_MINUTES = _env_int("KG_REPORT_MAX_FUTURE_MINUTES", 10)
 KG_REPORT_AUTO_INFER_TZ = _env_bool("KG_REPORT_AUTO_INFER_TZ", True)
@@ -3243,16 +3244,20 @@ def sync_get_nw_rankings_state_stats(world_id: int) -> dict:
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COUNT(*)::int AS cnt, MAX(updated_at) AS last_updated
-            FROM kingdom_rankings_state
-            WHERE world_id=%s;
+            SELECT
+                (SELECT COUNT(*)::int FROM kingdom_rankings_state WHERE world_id=%s) AS state_count,
+                (SELECT MAX(updated_at) FROM kingdom_rankings_state WHERE world_id=%s) AS state_last_updated,
+                (SELECT COUNT(*)::int FROM kingdom_rankings_history WHERE world_id=%s) AS history_count,
+                (SELECT MAX(snapshot_at) FROM kingdom_rankings_history WHERE world_id=%s) AS history_last_snapshot
             """,
-            (int(world_id),),
+            (int(world_id), int(world_id), int(world_id), int(world_id)),
         )
         row = cur.fetchone() or {}
         return {
-            "count": int(row.get("cnt") or 0),
-            "last_updated": row.get("last_updated"),
+            "state_count": int(row.get("state_count") or 0),
+            "state_last_updated": row.get("state_last_updated"),
+            "history_count": int(row.get("history_count") or 0),
+            "history_last_snapshot": row.get("history_last_snapshot"),
         }
 
 
@@ -7342,12 +7347,14 @@ async def nwjumpcheck(ctx):
         auth = await asyncio.to_thread(_kg_get_auth, False)
         auth_mode = str((auth or {}).get("auth_mode") or "none")
         has_auth = bool(auth and auth.get("account_id") and auth.get("token"))
+        live_pie_count = sum(1 for r in (rows or []) if bool(r.get("pie_active")) or str(r.get("pie_label") or "").strip())
 
         lines = [
             "🧪 **NW Jump Check**",
-            f"World: `{world_id}` | Rankings pulled now: `{len(rows or [])}`",
+            f"World: `{world_id}` | Rankings pulled now: `{len(rows or [])}` | Live pie detected: `{live_pie_count}`",
             f"Auth: `{auth_mode}` ({'ok' if has_auth else 'missing'})",
-            f"Baseline rows in DB: `{fmt_int(stats.get('count'))}` | Last baseline update: `{stats.get('last_updated') or 'never'}`",
+            f"Current state rows: `{fmt_int(stats.get('state_count'))}` | Last state update: `{stats.get('state_last_updated') or 'never'}`",
+            f"Rankings history rows: `{fmt_int(stats.get('history_count'))}` | Last history snapshot: `{stats.get('history_last_snapshot') or 'never'}`",
             f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last NW events: `{ev_last or 'n/a'}` | last pie events: `{pie_last or 'n/a'}`",
             f"Loop last ok ts: `{ok_ts or 'n/a'}` | last error ts: `{err_ts or 'n/a'}`",
             f"Last API mode: `{last_auth_mode or 'n/a'}` | ReturnValue: `{last_return_value or 'n/a'}` | ReturnString: `{last_return_string or 'n/a'}`",
