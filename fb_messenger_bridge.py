@@ -348,6 +348,7 @@ def main() -> int:
                         continue
 
                     messages = _extract_recent_messages(page, FB_LOOKBACK_MESSAGES)
+                    print(f"INFO: scanned chat={chat_name} messages={len(messages)}")
                     if not messages:
                         continue
 
