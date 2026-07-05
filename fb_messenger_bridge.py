@@ -71,6 +71,95 @@ def _preview(text: str, limit: int = 220) -> str:
     return compact[: limit - 3] + "..."
 
 
+_REPORT_BREAK_BEFORE = (
+    "From:",
+    "Date:",
+    "To:",
+    "Subject:",
+    "Attack Report:",
+    "Attack Result:",
+    "You have gained the following during the attack:",
+    "We regret to inform you of the following casualties during the attack:",
+    "You have also been awarded",
+    "Target:",
+    "Alliance:",
+    "Honour:",
+    "Ranking:",
+    "Networth:",
+    "Spies Sent:",
+    "Spies Lost:",
+    "Result Level:",
+    "Number of Castles:",
+    "Our spies also found the following information about the kingdom's resources:",
+    "Our spies also found the following information about the kingdoms resources:",
+    "Our spies also found the following information about the kingdom's troops:",
+    "Our spies also found the following information about the kingdoms troops:",
+    "The following information was found regarding troop movements around this kingdom:",
+    "The following recent market transactions were also discovered:",
+    "The following technology information was also discovered:",
+    "Approximate defensive power*:",
+    "Population:",
+    "Knights:",
+    "Heavy Cavalry:",
+    "Archers:",
+    "Peasants:",
+    "Pikemen:",
+    "Footmen:",
+    "Horses:",
+    "Green Gems:",
+    "Blue Gems:",
+    "Stone:",
+    "Land:",
+    "Food:",
+    "Wood:",
+    "Gold:",
+    "Attacked by ",
+    "Launched an attack on ",
+    "Bought ",
+    "Sold ",
+)
+
+
+def _format_report_text(text: str) -> str:
+    value = re.sub(r"\r\n?", "\n", str(text or "")).strip()
+    if not value:
+        return ""
+
+    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"^Enter,\s*Message sent .*? by [^:]{1,80}:\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+Enter,\s*Message sent .*? by [^:]{1,80}:\s*", "\n", value, flags=re.IGNORECASE)
+    for marker in sorted(_REPORT_BREAK_BEFORE, key=len, reverse=True):
+        value = re.sub(rf"\s+(?={re.escape(marker)})", "\n", value)
+
+    value = re.sub(r"(?<=\d)\*\(without skill/prayer modifiers\)", "\n*(without skill/prayer modifiers)", value)
+    value = re.sub(r"Subject:\nAttack Report:", "Subject: Attack Report:", value)
+    value = re.sub(r"(?<=\))\s+(?=The following|Our spies|From:|Target:|Attack Report:)", "\n\n", value)
+    value = re.sub(r"(?<=\d)\s+(?=[A-Z][A-Za-z ]+ lvl \d+)", "\n", value)
+    value = re.sub(r"\s+(?=\d+ of your footsoldiers)", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?<=\))\s+(?=Attacked by |Launched an attack on |Bought |Sold )", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return "\n".join(line.strip() for line in value.splitlines() if line.strip()).strip()
+
+
+def _split_report_blob(text: str) -> List[str]:
+    formatted = _format_report_text(text)
+    if not formatted:
+        return []
+
+    chunks: List[str] = []
+    current: List[str] = []
+    for line in formatted.splitlines():
+        ll = line.lower()
+        starts_new = ll.startswith("target:") or ll.startswith("from:")
+        if current and starts_new:
+            chunks.append("\n".join(current).strip())
+            current = []
+        current.append(line)
+    if current:
+        chunks.append("\n".join(current).strip())
+    return chunks or [formatted]
+
+
 def _chat_name_pattern(chat_name: str) -> re.Pattern:
     pieces: List[str] = []
     for char in str(chat_name or ""):
@@ -492,6 +581,15 @@ def _build_report_candidates(snippets: List[str]) -> List[str]:
     if not snippets:
         return []
 
+    expanded: List[str] = []
+    for snippet in snippets:
+        parts = _split_report_blob(snippet)
+        if parts:
+            expanded.extend(parts)
+        else:
+            expanded.append(snippet)
+    snippets = expanded
+
     starters = (
         "subject:",
         "attack report",
@@ -504,9 +602,10 @@ def _build_report_candidates(snippets: List[str]) -> List[str]:
 
     # Keep original snippets too, then add stitched multiline candidates.
     for s in snippets:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
+        formatted = _format_report_text(s)
+        if formatted and formatted not in seen:
+            seen.add(formatted)
+            out.append(formatted)
 
     n = len(snippets)
     for i, line in enumerate(snippets):
@@ -524,7 +623,7 @@ def _build_report_candidates(snippets: List[str]) -> List[str]:
                 break
             joined.append(nxt)
 
-        candidate = "\n".join(joined).strip()
+        candidate = _format_report_text("\n".join(joined))
         if len(candidate) < 40:
             continue
         h = _sha(candidate)
@@ -629,6 +728,7 @@ def main() -> int:
 
                     # Select the strongest current report candidate to avoid order-related misses.
                     best = max(report_candidates, key=lambda m: (_report_score(m), len(m)))
+                    best = _format_report_text(best)
                     best_hash = _sha(best)
                     if best_hash == state.get(chat_name, ""):
                         continue

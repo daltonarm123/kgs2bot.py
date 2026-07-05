@@ -130,5 +130,27 @@ class NwJumpFormattingSafetyTests(unittest.TestCase):
         self.assertIn("Unknown", sms)
 
 
+class BridgeReportFormattingTests(unittest.TestCase):
+    def test_format_bridge_report_text_reflows_messenger_blob(self):
+        raw = (
+            "Enter, Message sent 7:58 PM by General Zod: Target: Sevens house "
+            "Alliance: Knights of the Fire Honour: 3.07 Ranking: 42 Networth: 16039 "
+            "Spies Sent: 3000 Spies Lost: 203 Result Level: Complete Infiltration "
+            "Number of Castles: 49 Our spies also found the following information about the kingdom's resources: "
+            "Green Gems: 199 Blue Gems: 214 Stone: 11848 Land: 17191 / 17195 Horses: 975 "
+            "Food: 294152 Wood: 16527 Gold: 1250591 Our spies also found the following information about the kingdom's troops: "
+            "Approximate defensive power*: 16641*(without skill/prayer modifiers) "
+            "The following technology information was also discovered: Loose Order Formation lvl 5 Crop Rotation lvl 6"
+        )
+
+        formatted = kg2bot.format_bridge_report_text(raw)
+
+        self.assertNotIn("Enter, Message sent", formatted)
+        self.assertIn("Target: Sevens house\nAlliance: Knights of the Fire", formatted)
+        self.assertIn("Gold: 1250591\nOur spies also found", formatted)
+        self.assertIn("Approximate defensive power*: 16641\n*(without skill/prayer modifiers)", formatted)
+        self.assertIn("Loose Order Formation lvl 5\nCrop Rotation lvl 6", formatted)
+
+
 if __name__ == "__main__":
     unittest.main()

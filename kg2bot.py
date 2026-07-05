@@ -640,6 +640,77 @@ def normalized_report_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+_BRIDGE_REPORT_BREAK_BEFORE = (
+    "From:",
+    "Date:",
+    "To:",
+    "Subject:",
+    "Attack Report:",
+    "Attack Result:",
+    "You have gained the following during the attack:",
+    "We regret to inform you of the following casualties during the attack:",
+    "You have also been awarded",
+    "Target:",
+    "Alliance:",
+    "Honour:",
+    "Ranking:",
+    "Networth:",
+    "Spies Sent:",
+    "Spies Lost:",
+    "Result Level:",
+    "Number of Castles:",
+    "Our spies also found the following information about the kingdom's resources:",
+    "Our spies also found the following information about the kingdoms resources:",
+    "Our spies also found the following information about the kingdom's troops:",
+    "Our spies also found the following information about the kingdoms troops:",
+    "The following information was found regarding troop movements around this kingdom:",
+    "The following recent market transactions were also discovered:",
+    "The following technology information was also discovered:",
+    "Approximate defensive power*:",
+    "Population:",
+    "Knights:",
+    "Heavy Cavalry:",
+    "Archers:",
+    "Peasants:",
+    "Pikemen:",
+    "Footmen:",
+    "Horses:",
+    "Green Gems:",
+    "Blue Gems:",
+    "Stone:",
+    "Land:",
+    "Food:",
+    "Wood:",
+    "Gold:",
+    "Attacked by ",
+    "Launched an attack on ",
+    "Bought ",
+    "Sold ",
+)
+
+
+def format_bridge_report_text(text: str) -> str:
+    value = re.sub(r"\r\n?", "\n", str(text or "")).strip()
+    if not value:
+        return ""
+
+    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"^Enter,\s*Message sent .*? by [^:]{1,80}:\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+Enter,\s*Message sent .*? by [^:]{1,80}:\s*", "\n", value, flags=re.IGNORECASE)
+
+    for marker in sorted(_BRIDGE_REPORT_BREAK_BEFORE, key=len, reverse=True):
+        value = re.sub(rf"\s+(?={re.escape(marker)})", "\n", value)
+
+    value = re.sub(r"(?<=\d)\*\(without skill/prayer modifiers\)", "\n*(without skill/prayer modifiers)", value)
+    value = re.sub(r"Subject:\nAttack Report:", "Subject: Attack Report:", value)
+    value = re.sub(r"(?<=\))\s+(?=The following|Our spies|From:|Target:|Attack Report:)", "\n\n", value)
+    value = re.sub(r"(?<=\d)\s+(?=[A-Z][A-Za-z ]+ lvl \d+)", "\n", value)
+    value = re.sub(r"\s+(?=\d+ of your footsoldiers)", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?<=\))\s+(?=Attacked by |Launched an attack on |Bought |Sold )", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return "\n".join(line.strip() for line in value.splitlines() if line.strip()).strip()
+
+
 def castle_bonus(c: int) -> float:
     return (c ** 0.5) / 100 if c else 0.0
 
@@ -2319,7 +2390,7 @@ def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: st
     if not text:
         return {"ok": False, "status": 400, "error": "raw_text is empty"}
 
-    normalized = re.sub(r"\r\n?", "\n", text).strip()
+    normalized = format_bridge_report_text(text)
     source_name = str(source or "messenger").strip() or "messenger"
     ext = (str(external_id).strip() if external_id is not None else "")
     if ext:
@@ -2365,7 +2436,16 @@ def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: st
             logging.exception("bridge local DB save failed")
             local_saved = {"ok": False, "error": str(e)}
 
-        discord_post = schedule_bridge_report_to_discord(report_kind, normalized)
+        saved_any = False
+        if isinstance(local_saved, dict) and not local_saved.get("error"):
+            for value in local_saved.values():
+                if isinstance(value, dict) and value.get("saved"):
+                    saved_any = True
+                    break
+        if saved_any or (isinstance(local_saved, dict) and local_saved.get("error")):
+            discord_post = schedule_bridge_report_to_discord(report_kind, normalized)
+        else:
+            discord_post = {"scheduled": False, "duplicate": True, "reason": "already_saved"}
         forwarded = sync_recon_ingest_report(normalized)
 
     result = {
