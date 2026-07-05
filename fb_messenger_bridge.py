@@ -288,16 +288,14 @@ def _current_thread_has_chat_report_preview(page, chat_name: str) -> bool:
     text = _page_text(page)
     if not text:
         return False
-    match = _chat_name_pattern(chat_name).search(text)
-    if not match:
-        return False
-    nearby = text[match.end() : match.end() + 240].lower()
-    if "unread message" not in nearby and "subject:" not in nearby and "target:" not in nearby:
-        return False
-    report_pos = min([pos for pos in (nearby.find("subject:"), nearby.find("target:")) if pos >= 0] or [-1])
-    if report_pos < 0:
-        return False
-    return True
+    for match in _chat_name_pattern(chat_name).finditer(text):
+        nearby = text[match.end() : match.end() + 420].lower()
+        if "unread message" not in nearby and "subject:" not in nearby and "target:" not in nearby:
+            continue
+        report_pos = min([pos for pos in (nearby.find("subject:"), nearby.find("target:")) if pos >= 0] or [-1])
+        if report_pos >= 0:
+            return True
+    return False
 
 
 def _open_from_search_results(page, chat_name: str) -> bool:
