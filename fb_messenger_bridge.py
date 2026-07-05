@@ -72,9 +72,15 @@ def _preview(text: str, limit: int = 220) -> str:
 
 
 def _chat_name_pattern(chat_name: str) -> re.Pattern:
-    escaped = re.escape(chat_name).replace(r"\'", r"['\u2019]")
-    escaped = re.sub(r"\\\s+", r"\\s+", escaped)
-    return re.compile(escaped, re.IGNORECASE)
+    pieces: List[str] = []
+    for char in str(chat_name or ""):
+        if char in {"'", "\u2019", "\u2018"}:
+            pieces.append(r"['\u2019\u2018]")
+        elif char.isspace():
+            pieces.append(r"\s+")
+        else:
+            pieces.append(re.escape(char))
+    return re.compile("".join(pieces), re.IGNORECASE)
 
 
 def _page_debug_state(page) -> str:
