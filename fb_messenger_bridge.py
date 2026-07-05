@@ -43,6 +43,7 @@ FB_HEADLESS = _env_bool("FB_MESSENGER_HEADLESS", False)
 FB_POLL_SECONDS = _env_int("FB_MESSENGER_POLL_SECONDS", 15)
 FB_LOOKBACK_MESSAGES = _env_int("FB_MESSENGER_LOOKBACK_MESSAGES", 40)
 FB_LOGIN_ONLY = _env_bool("FB_MESSENGER_LOGIN_ONLY", False)
+FB_DEBUG_REPORTS = _env_bool("FB_MESSENGER_DEBUG_REPORTS", False)
 FB_CHAT_NAMES = [
     name.strip()
     for name in _env_text(
@@ -61,6 +62,13 @@ STATE_PATH = _env_text("FB_MESSENGER_STATE_PATH", ".fb_messenger_bridge_state.js
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _preview(text: str, limit: int = 220) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
 
 
 def _is_report_text(text: str) -> bool:
@@ -433,6 +441,20 @@ def main() -> int:
 
                     candidates = _build_report_candidates(messages)
                     report_candidates = [m for m in candidates if _is_report_text(m)]
+                    if FB_DEBUG_REPORTS:
+                        print(
+                            f"DEBUG: report scan chat={chat_name} "
+                            f"snippets={len(messages)} candidates={len(candidates)} "
+                            f"matches={len(report_candidates)}"
+                        )
+                        for idx, snippet in enumerate(messages[-8:], start=max(1, len(messages) - 7)):
+                            print(f"DEBUG: snippet[{idx}] chat={chat_name}: {_preview(snippet)}")
+                        for idx, candidate in enumerate(candidates[-8:], start=max(1, len(candidates) - 7)):
+                            print(
+                                f"DEBUG: candidate[{idx}] chat={chat_name} "
+                                f"score={_report_score(candidate)} match={_is_report_text(candidate)}: "
+                                f"{_preview(candidate)}"
+                            )
                     if not report_candidates:
                         continue
 
