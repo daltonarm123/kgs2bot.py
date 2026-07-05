@@ -73,11 +73,12 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-04.3"
+BOT_VERSION = "2026-07-05.2"
 PATCH_NOTES = [
-    "Added !oven training inference from SR peasant/population deltas plus NW jump data.",
-    "NW jump alerts now append likely oven/training guesses when recent SR history exists.",
-    "SR snapshots now preserve Population lines so peasant-missing inference has a fallback signal.",
+    "Rankings alerts now track pie-status changes and can notify when kingdoms appear to have been hit.",
+    "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
+    "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
+    "Documented the new live-intel command and lookback tuning env vars in the README.",
 ]
 # -------------------------------------------------
 
@@ -236,6 +237,9 @@ NW_JUMP_ALERTS_ENABLED = _env_bool("NW_JUMP_ALERTS_ENABLED", True)
 NW_JUMP_ALERT_POLL_SECONDS = _env_int("NW_JUMP_ALERT_POLL_SECONDS", 60)
 NW_JUMP_ALERT_DEFAULT_THRESHOLD = _env_int("NW_JUMP_ALERT_DEFAULT_THRESHOLD", 5000)
 NW_JUMP_ALERT_SILENT_NO_SUBS = _env_bool("NW_JUMP_ALERT_SILENT_NO_SUBS", True)
+KG_GAME_PIE_ALERTS_ENABLED = _env_bool("KG_GAME_PIE_ALERTS_ENABLED", True)
+KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS = _env_int("KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS", 1)
+KINGDOM_LIVE_ATTACK_WINDOW_HOURS = _env_int("KINGDOM_LIVE_ATTACK_WINDOW_HOURS", 24)
 OVEN_ESTIMATOR_ENABLED = _env_bool("OVEN_ESTIMATOR_ENABLED", True)
 OVEN_LOOKBACK_HOURS = _env_int("OVEN_LOOKBACK_HOURS", 36)
 OVEN_MAX_ALERT_LINES = _env_int("OVEN_MAX_ALERT_LINES", 3)
@@ -2433,8 +2437,27 @@ def init_db():
             kingdom_name TEXT,
             rank_pos INTEGER,
             networth BIGINT,
+            pie_active BOOLEAN NOT NULL DEFAULT FALSE,
+            pie_signature TEXT,
+            pie_label TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (world_id, kingdom_id)
+        );
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kingdom_rankings_history (
+            id BIGSERIAL PRIMARY KEY,
+            world_id INTEGER NOT NULL,
+            kingdom_id BIGINT NOT NULL,
+            kingdom_name TEXT,
+            lookup_key TEXT NOT NULL,
+            rank_pos INTEGER,
+            networth BIGINT,
+            pie_active BOOLEAN NOT NULL DEFAULT FALSE,
+            pie_signature TEXT,
+            pie_label TEXT,
+            snapshot_at TIMESTAMPTZ NOT NULL
         );
         """)
 
@@ -2469,10 +2492,25 @@ def init_db():
         attack_cols = {r["column_name"] for r in attack_col_rows}
         attack_nullable = {r["column_name"]: (str(r.get("is_nullable") or "").upper() == "YES") for r in attack_col_rows}
 
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'kingdom_rankings_state';
+            """
+        )
+        rankings_state_cols = {r["column_name"] for r in (cur.fetchall() or [])}
+
         if "attacker" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN attacker TEXT;")
         if "defender" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN defender TEXT;")
+        if "pie_active" not in rankings_state_cols:
+            cur.execute("ALTER TABLE kingdom_rankings_state ADD COLUMN pie_active BOOLEAN NOT NULL DEFAULT FALSE;")
+        if "pie_signature" not in rankings_state_cols:
+            cur.execute("ALTER TABLE kingdom_rankings_state ADD COLUMN pie_signature TEXT;")
+        if "pie_label" not in rankings_state_cols:
+            cur.execute("ALTER TABLE kingdom_rankings_state ADD COLUMN pie_label TEXT;")
         if "attack_result" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN attack_result TEXT;")
         if "land_taken" not in attack_cols:
@@ -2619,6 +2657,14 @@ def init_db():
             ON kingdom_rankings_state (updated_at DESC);
         """)
         cur.execute("""
+            CREATE INDEX IF NOT EXISTS kingdom_rankings_history_lookup_snapshot_idx
+            ON kingdom_rankings_history (lookup_key, snapshot_at DESC, id DESC);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS kingdom_rankings_history_world_snapshot_idx
+            ON kingdom_rankings_history (world_id, snapshot_at DESC, id DESC);
+        """)
+        cur.execute("""
             CREATE INDEX IF NOT EXISTS nw_jump_alert_subscriptions_enabled_idx
             ON nw_jump_alert_subscriptions (enabled, updated_at DESC);
         """)
@@ -2650,6 +2696,76 @@ def _kg_extract_rankings_rows(payload: dict) -> list[dict]:
     return []
 
 
+def _kg_extract_rankings_pie_state(row: dict) -> dict:
+    if not isinstance(row, dict):
+        return {"active": False, "signature": "", "label": ""}
+
+    candidates = {}
+    for raw_key, raw_value in row.items():
+        if raw_value is None:
+            continue
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        key_norm = re.sub(r"[^a-z0-9]+", "", key.casefold())
+        if not key_norm:
+            continue
+        if (
+            "pie" in key_norm
+            or key_norm in {
+                "protectionstatus",
+                "landprotectionstatus",
+                "landstatus",
+                "hitstatus",
+                "kingdomstatus",
+            }
+            or ("protect" in key_norm and ("status" in key_norm or "land" in key_norm))
+        ):
+            candidates[key] = raw_value
+
+    if not candidates:
+        return {"active": False, "signature": "", "label": ""}
+
+    def _is_active_value(value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)):
+            return float(value) > 0
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) > 0
+
+        txt = str(value or "").strip()
+        if not txt:
+            return False
+        low = txt.casefold()
+        if low in {"0", "0.0", "false", "none", "null", "[]", "{}", "clear", "empty", "n/a", "na", "no pie", "nopie"}:
+            return False
+        num = _safe_int_or_none(txt.replace(",", ""))
+        if num is not None:
+            return int(num) > 0
+        return True
+
+    active = any(_is_active_value(v) for v in candidates.values())
+    signature = json.dumps(candidates, sort_keys=True, separators=(",", ":"), default=str)
+    label_parts = []
+    for key, value in sorted(candidates.items()):
+        if isinstance(value, (dict, list, tuple, set)):
+            pretty = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        else:
+            pretty = str(value).strip()
+        if len(pretty) > 40:
+            pretty = pretty[:37] + "..."
+        label_parts.append(f"{key}={pretty}")
+
+    return {
+        "active": bool(active),
+        "signature": signature,
+        "label": "; ".join(label_parts[:3]),
+    }
+
+
 def _kg_normalize_rankings_rows(rows: list[dict]) -> list[dict]:
     out = []
     for r in rows or []:
@@ -2663,11 +2779,15 @@ def _kg_normalize_rankings_rows(rows: list[dict]) -> list[dict]:
         if nw is None:
             continue
         rank = _safe_int_or_none(_dict_pick(r, "rank", "Rank", "position", "Position", "ranking", "Ranking"))
+        pie_state = _kg_extract_rankings_pie_state(r)
         out.append({
             "kingdom_id": int(kid),
             "kingdom_name": name or f"Kingdom #{kid}",
             "rank": int(rank) if rank else None,
             "networth": int(nw),
+            "pie_active": bool(pie_state.get("active")),
+            "pie_signature": str(pie_state.get("signature") or ""),
+            "pie_label": str(pie_state.get("label") or ""),
         })
     out.sort(key=lambda x: (x.get("rank") is None, int(x.get("rank") or 10**9), -int(x.get("networth") or 0), str(x.get("kingdom_name") or "")))
     for i, row in enumerate(out, start=1):
@@ -3136,22 +3256,23 @@ def sync_get_nw_rankings_state_stats(world_id: int) -> dict:
         }
 
 
-def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_threshold: int) -> list[dict]:
+def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_threshold: int) -> dict:
     if not rows:
-        return []
+        return {"nw_events": [], "pie_events": []}
 
     threshold = max(1, int(default_threshold or 5000))
     now_ts = now_utc()
     row_by_id = {int(r["kingdom_id"]): r for r in rows if isinstance(r, dict) and r.get("kingdom_id")}
     kingdom_ids = list(row_by_id.keys())
     if not kingdom_ids:
-        return []
+        return {"nw_events": [], "pie_events": []}
 
-    events = []
+    nw_events = []
+    pie_events = []
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT kingdom_id, kingdom_name, rank_pos, networth
+            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label
             FROM kingdom_rankings_state
             WHERE world_id=%s AND kingdom_id = ANY(%s);
             """,
@@ -3169,7 +3290,7 @@ def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_thres
                 continue
             delta = int(new_nw) - int(old_nw)
             if abs(delta) >= threshold:
-                events.append({
+                nw_events.append({
                     "kingdom_id": kid,
                     "kingdom_name": str(current.get("kingdom_name") or old.get("kingdom_name") or f"Kingdom #{kid}"),
                     "old_networth": int(old_nw),
@@ -3180,6 +3301,22 @@ def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_thres
                     "detected_at": now_ts,
                 })
 
+            old_pie_active = bool(old.get("pie_active"))
+            new_pie_active = bool(current.get("pie_active"))
+            old_pie_signature = str(old.get("pie_signature") or "")
+            new_pie_signature = str(current.get("pie_signature") or "")
+            if KG_GAME_PIE_ALERTS_ENABLED and new_pie_active and new_pie_signature and new_pie_signature != old_pie_signature:
+                pie_events.append({
+                    "kingdom_id": kid,
+                    "kingdom_name": str(current.get("kingdom_name") or old.get("kingdom_name") or f"Kingdom #{kid}"),
+                    "rank": _safe_int_or_none(current.get("rank")) or _safe_int_or_none(old.get("rank_pos")),
+                    "networth": int(new_nw),
+                    "detected_at": now_ts,
+                    "pie_label": str(current.get("pie_label") or old.get("pie_label") or "").strip(),
+                    "previous_pie_label": str(old.get("pie_label") or "").strip(),
+                    "event_kind": "first_seen" if not old_pie_active else "changed",
+                })
+
         upsert_rows = [
             (
                 int(world_id),
@@ -3187,25 +3324,64 @@ def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_thres
                 str(r.get("kingdom_name") or "").strip() or None,
                 int(r.get("rank") or 0) if r.get("rank") else None,
                 int(r.get("networth") or 0),
+                bool(r.get("pie_active")),
+                str(r.get("pie_signature") or "") or None,
+                str(r.get("pie_label") or "") or None,
+                now_ts,
+            )
+            for r in row_by_id.values()
+        ]
+        history_rows = [
+            (
+                int(world_id),
+                int(r["kingdom_id"]),
+                str(r.get("kingdom_name") or "").strip() or None,
+                normalize_kingdom_lookup_key(r.get("kingdom_name")),
+                int(r.get("rank") or 0) if r.get("rank") else None,
+                int(r.get("networth") or 0),
+                bool(r.get("pie_active")),
+                str(r.get("pie_signature") or "") or None,
+                str(r.get("pie_label") or "") or None,
                 now_ts,
             )
             for r in row_by_id.values()
         ]
         cur.executemany(
             """
-            INSERT INTO kingdom_rankings_state (world_id, kingdom_id, kingdom_name, rank_pos, networth, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO kingdom_rankings_state (
+                world_id, kingdom_id, kingdom_name, rank_pos, networth,
+                pie_active, pie_signature, pie_label, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (world_id, kingdom_id) DO UPDATE
             SET kingdom_name=EXCLUDED.kingdom_name,
                 rank_pos=EXCLUDED.rank_pos,
                 networth=EXCLUDED.networth,
+                pie_active=EXCLUDED.pie_active,
+                pie_signature=EXCLUDED.pie_signature,
+                pie_label=EXCLUDED.pie_label,
                 updated_at=EXCLUDED.updated_at;
             """,
             upsert_rows,
         )
+        cur.executemany(
+            """
+            INSERT INTO kingdom_rankings_history (
+                world_id, kingdom_id, kingdom_name, lookup_key, rank_pos, networth,
+                pie_active, pie_signature, pie_label, snapshot_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """,
+            history_rows,
+        )
 
-    events.sort(key=lambda e: (-int(e.get("delta") or 0), str(e.get("kingdom_name") or "")))
-    return events
+    nw_events.sort(key=lambda e: (-int(e.get("delta") or 0), str(e.get("kingdom_name") or "")))
+    pie_events.sort(key=lambda e: (0 if str(e.get("event_kind") or "") == "first_seen" else 1, str(e.get("kingdom_name") or "")))
+    return {"nw_events": nw_events, "pie_events": pie_events}
+
+
+def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_threshold: int) -> list[dict]:
+    return list((sync_detect_rankings_alerts(world_id, rows, default_threshold) or {}).get("nw_events") or [])
 
 
 async def send_nw_jump_alerts(events: list[dict]):
@@ -3331,6 +3507,79 @@ async def send_nw_jump_alerts(events: list[dict]):
                 )
 
 
+async def send_rankings_pie_alerts(events: list[dict]):
+    if not events:
+        return
+
+    subs = await run_db(sync_get_enabled_nw_jump_subscriptions)
+    if not subs:
+        return
+
+    by_guild = {}
+    for s in subs:
+        gid = int(s.get("guild_id") or 0)
+        if gid > 0:
+            by_guild[gid] = s
+
+    for guild in bot.guilds:
+        sub = by_guild.get(int(guild.id))
+        if not sub:
+            continue
+
+        lines = ["🥧 **Pie Alert**"]
+        for e in events[:12]:
+            rank_part = f"rank #{int(e.get('rank') or 0)} • " if e.get("rank") else ""
+            nw_part = f"NW {fmt_int(e.get('networth'))}" if e.get("networth") is not None else "NW unknown"
+            reason = "pie appeared" if str(e.get("event_kind") or "") == "first_seen" else "pie changed"
+            lines.append(f"- **{e.get('kingdom_name')}** {rank_part}{nw_part} • {reason}")
+            pie_label = str(e.get("pie_label") or "").strip()
+            if pie_label:
+                lines.append(f"  {pie_label}")
+
+        extra = len(events) - 12
+        if extra > 0:
+            lines.append(f"... +{extra} more")
+
+        target_ids = []
+        primary_id = int(sub.get("channel_id") or 0)
+        if primary_id > 0:
+            target_ids.append(primary_id)
+        for c in (sub.get("extra_channel_ids") or []):
+            try:
+                cid = int(c)
+                if cid > 0:
+                    target_ids.append(cid)
+            except Exception:
+                continue
+
+        dedup_ids = []
+        seen = set()
+        for cid in target_ids:
+            if cid in seen:
+                continue
+            seen.add(cid)
+            dedup_ids.append(cid)
+
+        sent_any = False
+        for cid in dedup_ids:
+            ch = guild.get_channel(int(cid))
+            if not (ch and can_send(ch, guild)):
+                continue
+            try:
+                await ch.send("\n".join(lines))
+                sent_any = True
+            except Exception:
+                logging.exception("Failed to send pie alert to guild=%s channel=%s", guild.id, cid)
+
+        if not sent_any:
+            ch = get_live_battle_channel(guild, None)
+            if ch and can_send(ch, guild):
+                try:
+                    await ch.send("\n".join(lines))
+                except Exception:
+                    logging.exception("Failed to send pie alert to fallback channel guild=%s", guild.id)
+
+
 async def nw_jump_alerts_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
@@ -3343,16 +3592,21 @@ async def nw_jump_alerts_loop():
             await run_db(sync_meta_set, "nw_jump_last_return_string", str(dbg.get("return_string") or ""))
             await run_db(sync_meta_set, "nw_jump_last_attempts", json.dumps(dbg.get("attempts") or []))
             if rows:
-                events = await run_db(
-                    sync_detect_rankings_nw_jumps,
+                alerts = await run_db(
+                    sync_detect_rankings_alerts,
                     int(KG_GAME_WORLD_ID or 1),
                     rows,
                     int(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000),
                 )
-                await run_db(sync_meta_set, "nw_jump_last_events", str(len(events or [])))
+                nw_events = list((alerts or {}).get("nw_events") or [])
+                pie_events = list((alerts or {}).get("pie_events") or [])
+                await run_db(sync_meta_set, "nw_jump_last_events", str(len(nw_events or [])))
+                await run_db(sync_meta_set, "nw_jump_last_pie_events", str(len(pie_events or [])))
                 await run_db(sync_meta_set, "nw_jump_last_ok_ts", str(int(time.time())))
-                if events:
-                    await send_nw_jump_alerts(events)
+                if nw_events:
+                    await send_nw_jump_alerts(nw_events)
+                if pie_events:
+                    await send_rankings_pie_alerts(pie_events)
         except Exception:
             logging.exception("nw_jump_alerts_loop failed")
             try:
@@ -3414,6 +3668,207 @@ def sync_fuzzy_kingdom(query: str):
     if not match:
         return None
     return by_key.get(match[0])
+
+
+def sync_fuzzy_live_kingdom(query: str):
+    if not query:
+        return None
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH names AS (
+                SELECT kingdom AS name FROM spy_reports WHERE kingdom IS NOT NULL
+                UNION
+                SELECT kingdom_name AS name FROM kingdom_rankings_state WHERE kingdom_name IS NOT NULL
+                UNION
+                SELECT kingdom_name AS name FROM kingdom_rankings_history WHERE kingdom_name IS NOT NULL
+            )
+            SELECT DISTINCT name FROM names WHERE name IS NOT NULL;
+            """
+        )
+        names = [str(r["name"]).strip() for r in cur.fetchall() if r.get("name")]
+    if not names:
+        return None
+
+    q_key = normalize_kingdom_lookup_key(query)
+    if not q_key:
+        return None
+    by_key = {}
+    for name in names:
+        key = normalize_kingdom_lookup_key(name)
+        if key and key not in by_key:
+            by_key[key] = name
+
+    if q_key in by_key:
+        return by_key[q_key]
+
+    match = difflib.get_close_matches(q_key, list(by_key.keys()), 1, 0.8)
+    if not match:
+        return None
+    return by_key.get(match[0])
+
+
+def sync_get_live_kingdom_profile(kingdom_query: str, lookback_hours: int | None = None) -> dict:
+    requested = str(kingdom_query or "").strip()
+    if not requested:
+        return {"ok": False, "reason": "missing_kingdom"}
+
+    lookback_hours = max(1, min(168, int(lookback_hours or KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS or 1)))
+    resolved = sync_fuzzy_live_kingdom(requested) or requested
+    lookup_key = normalize_kingdom_lookup_key(resolved)
+    now_ts = now_utc()
+    cutoff = now_ts - timedelta(hours=lookback_hours)
+    attack_hours = max(1, min(168, int(KINGDOM_LIVE_ATTACK_WINDOW_HOURS or 24)))
+
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label, updated_at
+            FROM kingdom_rankings_state
+            WHERE REGEXP_REPLACE(LOWER(BTRIM(COALESCE(kingdom_name, ''))), '[^a-z0-9]+', ' ', 'g')=%s
+            ORDER BY updated_at DESC NULLS LAST, kingdom_id DESC
+            LIMIT 1;
+            """,
+            (lookup_key,),
+        )
+        current = cur.fetchone()
+        if not current:
+            cur.execute(
+                """
+                SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label,
+                       snapshot_at AS updated_at
+                FROM kingdom_rankings_history
+                WHERE lookup_key=%s
+                ORDER BY snapshot_at DESC, id DESC
+                LIMIT 1;
+                """,
+                (lookup_key,),
+            )
+            current = cur.fetchone()
+        if not current:
+            return {
+                "ok": False,
+                "reason": "no_rankings_data",
+                "kingdom": resolved,
+                "lookback_hours": lookback_hours,
+            }
+
+        kingdom_name = str(current.get("kingdom_name") or resolved).strip() or resolved
+        lookup_key = normalize_kingdom_lookup_key(kingdom_name)
+
+        cur.execute(
+            """
+            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label,
+                   snapshot_at AS updated_at
+            FROM kingdom_rankings_history
+            WHERE lookup_key=%s
+              AND snapshot_at <= %s
+            ORDER BY snapshot_at DESC, id DESC
+            LIMIT 1;
+            """,
+            (lookup_key, normalize_to_utc(cutoff)),
+        )
+        baseline = cur.fetchone()
+
+        cur.execute(
+            """
+            SELECT
+                COUNT(*)::int AS poll_count,
+                MIN(networth) AS min_networth,
+                MAX(networth) AS max_networth,
+                MIN(rank_pos) AS best_rank,
+                MAX(rank_pos) AS worst_rank,
+                MAX(snapshot_at) AS last_snapshot_at,
+                SUM(CASE WHEN pie_active THEN 1 ELSE 0 END)::int AS pie_polls
+            FROM kingdom_rankings_history
+            WHERE lookup_key=%s
+              AND snapshot_at >= %s;
+            """,
+            (lookup_key, normalize_to_utc(cutoff)),
+        )
+        window = cur.fetchone() or {}
+
+        since_attacks = now_ts - timedelta(hours=attack_hours)
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(attacker, '')) = LOWER(%s))::int AS outgoing_hits,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(defender, '')) = LOWER(%s))::int AS incoming_hits,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(attacker, '')) = LOWER(%s) THEN COALESCE(land_taken, 0) ELSE 0 END), 0)::bigint AS land_gained,
+                COALESCE(SUM(CASE WHEN LOWER(COALESCE(defender, '')) = LOWER(%s) THEN COALESCE(land_taken, 0) ELSE 0 END), 0)::bigint AS land_lost
+            FROM attack_reports
+            WHERE COALESCE(reported_at, created_at) >= %s;
+            """,
+            (kingdom_name, kingdom_name, kingdom_name, kingdom_name, normalize_to_utc(since_attacks)),
+        )
+        attacks = cur.fetchone() or {}
+
+    current_rank = _safe_int_or_none(current.get("rank_pos"))
+    baseline_rank = _safe_int_or_none(baseline.get("rank_pos")) if baseline else None
+    current_nw = _safe_int_or_none(current.get("networth"))
+    baseline_nw = _safe_int_or_none(baseline.get("networth")) if baseline else None
+    current_pie = bool(current.get("pie_active"))
+    baseline_pie = bool(baseline.get("pie_active")) if baseline else None
+
+    pie_change = None
+    if baseline is not None:
+        if current_pie and not baseline_pie:
+            pie_change = "appeared"
+        elif (not current_pie) and baseline_pie:
+            pie_change = "cleared"
+        elif current.get("pie_signature") != baseline.get("pie_signature"):
+            pie_change = "changed"
+        else:
+            pie_change = "unchanged"
+
+    spy = sync_get_latest_spy_for_kingdom(kingdom_name)
+    battle = sync_build_battle_estimate(kingdom_name, now_ts) if KG_TROOP_TRACKING_ENABLED else None
+    oven = sync_build_oven_estimate(kingdom_name, None, None) if OVEN_ESTIMATOR_ENABLED else None
+
+    return {
+        "ok": True,
+        "kingdom": kingdom_name,
+        "lookback_hours": lookback_hours,
+        "current": {
+            "kingdom_id": _safe_int_or_none(current.get("kingdom_id")),
+            "rank": current_rank,
+            "networth": current_nw,
+            "pie_active": current_pie,
+            "pie_label": str(current.get("pie_label") or "").strip(),
+            "updated_at": current.get("updated_at"),
+        },
+        "baseline": {
+            "rank": baseline_rank,
+            "networth": baseline_nw,
+            "pie_active": baseline_pie,
+            "pie_label": str((baseline or {}).get("pie_label") or "").strip() if baseline else "",
+            "updated_at": (baseline or {}).get("updated_at") if baseline else None,
+        } if baseline else None,
+        "window": {
+            "poll_count": int(window.get("poll_count") or 0),
+            "min_networth": _safe_int_or_none(window.get("min_networth")),
+            "max_networth": _safe_int_or_none(window.get("max_networth")),
+            "best_rank": _safe_int_or_none(window.get("best_rank")),
+            "worst_rank": _safe_int_or_none(window.get("worst_rank")),
+            "last_snapshot_at": window.get("last_snapshot_at"),
+            "pie_polls": int(window.get("pie_polls") or 0),
+        },
+        "delta": {
+            "networth": (int(current_nw) - int(baseline_nw)) if current_nw is not None and baseline_nw is not None else None,
+            "rank": (int(current_rank) - int(baseline_rank)) if current_rank is not None and baseline_rank is not None else None,
+            "pie_change": pie_change,
+        },
+        "attacks": {
+            "hours": attack_hours,
+            "outgoing_hits": int(attacks.get("outgoing_hits") or 0),
+            "incoming_hits": int(attacks.get("incoming_hits") or 0),
+            "land_gained": int(attacks.get("land_gained") or 0),
+            "land_lost": int(attacks.get("land_lost") or 0),
+        },
+        "latest_spy": spy,
+        "battle": battle if battle and battle.get("ok") else None,
+        "oven": oven if oven and oven.get("ok") else None,
+    }
 
 
 def sync_get_spy_by_id(report_id: int):
@@ -5861,6 +6316,126 @@ async def battle(ctx, *, kingdom: str):
         await send_error(ctx.guild, f"battle error: {e}", tb=tb)
 
 
+@bot.command(name="kingdomlive", aliases=["intel"])
+async def kingdomlive(ctx, *, arg: str):
+    """!kingdomlive <kingdom> [hours] -> live rankings profile with lookback deltas."""
+    try:
+        raw = str(arg or "").strip()
+        if not raw:
+            return await ctx.send("Usage: `!kingdomlive <kingdom> [hours]`")
+
+        hours = int(KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS or 1)
+        kingdom = raw
+        parts = raw.rsplit(" ", 1)
+        if len(parts) == 2 and re.match(r"^\d+$", parts[1].strip()):
+            maybe_hours = int(parts[1].strip())
+            if maybe_hours > 0:
+                hours = maybe_hours
+                kingdom = parts[0].strip()
+        if not kingdom:
+            return await ctx.send("Usage: `!kingdomlive <kingdom> [hours]`")
+
+        profile = await run_db(sync_get_live_kingdom_profile, kingdom, hours)
+        if not profile.get("ok"):
+            reason = str(profile.get("reason") or "unknown")
+            if reason == "no_rankings_data":
+                return await ctx.send(
+                    f"❌ No live rankings data found for **{profile.get('kingdom') or kingdom}** yet. Wait for the poller to collect snapshots first."
+                )
+            return await ctx.send(f"❌ Live intel unavailable for **{kingdom}** (`{reason}`).")
+
+        real = str(profile.get("kingdom") or kingdom)
+        current = profile.get("current") or {}
+        baseline = profile.get("baseline") or {}
+        window = profile.get("window") or {}
+        delta = profile.get("delta") or {}
+        attacks = profile.get("attacks") or {}
+        latest_spy = profile.get("latest_spy") or {}
+        battle_est = profile.get("battle") or {}
+        oven_est = profile.get("oven") or {}
+
+        rank_now = current.get("rank")
+        nw_now = current.get("networth")
+        pie_now = "active" if current.get("pie_active") else "clear"
+        pie_label = str(current.get("pie_label") or "").strip()
+
+        if rank_now:
+            now_line = (
+                f"Now: rank `#{int(rank_now)}` | NW `{fmt_int(nw_now)}` | pie `{pie_now}` | "
+                f"updated `{_format_dt_short(current.get('updated_at'))}`"
+            )
+        else:
+            now_line = (
+                f"Now: rank `n/a` | NW `{fmt_int(nw_now)}` | pie `{pie_now}` | "
+                f"updated `{_format_dt_short(current.get('updated_at'))}`"
+            )
+
+        lines = [f"📡 **Live Intel • {real}**", now_line]
+        if pie_label:
+            lines.append(f"Pie detail: {pie_label}")
+
+        if baseline:
+            nw_delta = delta.get("networth")
+            rank_from = baseline.get("rank")
+            rank_to = current.get("rank")
+            sign = "+" if (nw_delta or 0) >= 0 else "-"
+            rank_txt = "rank n/a"
+            if rank_from and rank_to:
+                rank_txt = f"rank #{int(rank_from)} -> #{int(rank_to)}"
+            pie_change = str(delta.get("pie_change") or "unknown")
+            nw_txt = "NW n/a"
+            if nw_delta is not None and baseline.get("networth") is not None and current.get("networth") is not None:
+                nw_txt = (
+                    f"NW {sign}`{fmt_int(abs(int(nw_delta)))}` "
+                    f"({fmt_int(baseline.get('networth'))} -> {fmt_int(current.get('networth'))})"
+                )
+            lines.append(
+                f"{int(profile.get('lookback_hours') or hours)}h change: {nw_txt} | {rank_txt} | pie `{pie_change}`"
+            )
+        else:
+            lines.append(f"{int(profile.get('lookback_hours') or hours)}h change: not enough rankings history yet.")
+
+        if int(window.get("poll_count") or 0) > 0:
+            best_rank = window.get("best_rank")
+            worst_rank = window.get("worst_rank")
+            if best_rank and worst_rank:
+                rank_range = f"rank range `#{int(best_rank)}` - `#{int(worst_rank)}`"
+            else:
+                rank_range = "rank range `n/a`"
+            lines.append(
+                f"Window: `{int(window.get('poll_count') or 0)}` polls | "
+                f"NW range `{fmt_int(window.get('min_networth'))}` - `{fmt_int(window.get('max_networth'))}` | "
+                f"{rank_range}"
+            )
+
+        if latest_spy:
+            lines.append(
+                f"Latest SR: `#{int(latest_spy.get('id') or 0)}` at `{_format_dt_short(latest_spy.get('created_at'))}` | "
+                f"DP `{fmt_int(latest_spy.get('defense_power'))}` | Castles `{fmt_int(latest_spy.get('castles'))}`"
+            )
+        else:
+            lines.append("Latest SR: none saved yet.")
+
+        lines.append(
+            f"{int(attacks.get('hours') or KINGDOM_LIVE_ATTACK_WINDOW_HOURS or 24)}h attacks: "
+            f"out `{int(attacks.get('outgoing_hits') or 0)}` | in `{int(attacks.get('incoming_hits') or 0)}` | "
+            f"land gained `{fmt_int(attacks.get('land_gained'))}` | land lost `{fmt_int(attacks.get('land_lost'))}`"
+        )
+
+        if battle_est:
+            lines.append(f"Estimated home now: {fmt_units_short(battle_est.get('estimated_home') or {}, limit=6)}")
+
+        if oven_est:
+            lines.extend(format_oven_summary_lines(oven_est, limit=2, compact=True))
+
+        for chunk in split_for_discord("\n".join(lines), 1900):
+            await ctx.send(chunk)
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ kingdomlive failed.")
+        await send_error(ctx.guild, f"kingdomlive error: {e}", tb=tb)
+
+
 @bot.command()
 async def track(ctx, *, arg: str = None):
     """
@@ -6576,9 +7151,10 @@ async def help_cmd(ctx):
             "`!spyid <id>` - Show saved spy report by DB ID",
             "`!spyhistory <kingdom>` - Show last 5 saved spy reports",
             "`!spies <kingdom>` - Show last 10 spy reports + send recommendation",
+            "`!kingdomlive <kingdom> [hours]` - Live rankings profile with lookback deltas, pie, SR, and attack summary",
             "`!supply <kingdom> [days]` - Premium: show supplier kingdoms from market transactions + TSV",
             "`!nwjumpalerts status` - Show NW jump alert config for this server",
-            "`!nwjumpalerts on [threshold]` - Admin: enable NW jump alerts in this channel (default threshold 5000)",
+            "`!nwjumpalerts on [threshold]` - Admin: enable rankings alerts in this channel (NW jumps + pie changes)",
             "`!nwjumpalerts addhere` - Admin: add current room to NW jump alert fanout",
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
@@ -6640,7 +7216,7 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
             row = await run_db(sync_get_nw_jump_subscription, guild_id)
             if not row:
                 return await ctx.send(
-                    f"ℹ️ NW jump alerts are **not configured** for this server. "
+                    f"ℹ️ Rankings alerts are **not configured** for this server. "
                     f"Use `!nwjumpalerts on {NW_JUMP_ALERT_DEFAULT_THRESHOLD}` in the channel that should receive alerts."
                 )
             enabled = bool(row.get("enabled"))
@@ -6651,9 +7227,10 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
             state = "enabled" if enabled else "disabled"
             extra_txt = ", ".join([f"<#{int(x)}>" for x in extra_channels]) if extra_channels else "(none)"
             return await ctx.send(
-                f"📡 NW jump alerts are **{state}** for this server.\n"
+                f"📡 Rankings alerts are **{state}** for this server.\n"
                 f"Channel: {ch_text}\n"
-                f"Threshold: `{fmt_int(threshold_v)}`\n"
+                f"NW threshold: `{fmt_int(threshold_v)}`\n"
+                f"Pie alerts: `{'enabled' if KG_GAME_PIE_ALERTS_ENABLED else 'disabled'}`\n"
                 f"Fanout rooms: {extra_txt}"
             )
 
@@ -6695,8 +7272,8 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
             )
             await run_db(sync_add_nw_jump_channel, guild_id, int(ctx.channel.id))
             return await ctx.send(
-                f"✅ NW jump alerts enabled in {ctx.channel.mention} with threshold `{fmt_int(min_jump)}`.\n"
-                "Alerts trigger when a kingdom gains at least this much net worth between ranking polls."
+                f"✅ Rankings alerts enabled in {ctx.channel.mention} with NW threshold `{fmt_int(min_jump)}`.\n"
+                "Alerts trigger when a kingdom gains at least this much net worth between ranking polls, and also when pie status appears or changes in rankings."
             )
 
         return await ctx.send(
@@ -6750,6 +7327,7 @@ async def nwjumpcheck(ctx):
         poll_ts = await run_db(sync_meta_get, "nw_jump_last_poll_ts")
         poll_rows = await run_db(sync_meta_get, "nw_jump_last_poll_rows")
         ev_last = await run_db(sync_meta_get, "nw_jump_last_events")
+        pie_last = await run_db(sync_meta_get, "nw_jump_last_pie_events")
         ok_ts = await run_db(sync_meta_get, "nw_jump_last_ok_ts")
         err_ts = await run_db(sync_meta_get, "nw_jump_last_error_ts")
         last_auth_mode = await run_db(sync_meta_get, "nw_jump_last_auth_mode")
@@ -6770,7 +7348,7 @@ async def nwjumpcheck(ctx):
             f"World: `{world_id}` | Rankings pulled now: `{len(rows or [])}`",
             f"Auth: `{auth_mode}` ({'ok' if has_auth else 'missing'})",
             f"Baseline rows in DB: `{fmt_int(stats.get('count'))}` | Last baseline update: `{stats.get('last_updated') or 'never'}`",
-            f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last events: `{ev_last or 'n/a'}`",
+            f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last NW events: `{ev_last or 'n/a'}` | last pie events: `{pie_last or 'n/a'}`",
             f"Loop last ok ts: `{ok_ts or 'n/a'}` | last error ts: `{err_ts or 'n/a'}`",
             f"Last API mode: `{last_auth_mode or 'n/a'}` | ReturnValue: `{last_return_value or 'n/a'}` | ReturnString: `{last_return_string or 'n/a'}`",
             f"This check attempts: `{json.dumps(dbg.get('attempts') or [])[:900]}`",
@@ -6798,7 +7376,8 @@ async def nwjumpcheck(ctx):
         if preview:
             lines.append("Top rankings sample:")
             for r in preview:
-                lines.append(f"- #{int(r.get('rank') or 0)} {r.get('kingdom_name')} (NW {fmt_int(r.get('networth'))})")
+                pie_text = f" | pie: {r.get('pie_label')}" if r.get("pie_label") else ""
+                lines.append(f"- #{int(r.get('rank') or 0)} {r.get('kingdom_name')} (NW {fmt_int(r.get('networth'))}){pie_text}")
 
         await _send_with_fallback("\n".join(lines))
     except Exception as e:

@@ -24,6 +24,22 @@ New: NW jump alerts from live rankings.
 
 The bot can poll KingdomGame rankings and alert your Discord when a kingdom gains net worth by a configured amount (default 5,000+) between polls.
 
+Rankings alerts can also notify when the game shows pie status next to a kingdom name, which is useful for spotting kingdoms that were recently hit.
+
+Live kingdom intelligence:
+
+The bot now stores rankings snapshots over time so you can inspect a target's current rank, net worth, pie state, recent attack activity, and how those changed over a chosen lookback window.
+
+Command usage:
+
+!kingdomlive <kingdom>
+!kingdomlive <kingdom> <hours>
+
+Examples:
+
+!kingdomlive Seven
+!kingdomlive Seven 6
+
 Oven/training inference:
 
 When the bot has at least two recent SR reports for a kingdom, it can compare missing Peasants/Population against a NW jump and estimate likely troops in training. It uses the report Date/Received timestamp when present, so stale reports pasted later do not count as fresh oven data.
@@ -84,6 +100,9 @@ Environment variables for this feature:
 NW_JUMP_ALERTS_ENABLED=true
 NW_JUMP_ALERT_POLL_SECONDS=60
 NW_JUMP_ALERT_DEFAULT_THRESHOLD=5000
+KG_GAME_PIE_ALERTS_ENABLED=true
+KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS=1
+KINGDOM_LIVE_ATTACK_WINDOW_HOURS=24
 KG_GAME_RANKINGS_CONTINENT_ID=-1
 
 Optional SMS fanout (Twilio):
