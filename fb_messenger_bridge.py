@@ -361,6 +361,25 @@ def _build_report_candidates(snippets: List[str]) -> List[str]:
     return out
 
 
+def _report_score(text: str) -> int:
+    ll = text.lower()
+    score = 0
+    for token in (
+        "subject: attack report",
+        "attack result:",
+        "you have gained the following during the attack",
+        "target:",
+        "spies sent:",
+        "spies lost:",
+        "our spies also found",
+        "approximate defensive power",
+        "number of castles:",
+    ):
+        if token in ll:
+            score += 1
+    return score
+
+
 def main() -> int:
     if not BRIDGE_TOKEN:
         print("ERROR: BRIDGE_HTTP_TOKEN is required")
@@ -413,25 +432,22 @@ def main() -> int:
                         continue
 
                     candidates = _build_report_candidates(messages)
+                    report_candidates = [m for m in candidates if _is_report_text(m)]
+                    if not report_candidates:
+                        continue
 
-                    last_hash = state.get(chat_name, "")
-                    pending: List[str] = []
-                    for m in candidates:
-                        h = _sha(m)
-                        if h == last_hash:
-                            pending = []
-                        else:
-                            pending.append(m)
+                    # Select the strongest current report candidate to avoid order-related misses.
+                    best = max(report_candidates, key=lambda m: (_report_score(m), len(m)))
+                    best_hash = _sha(best)
+                    if best_hash == state.get(chat_name, ""):
+                        continue
 
-                    for m in pending:
-                        if not _is_report_text(m):
-                            continue
-                        mid = _sha(f"{chat_name}|{m}")[:24]
-                        external_id = f"{chat_name}:{mid}"
-                        result = _bridge_post(m, external_id)
-                        print(f"INFO: bridge {chat_name} status={result.get('status')} ok={result.get('ok')}")
-                        state[chat_name] = _sha(m)
-                        _save_state(state)
+                    mid = _sha(f"{chat_name}|{best}")[:24]
+                    external_id = f"{chat_name}:{mid}"
+                    result = _bridge_post(best, external_id)
+                    print(f"INFO: bridge {chat_name} status={result.get('status')} ok={result.get('ok')}")
+                    state[chat_name] = best_hash
+                    _save_state(state)
 
                 time.sleep(max(3, FB_POLL_SECONDS))
         except KeyboardInterrupt:
