@@ -267,6 +267,7 @@ BRIDGE_HTTP_PORT = _env_int("BRIDGE_HTTP_PORT", 8080)
 BRIDGE_HTTP_PATH = _env_text("BRIDGE_HTTP_PATH", "/api/bridge/report") or "/api/bridge/report"
 BRIDGE_HTTP_TOKEN = _env_text("BRIDGE_HTTP_TOKEN", "")
 BRIDGE_HTTP_REQUIRE_RECON_MATCH = _env_bool("BRIDGE_HTTP_REQUIRE_RECON_MATCH", True)
+BRIDGE_DISCORD_CHANNEL_NAME = _env_text("BRIDGE_DISCORD_CHANNEL_NAME", "allies-war-room") or "allies-war-room"
 BATTLE_RETURNS_LOOP_STARTED = False
 NW_JUMP_ALERTS_LOOP_STARTED = False
 BRIDGE_HTTP_SERVER = None
@@ -2229,6 +2230,90 @@ def _bridge_int_or_none(raw: object) -> int | None:
         return None
 
 
+def _bridge_report_kind(text: str) -> str:
+    if looks_like_attack_report(text):
+        return "attack"
+    if looks_like_spy_report(text):
+        return "spy"
+    return "report"
+
+
+def _find_sendable_text_channel_by_name(name: str):
+    wanted = str(name or "").strip().lower()
+    if not wanted:
+        return None
+    for guild in bot.guilds:
+        if not is_target_guild(guild):
+            continue
+        for ch in getattr(guild, "text_channels", []) or []:
+            if str(getattr(ch, "name", "")).strip().lower() == wanted and can_send(ch, guild):
+                return ch
+    return None
+
+
+async def post_bridge_report_to_discord(report_kind: str, raw_text: str):
+    if not bot.is_ready():
+        return {"ok": False, "error": "bot_not_ready"}
+
+    ch = _find_sendable_text_channel_by_name(BRIDGE_DISCORD_CHANNEL_NAME)
+    if not ch:
+        return {"ok": False, "error": "channel_not_found", "channel": BRIDGE_DISCORD_CHANNEL_NAME}
+
+    label = "attack report" if report_kind == "attack" else "spy report" if report_kind == "spy" else "report"
+    prefix = f"pulled {label} from fb"
+    text = str(raw_text or "").strip()
+
+    if len(prefix) + 2 + len(text) <= 1900:
+        msg = await ch.send(f"{prefix}\n{text}")
+    else:
+        filename = f"fb-{report_kind}-report.txt"
+        msg = await ch.send(
+            prefix,
+            file=discord.File(fp=io.BytesIO(text.encode("utf-8", errors="replace")), filename=filename),
+        )
+
+    return {"ok": True, "channel_id": int(ch.id), "message_id": int(msg.id)}
+
+
+def schedule_bridge_report_to_discord(report_kind: str, raw_text: str) -> dict:
+    try:
+        loop = getattr(bot, "loop", None)
+        if loop is None or loop.is_closed():
+            return {"scheduled": False, "error": "bot_loop_unavailable"}
+        future = asyncio.run_coroutine_threadsafe(post_bridge_report_to_discord(report_kind, raw_text), loop)
+
+        def _done(fut):
+            try:
+                res = fut.result()
+                if not res.get("ok"):
+                    logging.warning("Bridge Discord post failed: %s", res)
+                else:
+                    logging.info("Bridge Discord post ok: %s", res)
+            except Exception:
+                logging.exception("Bridge Discord post task failed")
+
+        future.add_done_callback(_done)
+        return {"scheduled": True, "channel": BRIDGE_DISCORD_CHANNEL_NAME}
+    except Exception as e:
+        logging.exception("Bridge Discord post schedule failed")
+        return {"scheduled": False, "error": str(e)}
+
+
+def _bridge_compact_store_result(res: dict | None) -> dict:
+    if not isinstance(res, dict):
+        return {"saved": False}
+    row = res.get("row") or {}
+    compact = {
+        "saved": bool(res.get("saved")),
+        "duplicate": bool(res.get("duplicate")),
+    }
+    if row:
+        compact["id"] = row.get("id")
+    if res.get("movement_rows") is not None:
+        compact["movement_rows"] = int(res.get("movement_rows") or 0)
+    return compact
+
+
 def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: str, received_at: datetime | None):
     text = str(raw_text or "").strip()
     if not text:
@@ -2256,11 +2341,31 @@ def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: st
             "source": source_name,
             "external_id": ext or None,
             "report_hash": report_hash,
+            "report_kind": "report",
+            "local_saved": None,
+            "discord_post": None,
             "forwarded": None,
         }
 
+    report_kind = _bridge_report_kind(normalized)
+    local_saved = None
+    discord_post = None
     forwarded = None
     if is_recon:
+        try:
+            ensure_db_ready_sync()
+            saved_at = received_at or now_utc()
+            spy_res = sync_store_report(normalized, saved_at)
+            attack_res = sync_store_attack_report(normalized, saved_at, None, None)
+            local_saved = {
+                "spy": _bridge_compact_store_result(spy_res),
+                "attack": _bridge_compact_store_result(attack_res),
+            }
+        except Exception as e:
+            logging.exception("bridge local DB save failed")
+            local_saved = {"ok": False, "error": str(e)}
+
+        discord_post = schedule_bridge_report_to_discord(report_kind, normalized)
         forwarded = sync_recon_ingest_report(normalized)
 
     result = {
@@ -2272,6 +2377,9 @@ def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: st
         "source": source_name,
         "external_id": ext or None,
         "report_hash": report_hash,
+        "report_kind": report_kind,
+        "local_saved": local_saved,
+        "discord_post": discord_post,
         "forwarded": forwarded,
     }
     return result
