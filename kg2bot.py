@@ -73,9 +73,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-05.3"
+BOT_VERSION = "2026-07-05.4"
 PATCH_NOTES = [
-    "Rankings alerts now track pie-status changes and can notify when kingdoms appear to have been hit.",
+    "Rankings tracking now records pie-status changes silently during background refreshes while leaving NW alert posting unchanged.",
     "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
     "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
     "NW jump diagnostics now show current state rows, rankings history rows, and live pie detections from the current pull.",
@@ -3611,8 +3611,6 @@ async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
         if dispatch_alerts:
             if nw_events:
                 await send_nw_jump_alerts(nw_events)
-            if pie_events:
-                await send_rankings_pie_alerts(pie_events)
 
     return {
         "rows": rows,
@@ -7632,7 +7630,7 @@ async def rankingsrefresh(ctx):
             f"Rows stored this pull: `{len(rows)}`\n"
             f"Live pie rows this pull: `{pie_live}`\n"
             f"NW alerts triggered: `{len(nw_events)}`\n"
-            f"Pie alerts triggered: `{len(pie_events)}`\n"
+            f"Pie changes detected: `{len(pie_events)}`\n"
             f"Auth mode: `{dbg.get('auth_mode') or 'n/a'}` | ReturnValue: `{dbg.get('return_value') or 'n/a'}`"
         )
     except Exception as e:
