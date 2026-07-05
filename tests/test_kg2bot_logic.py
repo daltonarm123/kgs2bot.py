@@ -177,6 +177,36 @@ class FacebookBridgeStateTests(unittest.TestCase):
         self.assertEqual("new-hash", chat_state["last_report_hash"])
         self.assertEqual(["old-hash", "new-hash"], chat_state["seen_report_hashes"])
 
+    def test_unseen_report_batch_keeps_multiple_new_reports(self):
+        reports = [
+            fb_messenger_bridge._format_report_text(
+                f"Target: Multi {idx} Spies Sent: 100 Spies Lost: {idx} "
+                f"Number of Castles: {idx + 1} "
+                "Our spies also found the following information about the kingdom's resources: "
+                f"Gold: {1000 + idx}"
+            )
+            for idx in range(3)
+        ]
+
+        unseen = fb_messenger_bridge._unseen_report_batch(reports, set())
+
+        self.assertEqual(3, len(unseen))
+        self.assertEqual(["Target: Multi 0", "Target: Multi 1", "Target: Multi 2"], [text.splitlines()[0] for text, _ in unseen])
+
+    def test_unseen_report_batch_skips_seen_and_duplicate_candidates(self):
+        report = fb_messenger_bridge._format_report_text(
+            "Target: Seen One Spies Sent: 100 Spies Lost: 1 Number of Castles: 2 "
+            "Our spies also found the following information about the kingdom's resources: Gold: 1000"
+        )
+        report_hash = fb_messenger_bridge._sha(report)
+
+        self.assertEqual([], fb_messenger_bridge._unseen_report_batch([report, report], {report_hash}))
+
+        unseen = fb_messenger_bridge._unseen_report_batch([report, report], set())
+
+        self.assertEqual(1, len(unseen))
+        self.assertEqual(report_hash, unseen[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()

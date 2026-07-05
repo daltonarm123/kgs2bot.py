@@ -645,8 +645,9 @@ def _build_report_candidates(snippets: List[str]) -> List[str]:
     # Keep original snippets too, then add stitched multiline candidates.
     for s in snippets:
         formatted = _format_report_text(s)
-        if formatted and formatted not in seen:
-            seen.add(formatted)
+        h = _sha(formatted) if formatted else ""
+        if formatted and h not in seen:
+            seen.add(h)
             out.append(formatted)
 
     n = len(snippets)
@@ -694,6 +695,19 @@ def _report_score(text: str) -> int:
         if token in ll:
             score += 1
     return score
+
+
+def _unseen_report_batch(report_candidates: List[str], seen_hashes: set) -> List[tuple[str, str]]:
+    unseen_reports: List[tuple[str, str]] = []
+    batch_hashes = set()
+    for candidate in report_candidates:
+        formatted = _format_report_text(candidate)
+        candidate_hash = _sha(formatted)
+        if candidate_hash in seen_hashes or candidate_hash in batch_hashes:
+            continue
+        unseen_reports.append((formatted, candidate_hash))
+        batch_hashes.add(candidate_hash)
+    return unseen_reports
 
 
 def main() -> int:
@@ -777,22 +791,19 @@ def main() -> int:
                         continue
 
                     seen_hashes = set(chat_state.get("seen_report_hashes", []))
-                    unseen = [m for m in report_candidates if _sha(_format_report_text(m)) not in seen_hashes]
-                    if not unseen:
+                    unseen_reports = _unseen_report_batch(report_candidates, seen_hashes)
+                    if not unseen_reports:
                         continue
 
-                    # Select the strongest unseen report candidate to avoid order-related misses.
-                    best = max(unseen, key=lambda m: (_report_score(m), len(m)))
-                    best = _format_report_text(best)
-                    best_hash = _sha(best)
+                    posted_hashes = []
+                    for best, best_hash in unseen_reports:
+                        mid = _sha(f"{chat_name}|{best}")[:24]
+                        external_id = f"{chat_name}:{mid}"
+                        result = _bridge_post(best, external_id)
+                        print(f"INFO: bridge {chat_name} status={result.get('status')} ok={result.get('ok')}")
+                        posted_hashes.append(best_hash)
 
-                    mid = _sha(f"{chat_name}|{best}")[:24]
-                    external_id = f"{chat_name}:{mid}"
-                    result = _bridge_post(best, external_id)
-                    print(f"INFO: bridge {chat_name} status={result.get('status')} ok={result.get('ok')}")
-                    _remember_report_hashes(chat_state, report_hashes)
-                    if best_hash not in report_hashes:
-                        _remember_report_hashes(chat_state, [best_hash])
+                    _remember_report_hashes(chat_state, posted_hashes)
                     _save_state(state)
 
                 time.sleep(max(3, FB_POLL_SECONDS))
