@@ -313,6 +313,54 @@ def _extract_recent_messages(page, max_items: int) -> List[str]:
     return cleaned[-max_items:]
 
 
+def _build_report_candidates(snippets: List[str]) -> List[str]:
+    if not snippets:
+        return []
+
+    starters = (
+        "subject:",
+        "attack report",
+        "magic spy report",
+        "target:",
+    )
+
+    out: List[str] = []
+    seen = set()
+
+    # Keep original snippets too, then add stitched multiline candidates.
+    for s in snippets:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    n = len(snippets)
+    for i, line in enumerate(snippets):
+        ll = line.lower()
+        if not any(tok in ll for tok in starters):
+            continue
+
+        # Stitch forward lines to rebuild full report blobs from fragmented nodes.
+        joined = [line]
+        for j in range(i + 1, min(n, i + 45)):
+            nxt = snippets[j]
+            # New report likely starts here; stop current stitch.
+            nxt_ll = nxt.lower()
+            if j > i + 1 and ("subject:" in nxt_ll or "target:" in nxt_ll):
+                break
+            joined.append(nxt)
+
+        candidate = "\n".join(joined).strip()
+        if len(candidate) < 40:
+            continue
+        h = _sha(candidate)
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(candidate)
+
+    return out
+
+
 def main() -> int:
     if not BRIDGE_TOKEN:
         print("ERROR: BRIDGE_HTTP_TOKEN is required")
@@ -364,9 +412,11 @@ def main() -> int:
                     if not messages:
                         continue
 
+                    candidates = _build_report_candidates(messages)
+
                     last_hash = state.get(chat_name, "")
                     pending: List[str] = []
-                    for m in messages:
+                    for m in candidates:
                         h = _sha(m)
                         if h == last_hash:
                             pending = []
