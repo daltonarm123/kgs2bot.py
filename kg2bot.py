@@ -3311,33 +3311,6 @@ def sync_list_nw_jump_user_blocks(guild_id: int, user_id: int) -> list[dict]:
         return cur.fetchall() or []
 
 
-def sync_get_nw_jump_user_settings_for_guild(guild_id: int) -> list[dict]:
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                p.user_id,
-                p.muted,
-                COALESCE(array_agg(b.kingdom_key) FILTER (WHERE b.kingdom_key IS NOT NULL), '{}') AS blocked_keys
-            FROM nw_jump_user_prefs p
-            LEFT JOIN nw_jump_user_blocks b ON b.guild_id=p.guild_id AND b.user_id=p.user_id
-            WHERE p.guild_id=%s
-            GROUP BY p.user_id, p.muted
-            ORDER BY p.user_id ASC;
-            """,
-            (int(guild_id),),
-        )
-        return cur.fetchall() or []
-
-
-def _nw_jump_event_blocked_for_user(event: dict, blocked_keys) -> bool:
-    keys = {str(k or "").strip() for k in (blocked_keys or []) if str(k or "").strip()}
-    if not keys:
-        return False
-    kingdom_key = normalize_kingdom_lookup_key(event.get("kingdom_name"))
-    return bool(kingdom_key and kingdom_key in keys)
-
-
 def _normalize_phone_number(s: str) -> str:
     txt = str(s or "").strip()
     if not txt:
@@ -3753,35 +3726,6 @@ async def send_nw_jump_alerts(events: list[dict]):
                     await ch.send("\n".join(lines))
                 except Exception:
                     logging.exception("Failed to send NW jump alert to fallback channel guild=%s", guild.id)
-
-        try:
-            settings = await run_db(sync_get_nw_jump_user_settings_for_guild, int(guild.id))
-            for pref in settings:
-                if bool(pref.get("muted")):
-                    continue
-                user_hits = [e for e in hits if not _nw_jump_event_blocked_for_user(e, pref.get("blocked_keys") or [])]
-                if not user_hits:
-                    continue
-                member = guild.get_member(int(pref.get("user_id") or 0))
-                if not member or getattr(member, "bot", False):
-                    continue
-                dm_lines = [f"🚨 **NW Jumper** (threshold: `{fmt_int(min_jump)}`)"]
-                for e in user_hits[:12]:
-                    delta_v = int(e.get("delta") or 0)
-                    sign = "+" if delta_v >= 0 else "-"
-                    dm_lines.append(
-                        f"- **{e.get('kingdom_name')}** {sign}`{fmt_int(abs(delta_v))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))})"
-                    )
-                extra_dm = len(user_hits) - 12
-                if extra_dm > 0:
-                    dm_lines.append(f"... +{extra_dm} more")
-                dm_lines.append("Use `!nwjumpblock <kingdom>` or `!mutenwjumper` in the server to adjust these.")
-                try:
-                    await member.send("\n".join(dm_lines))
-                except Exception:
-                    logging.info("Could not DM NW jumper alert to guild=%s user=%s", guild.id, member.id)
-        except Exception:
-            logging.exception("Failed to dispatch personal NW jumper alerts for guild=%s", guild.id)
 
     if _twilio_sms_configured():
         watch = _parse_alert_sms_watchlist()
@@ -7481,8 +7425,8 @@ async def help_cmd(ctx):
             "`!nwjumpalerts addhere` - Admin: add current room to NW jump alert fanout",
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
-            "`!nwjumpblock [name|list|remove <name>|clear]` - Manage your personal blocked kingdoms for NW jumper alerts",
-            "`!mutenwjumper [on|off|status]` - Mute/unmute your personal NW jumper notifications",
+            "`!nwjumpblock [name|list|remove <name>|clear]` - Manage your personal NW jumper block list",
+            "`!mutenwjumper` - Explains how to mute NW jumper channel posts on your Discord client",
             "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
             "`!rankingsrefresh` - Admin: force a live top-100 rankings refresh into DB/history now",
             "`!nwjumptestalert` - Admin: send a marked test NW jump alert to all configured rooms",
@@ -7616,7 +7560,7 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
 
 @bot.command(name="nwjumpblock")
 async def nwjumpblock(ctx, action: str = "list", *, kingdom: str = ""):
-    """Manage a user's personal kingdom block list for NW jumper notifications."""
+    """Manage a user's personal kingdom block list for NW jumper tracking."""
     try:
         if not ctx.guild:
             return await ctx.send("❌ This command can only be used in a server channel.")
@@ -7644,6 +7588,7 @@ async def nwjumpblock(ctx, action: str = "list", *, kingdom: str = ""):
                     lines.append(f"... +{extra} more")
             else:
                 lines.append("Blocked kingdoms: (none)")
+            lines.append("Note: NW jumper alerts are public channel posts. Discord does not let the bot hide one channel post from only one person.")
             lines.append("Use `!nwjumpblock <kingdom>` to add, `!nwjumpblock remove <kingdom>` to remove, or `!nwjumpblock clear` to reset.")
             return await ctx.send("\n".join(lines))
 
@@ -7691,7 +7636,7 @@ async def nwjumpblock(ctx, action: str = "list", *, kingdom: str = ""):
 
 @bot.command(name="mutenwjumper")
 async def mutenwjumper(ctx, action: str = "on"):
-    """Mute or unmute a user's personal NW jumper notifications."""
+    """Explain user-side muting for public NW jumper channel posts."""
     try:
         if not ctx.guild:
             return await ctx.send("❌ This command can only be used in a server channel.")
@@ -7705,15 +7650,21 @@ async def mutenwjumper(ctx, action: str = "on"):
         if action_norm in ("status", "show"):
             pref = await run_db(sync_get_nw_jump_user_pref, guild_id, user_id)
             muted = bool((pref or {}).get("muted"))
-            return await ctx.send(f"🔕 NW jumper personal DMs are `{'muted' if muted else 'unmuted'}` for you.")
+            return await ctx.send(
+                f"🔕 Your saved NW jumper preference is `{'muted' if muted else 'unmuted'}`.\n"
+                "NW jumper alerts are public channel posts, so to stop seeing them you need to mute the alert channel in Discord."
+            )
 
         if action_norm in ("off", "unmute", "false", "0", "no"):
             await run_db(sync_set_nw_jump_user_muted, guild_id, user_id, False)
-            return await ctx.send("🔔 NW jumper personal DMs are unmuted for you.")
+            return await ctx.send("🔔 Saved your NW jumper preference as unmuted. Public channel alerts will still post for the server.")
 
         if action_norm in ("on", "mute", "true", "1", "yes"):
             await run_db(sync_set_nw_jump_user_muted, guild_id, user_id, True)
-            return await ctx.send("🔕 NW jumper personal DMs are muted for you.")
+            return await ctx.send(
+                "🔕 Saved your NW jumper preference as muted.\n"
+                "Because alerts post in channels, use Discord's channel mute/notification settings to stop seeing them on your client."
+            )
 
         return await ctx.send("Usage: `!mutenwjumper` | `!mutenwjumper off` | `!mutenwjumper status`")
     except Exception as e:
