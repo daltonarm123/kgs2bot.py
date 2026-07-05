@@ -80,6 +80,7 @@ PATCH_NOTES = [
     "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
     "NW jump diagnostics now show current state rows, rankings history rows, and live pie detections from the current pull.",
     "Rankings tracking now always keeps at least the top 100 kingdoms in scope.",
+    "Added !rankingsrefresh so admins can force an immediate live top-100 rankings update between automatic poll cycles.",
 ]
 # -------------------------------------------------
 
@@ -3585,33 +3586,47 @@ async def send_rankings_pie_alerts(events: list[dict]):
                     logging.exception("Failed to send pie alert to fallback channel guild=%s", guild.id)
 
 
+async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
+    rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
+    await run_db(sync_meta_set, "nw_jump_last_poll_ts", str(int(time.time())))
+    await run_db(sync_meta_set, "nw_jump_last_poll_rows", str(len(rows or [])))
+    await run_db(sync_meta_set, "nw_jump_last_auth_mode", str(dbg.get("auth_mode") or ""))
+    await run_db(sync_meta_set, "nw_jump_last_return_value", str(dbg.get("return_value") or ""))
+    await run_db(sync_meta_set, "nw_jump_last_return_string", str(dbg.get("return_string") or ""))
+    await run_db(sync_meta_set, "nw_jump_last_attempts", json.dumps(dbg.get("attempts") or []))
+
+    alerts = {"nw_events": [], "pie_events": []}
+    if rows:
+        alerts = await run_db(
+            sync_detect_rankings_alerts,
+            int(KG_GAME_WORLD_ID or 1),
+            rows,
+            int(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000),
+        ) or {"nw_events": [], "pie_events": []}
+        nw_events = list((alerts or {}).get("nw_events") or [])
+        pie_events = list((alerts or {}).get("pie_events") or [])
+        await run_db(sync_meta_set, "nw_jump_last_events", str(len(nw_events or [])))
+        await run_db(sync_meta_set, "nw_jump_last_pie_events", str(len(pie_events or [])))
+        await run_db(sync_meta_set, "nw_jump_last_ok_ts", str(int(time.time())))
+        if dispatch_alerts:
+            if nw_events:
+                await send_nw_jump_alerts(nw_events)
+            if pie_events:
+                await send_rankings_pie_alerts(pie_events)
+
+    return {
+        "rows": rows,
+        "debug": dbg,
+        "nw_events": list((alerts or {}).get("nw_events") or []),
+        "pie_events": list((alerts or {}).get("pie_events") or []),
+    }
+
+
 async def nw_jump_alerts_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
-            await run_db(sync_meta_set, "nw_jump_last_poll_ts", str(int(time.time())))
-            await run_db(sync_meta_set, "nw_jump_last_poll_rows", str(len(rows or [])))
-            await run_db(sync_meta_set, "nw_jump_last_auth_mode", str(dbg.get("auth_mode") or ""))
-            await run_db(sync_meta_set, "nw_jump_last_return_value", str(dbg.get("return_value") or ""))
-            await run_db(sync_meta_set, "nw_jump_last_return_string", str(dbg.get("return_string") or ""))
-            await run_db(sync_meta_set, "nw_jump_last_attempts", json.dumps(dbg.get("attempts") or []))
-            if rows:
-                alerts = await run_db(
-                    sync_detect_rankings_alerts,
-                    int(KG_GAME_WORLD_ID or 1),
-                    rows,
-                    int(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000),
-                )
-                nw_events = list((alerts or {}).get("nw_events") or [])
-                pie_events = list((alerts or {}).get("pie_events") or [])
-                await run_db(sync_meta_set, "nw_jump_last_events", str(len(nw_events or [])))
-                await run_db(sync_meta_set, "nw_jump_last_pie_events", str(len(pie_events or [])))
-                await run_db(sync_meta_set, "nw_jump_last_ok_ts", str(int(time.time())))
-                if nw_events:
-                    await send_nw_jump_alerts(nw_events)
-                if pie_events:
-                    await send_rankings_pie_alerts(pie_events)
+            await run_rankings_refresh_cycle(dispatch_alerts=True)
         except Exception:
             logging.exception("nw_jump_alerts_loop failed")
             try:
@@ -7164,6 +7179,7 @@ async def help_cmd(ctx):
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
             "`!nwjumpcheck` - Admin: run live rankings check + show alert pipeline status",
+            "`!rankingsrefresh` - Admin: force a live top-100 rankings refresh into DB/history now",
             "`!nwjumptestalert` - Admin: send a marked test NW jump alert to all configured rooms",
             "`!nwjumppulltest` - Admin: pull rankings now and print top sample rows",
             "`!whereupdates` - Show configured target server/channel + bot send permissions",
@@ -7592,6 +7608,38 @@ async def nwjumppulltest(ctx):
                     await ch.send("⚠️ nwjumppulltest failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"nwjumppulltest error: {e}", tb=tb)
+
+
+@bot.command(name="rankingsrefresh")
+async def rankingsrefresh(ctx):
+    """Admin-only: force a live top-100 rankings refresh into DB/history now."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+        if ctx.guild and not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        await ctx.send("⏳ Refreshing live top-100 rankings now...")
+        result = await run_rankings_refresh_cycle(dispatch_alerts=True)
+        rows = list(result.get("rows") or [])
+        dbg = result.get("debug") or {}
+        nw_events = list(result.get("nw_events") or [])
+        pie_events = list(result.get("pie_events") or [])
+        pie_live = sum(1 for r in rows if bool(r.get("pie_active")) or str(r.get("pie_label") or "").strip())
+
+        await ctx.send(
+            "✅ **Rankings refresh complete**\n"
+            f"Rows stored this pull: `{len(rows)}`\n"
+            f"Live pie rows this pull: `{pie_live}`\n"
+            f"NW alerts triggered: `{len(nw_events)}`\n"
+            f"Pie alerts triggered: `{len(pie_events)}`\n"
+            f"Auth mode: `{dbg.get('auth_mode') or 'n/a'}` | ReturnValue: `{dbg.get('return_value') or 'n/a'}`"
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ rankingsrefresh failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"rankingsrefresh error: {e}", tb=tb)
 
 
 @bot.command(name="whereupdates")
