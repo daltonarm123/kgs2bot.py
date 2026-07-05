@@ -6,7 +6,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -42,6 +42,7 @@ FB_PROFILE_DIR = _env_text("FB_MESSENGER_PROFILE_DIR", ".fb_messenger_profile").
 FB_HEADLESS = _env_bool("FB_MESSENGER_HEADLESS", False)
 FB_POLL_SECONDS = _env_int("FB_MESSENGER_POLL_SECONDS", 15)
 FB_LOOKBACK_MESSAGES = _env_int("FB_MESSENGER_LOOKBACK_MESSAGES", 40)
+FB_SEEN_REPORT_LIMIT = max(50, _env_int("FB_MESSENGER_SEEN_REPORT_LIMIT", 300))
 FB_LOGIN_ONLY = _env_bool("FB_MESSENGER_LOGIN_ONLY", False)
 FB_DEBUG_REPORTS = _env_bool("FB_MESSENGER_DEBUG_REPORTS", False)
 FB_CHAT_NAMES = [
@@ -227,23 +228,64 @@ def _is_report_text(text: str) -> bool:
     return looks_attack or looks_spy
 
 
-def _load_state() -> Dict[str, str]:
+def _load_state() -> Dict[str, Any]:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
+            return {str(k): v for k, v in data.items()}
     except Exception:
         pass
     return {}
 
 
-def _save_state(state: Dict[str, str]) -> None:
+def _save_state(state: Dict[str, Any]) -> None:
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"WARN: failed to save state file: {e}")
+
+
+def _chat_state(state: Dict[str, Any], chat_name: str) -> Dict[str, Any]:
+    raw = state.get(chat_name)
+    if isinstance(raw, dict):
+        seen = raw.get("seen_report_hashes")
+        if not isinstance(seen, list):
+            seen = []
+        chat_state = {
+            "initialized": bool(raw.get("initialized")),
+            "last_report_hash": str(raw.get("last_report_hash") or raw.get("last_hash") or ""),
+            "seen_report_hashes": [str(v) for v in seen if str(v or "").strip()],
+        }
+    else:
+        legacy_hash = str(raw or "").strip()
+        chat_state = {
+            "initialized": False,
+            "last_report_hash": legacy_hash,
+            "seen_report_hashes": [legacy_hash] if legacy_hash else [],
+        }
+    state[chat_name] = chat_state
+    return chat_state
+
+
+def _remember_report_hashes(chat_state: Dict[str, Any], report_hashes: List[str]) -> None:
+    seen = [str(v) for v in chat_state.get("seen_report_hashes", []) if str(v or "").strip()]
+    seen_set = set(seen)
+    for report_hash in report_hashes:
+        h = str(report_hash or "").strip()
+        if not h:
+            continue
+        if h in seen_set:
+            continue
+        seen.append(h)
+        seen_set.add(h)
+    if len(seen) > FB_SEEN_REPORT_LIMIT:
+        seen = seen[-FB_SEEN_REPORT_LIMIT:]
+    chat_state["seen_report_hashes"] = seen
+    chat_state["initialized"] = True
+    if report_hashes:
+        chat_state["last_report_hash"] = str(report_hashes[-1] or "").strip()
 
 
 def _bridge_post(raw_text: str, external_id: str) -> dict:
@@ -726,18 +768,31 @@ def main() -> int:
                     if not report_candidates:
                         continue
 
-                    # Select the strongest current report candidate to avoid order-related misses.
-                    best = max(report_candidates, key=lambda m: (_report_score(m), len(m)))
+                    chat_state = _chat_state(state, chat_name)
+                    report_hashes = [_sha(_format_report_text(m)) for m in report_candidates]
+                    if not chat_state.get("initialized"):
+                        _remember_report_hashes(chat_state, report_hashes)
+                        _save_state(state)
+                        print(f"INFO: baseline chat={chat_name} reports={len(report_hashes)}")
+                        continue
+
+                    seen_hashes = set(chat_state.get("seen_report_hashes", []))
+                    unseen = [m for m in report_candidates if _sha(_format_report_text(m)) not in seen_hashes]
+                    if not unseen:
+                        continue
+
+                    # Select the strongest unseen report candidate to avoid order-related misses.
+                    best = max(unseen, key=lambda m: (_report_score(m), len(m)))
                     best = _format_report_text(best)
                     best_hash = _sha(best)
-                    if best_hash == state.get(chat_name, ""):
-                        continue
 
                     mid = _sha(f"{chat_name}|{best}")[:24]
                     external_id = f"{chat_name}:{mid}"
                     result = _bridge_post(best, external_id)
                     print(f"INFO: bridge {chat_name} status={result.get('status')} ok={result.get('ok')}")
-                    state[chat_name] = best_hash
+                    _remember_report_hashes(chat_state, report_hashes)
+                    if best_hash not in report_hashes:
+                        _remember_report_hashes(chat_state, [best_hash])
                     _save_state(state)
 
                 time.sleep(max(3, FB_POLL_SECONDS))

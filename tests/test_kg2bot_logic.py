@@ -7,6 +7,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost:5432/kg2
 os.environ.setdefault("RECON_INGEST_ENABLED", "false")
 
 import kg2bot  # noqa: E402
+import fb_messenger_bridge  # noqa: E402
 
 
 class RankingsPieParsingTests(unittest.TestCase):
@@ -150,6 +151,31 @@ class BridgeReportFormattingTests(unittest.TestCase):
         self.assertIn("Gold: 1250591\nOur spies also found", formatted)
         self.assertIn("Approximate defensive power*: 16641\n*(without skill/prayer modifiers)", formatted)
         self.assertIn("Loose Order Formation lvl 5\nCrop Rotation lvl 6", formatted)
+
+
+class FacebookBridgeStateTests(unittest.TestCase):
+    def test_legacy_chat_hash_migrates_to_uninitialized_seen_state(self):
+        state = {"A Team Only": "old-hash"}
+
+        chat_state = fb_messenger_bridge._chat_state(state, "A Team Only")
+
+        self.assertFalse(chat_state["initialized"])
+        self.assertEqual("old-hash", chat_state["last_report_hash"])
+        self.assertEqual(["old-hash"], chat_state["seen_report_hashes"])
+        self.assertIs(state["A Team Only"], chat_state)
+
+    def test_remember_report_hashes_dedupes_and_marks_chat_initialized(self):
+        chat_state = {
+            "initialized": False,
+            "last_report_hash": "old-hash",
+            "seen_report_hashes": ["old-hash"],
+        }
+
+        fb_messenger_bridge._remember_report_hashes(chat_state, ["old-hash", "new-hash"])
+
+        self.assertTrue(chat_state["initialized"])
+        self.assertEqual("new-hash", chat_state["last_report_hash"])
+        self.assertEqual(["old-hash", "new-hash"], chat_state["seen_report_hashes"])
 
 
 if __name__ == "__main__":
