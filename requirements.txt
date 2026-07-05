@@ -2,3 +2,4 @@ discord.py>=2.4,<3
 python-dotenv>=1.0,<2
 tzdata>=2024.1
 psycopg2-binary>=2.9.9,<3
+playwright>=1.54,<2

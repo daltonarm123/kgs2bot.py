@@ -50,10 +50,13 @@ import difflib
 import hashlib
 import logging
 import traceback
+import threading
+import secrets
 import urllib.request
 import urllib.error
 import urllib.parse
 import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import ceil
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
@@ -258,8 +261,16 @@ ALERT_SMS_TO = _env_text("ALERT_SMS_TO", "")
 ALERT_SMS_WATCHLIST = _env_text("ALERT_SMS_WATCHLIST", "")
 ALERT_SMS_MAX_PER_ALERT = _env_int("ALERT_SMS_MAX_PER_ALERT", 10)
 PREMIUM_GATE_ENABLED = _env_bool("PREMIUM_GATE_ENABLED", True)
+BRIDGE_HTTP_ENABLED = _env_bool("BRIDGE_HTTP_ENABLED", False)
+BRIDGE_HTTP_BIND = _env_text("BRIDGE_HTTP_BIND", "0.0.0.0") or "0.0.0.0"
+BRIDGE_HTTP_PORT = _env_int("BRIDGE_HTTP_PORT", 8080)
+BRIDGE_HTTP_PATH = _env_text("BRIDGE_HTTP_PATH", "/api/bridge/report") or "/api/bridge/report"
+BRIDGE_HTTP_TOKEN = _env_text("BRIDGE_HTTP_TOKEN", "")
+BRIDGE_HTTP_REQUIRE_RECON_MATCH = _env_bool("BRIDGE_HTTP_REQUIRE_RECON_MATCH", True)
 BATTLE_RETURNS_LOOP_STARTED = False
 NW_JUMP_ALERTS_LOOP_STARTED = False
+BRIDGE_HTTP_SERVER = None
+BRIDGE_HTTP_THREAD = None
 
 
 def parse_utc_dt(s: str) -> datetime:
@@ -520,6 +531,19 @@ async def ensure_db_ready():
         DB_READY = True
 
 
+def ensure_db_ready_sync():
+    """
+    Sync equivalent for non-async threads (bridge HTTP server).
+    """
+    global DB_READY
+    if DB_READY and DB_POOL:
+        return
+    init_db_pool(1, 10)
+    init_db()
+    heal_sequences()
+    DB_READY = True
+
+
 def compress_report(text: str) -> bytes:
     return gzip.compress(text.encode("utf-8"), compresslevel=9)
 
@@ -608,6 +632,11 @@ def _top_resource_text_for_seller(resource_map: dict, seller_key: str) -> str:
 
 def hash_report(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def normalized_report_hash(text: str) -> str:
+    normalized = re.sub(r"\r\n?", "\n", str(text or "").strip())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def castle_bonus(c: int) -> float:
@@ -2133,6 +2162,235 @@ def sync_recon_ingest_report(msg_content: str):
         return {"ok": False, "error": str(e)}
 
 
+def sync_claim_bridge_event(source: str, external_id: str | None, dedupe_key: str, report_hash: str, received_at: datetime | None, is_recon: bool) -> bool:
+    """
+    Returns True when this event is newly claimed, False when duplicate.
+    """
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bridge_ingest_events
+              (source, external_id, dedupe_key, report_hash, received_at, is_recon)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (dedupe_key) DO NOTHING
+            RETURNING id
+            """,
+            (
+                str(source or "messenger").strip() or "messenger",
+                (str(external_id).strip() if external_id is not None else None) or None,
+                dedupe_key,
+                report_hash,
+                normalize_to_utc(received_at) if received_at else None,
+                bool(is_recon),
+            ),
+        )
+        row = cur.fetchone()
+        return bool(row and row.get("id"))
+
+
+def sync_mark_bridge_event_result(dedupe_key: str, ingest_result: dict | None):
+    r = ingest_result or {}
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE bridge_ingest_events
+            SET ingest_ok = %s,
+                ingest_status = %s,
+                ingest_error = %s,
+                ingest_response_json = %s
+            WHERE dedupe_key = %s
+            """,
+            (
+                bool(r.get("ok")),
+                (int(r.get("status")) if r.get("status") is not None else None),
+                (str(r.get("error") or "").strip() or None),
+                (json.dumps(r, ensure_ascii=False) if r else None),
+                dedupe_key,
+            ),
+        )
+
+
+def _bridge_parse_received_at(raw: object) -> datetime:
+    txt = str(raw or "").strip()
+    if not txt:
+        return now_utc()
+    return parse_utc_dt(txt)
+
+
+def _bridge_int_or_none(raw: object) -> int | None:
+    try:
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        return int(s)
+    except Exception:
+        return None
+
+
+def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: str, received_at: datetime | None):
+    text = str(raw_text or "").strip()
+    if not text:
+        return {"ok": False, "status": 400, "error": "raw_text is empty"}
+
+    normalized = re.sub(r"\r\n?", "\n", text).strip()
+    source_name = str(source or "messenger").strip() or "messenger"
+    ext = (str(external_id).strip() if external_id is not None else "")
+    if ext:
+        dedupe_key = normalized_report_hash(f"{source_name}|{ext}")
+    else:
+        dedupe_key = normalized_report_hash(f"{source_name}|{normalized}")
+
+    report_hash = normalized_report_hash(normalized)
+    is_recon = looks_like_recon_report(normalized)
+
+    if BRIDGE_HTTP_REQUIRE_RECON_MATCH and not is_recon:
+        return {
+            "ok": True,
+            "duplicate": False,
+            "ignored": True,
+            "reason": "not_recon_report",
+            "dedupe_key": dedupe_key,
+            "is_recon": False,
+            "source": source_name,
+            "external_id": ext or None,
+            "report_hash": report_hash,
+            "forwarded": None,
+        }
+
+    forwarded = None
+    if is_recon:
+        forwarded = sync_recon_ingest_report(normalized)
+
+    result = {
+        "ok": True,
+        "duplicate": False,
+        "ignored": False,
+        "dedupe_key": dedupe_key,
+        "is_recon": is_recon,
+        "source": source_name,
+        "external_id": ext or None,
+        "report_hash": report_hash,
+        "forwarded": forwarded,
+    }
+    return result
+
+
+def _bridge_token_valid(headers) -> bool:
+    expected = str(BRIDGE_HTTP_TOKEN or "").strip()
+    if not expected:
+        return False
+
+    provided = str(headers.get("X-Bridge-Token") or "").strip()
+    if not provided:
+        auth = str(headers.get("Authorization") or "")
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if not provided:
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def start_bridge_http_server():
+    global BRIDGE_HTTP_SERVER, BRIDGE_HTTP_THREAD
+    logging.warning(
+        "Bridge startup config: enabled=%s bind=%s port=%s path=%s token_set=%s",
+        bool(BRIDGE_HTTP_ENABLED),
+        BRIDGE_HTTP_BIND,
+        BRIDGE_HTTP_PORT,
+        BRIDGE_HTTP_PATH,
+        bool(str(BRIDGE_HTTP_TOKEN or "").strip()),
+    )
+    if not BRIDGE_HTTP_ENABLED:
+        logging.info("Bridge HTTP receiver disabled (BRIDGE_HTTP_ENABLED=false)")
+        return
+    if not BRIDGE_HTTP_TOKEN:
+        raise RuntimeError("BRIDGE_HTTP_ENABLED=true requires BRIDGE_HTTP_TOKEN")
+    if BRIDGE_HTTP_SERVER:
+        return
+
+    port = _env_int("PORT", BRIDGE_HTTP_PORT)
+    path = str(BRIDGE_HTTP_PATH or "/api/bridge/report").strip() or "/api/bridge/report"
+    bind_host = str(BRIDGE_HTTP_BIND or "0.0.0.0").strip() or "0.0.0.0"
+
+    class BridgeHandler(BaseHTTPRequestHandler):
+        server_version = "KG2Bridge/1.0"
+
+        def log_message(self, fmt, *args):
+            logging.info("bridge_http: " + str(fmt), *args)
+
+        def _write_json(self, status: int, payload: dict):
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(int(status))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            req_path = str(self.path or "").split("?", 1)[0]
+            if req_path == "/healthz":
+                return self._write_json(200, {"ok": True, "service": "kg2bot", "bridge_http": True})
+            if req_path == path:
+                if not _bridge_token_valid(self.headers):
+                    return self._write_json(401, {"ok": False, "error": "unauthorized"})
+                return self._write_json(200, {"ok": True, "path": path, "ready": True})
+            return self._write_json(404, {"ok": False, "error": "not_found"})
+
+        def do_POST(self):
+            req_path = str(self.path or "").split("?", 1)[0]
+            if req_path != path:
+                return self._write_json(404, {"ok": False, "error": "not_found"})
+            if not _bridge_token_valid(self.headers):
+                return self._write_json(401, {"ok": False, "error": "unauthorized"})
+
+            try:
+                content_len = int(self.headers.get("Content-Length") or 0)
+            except Exception:
+                content_len = 0
+            if content_len <= 0:
+                return self._write_json(400, {"ok": False, "error": "missing_body"})
+
+            try:
+                raw_body = self.rfile.read(content_len)
+            except Exception:
+                return self._write_json(400, {"ok": False, "error": "read_failed"})
+
+            try:
+                body = json.loads(raw_body.decode("utf-8", errors="replace"))
+            except Exception:
+                return self._write_json(400, {"ok": False, "error": "invalid_json"})
+
+            raw_text = str((body or {}).get("raw_text") or (body or {}).get("text") or "").strip()
+            source = str((body or {}).get("source") or "messenger").strip() or "messenger"
+            external_id = (body or {}).get("external_id")
+            external_id = str(external_id).strip() if external_id is not None else None
+            received_at = _bridge_parse_received_at((body or {}).get("sent_at") or (body or {}).get("received_at"))
+
+            if not raw_text:
+                return self._write_json(400, {"ok": False, "error": "raw_text is empty"})
+
+            try:
+                result = sync_ingest_bridge_report(source, external_id, raw_text, received_at)
+            except Exception as e:
+                logging.exception("bridge ingest failed")
+                return self._write_json(500, {"ok": False, "error": str(e)})
+
+            status = int(result.get("status") or 200)
+            if result.get("duplicate"):
+                status = 200
+            elif result.get("ignored"):
+                status = 202
+            return self._write_json(status, result)
+
+    BRIDGE_HTTP_SERVER = ThreadingHTTPServer((bind_host, int(port)), BridgeHandler)
+    BRIDGE_HTTP_THREAD = threading.Thread(target=BRIDGE_HTTP_SERVER.serve_forever, name="bridge-http", daemon=True)
+    BRIDGE_HTTP_THREAD.start()
+    logging.info("Bridge HTTP receiver listening on %s:%s path=%s", bind_host, port, path)
+    logging.warning("Bridge HTTP receiver started on %s:%s path=%s", bind_host, port, path)
+
+
 def build_calc_link_from_ingest_data(data: dict) -> str | None:
     """
     Build calc deep-link using recon-hub stored spy report id/kingdom.
@@ -2393,6 +2651,23 @@ def init_db():
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS bridge_ingest_events (
+            id BIGSERIAL PRIMARY KEY,
+            source TEXT NOT NULL,
+            external_id TEXT,
+            dedupe_key TEXT NOT NULL,
+            report_hash TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            received_at TIMESTAMPTZ,
+            is_recon BOOLEAN NOT NULL DEFAULT FALSE,
+            ingest_ok BOOLEAN NOT NULL DEFAULT FALSE,
+            ingest_status INTEGER,
+            ingest_error TEXT,
+            ingest_response_json TEXT
+        );
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS troop_movements (
             id SERIAL PRIMARY KEY,
             owner_kingdom TEXT NOT NULL,
@@ -2644,6 +2919,19 @@ def init_db():
             CREATE UNIQUE INDEX IF NOT EXISTS attack_reports_source_message_id_uq
             ON attack_reports (source_message_id)
             WHERE source_message_id IS NOT NULL;
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS bridge_ingest_events_dedupe_key_uq
+            ON bridge_ingest_events (dedupe_key);
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS bridge_ingest_events_source_external_uq
+            ON bridge_ingest_events (source, external_id)
+            WHERE external_id IS NOT NULL;
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS bridge_ingest_events_created_at_idx
+            ON bridge_ingest_events (created_at DESC, id DESC);
         """)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS troop_movements_owner_out_idx
@@ -8215,4 +8503,5 @@ async def announcepatch(ctx):
 
 # ---------- START ----------
 if __name__ == "__main__":
+    start_bridge_http_server()
     bot.run(TOKEN)

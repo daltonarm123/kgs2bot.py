@@ -178,6 +178,65 @@ DISCORD_TOKEN=...
 DATABASE_URL=...
 ```
 
+Messenger bridge receiver variables (for automated forwarding from a local Messenger watcher):
+
+```text
+BRIDGE_HTTP_ENABLED=true
+BRIDGE_HTTP_TOKEN=<long-random-secret>
+BRIDGE_HTTP_PATH=/api/bridge/report
+BRIDGE_HTTP_REQUIRE_RECON_MATCH=true
+```
+
+Optional bridge variables:
+
+```text
+BRIDGE_HTTP_BIND=0.0.0.0
+BRIDGE_HTTP_PORT=8080
+```
+
+Bridge endpoint behavior:
+
+- `POST /api/bridge/report` accepts JSON with `raw_text` (or `text`), plus optional `source`, `external_id`, and `sent_at`.
+- Auth header: `X-Bridge-Token: <token>` (or `Authorization: Bearer <token>`).
+- Incoming events are deduped in `bridge_ingest_events` before processing.
+- If the text looks like a recon report, it is saved locally and forwarded to `RECON_INGEST_URL`.
+- Health endpoint: `GET /healthz`.
+
+## Facebook Messenger Bridge Worker
+
+Use the local worker in [fb_messenger_bridge.py](fb_messenger_bridge.py) to watch Messenger chats and post report text into the Railway bridge endpoint.
+
+Install dependency and browser once:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Recommended environment variables:
+
+```text
+BRIDGE_HTTP_URL=https://kg2recon-production.up.railway.app/api/bridge/report
+BRIDGE_HTTP_TOKEN=<same token set in Railway>
+FB_MESSENGER_EMAIL=<your fb login email>
+FB_MESSENGER_PASSWORD=<your fb login password>
+FB_MESSENGER_CHAT_NAMES=mom's knights in training,a team only
+FB_MESSENGER_HEADLESS=false
+FB_MESSENGER_POLL_SECONDS=15
+FB_MESSENGER_PROFILE_DIR=.fb_messenger_profile
+```
+
+Run the watcher:
+
+```bash
+python fb_messenger_bridge.py
+```
+
+Notes:
+- First run may require manual checkpoint/2FA approval in the browser.
+- The worker keeps a local browser profile dir so you do not need to log in every time.
+- Only report-like messages are forwarded (spy/recon and attack-style markers).
+
 Recommended variables for this bot:
 
 ```text
