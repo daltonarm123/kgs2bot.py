@@ -76,8 +76,9 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-05.4"
+BOT_VERSION = "2026-07-05.5"
 PATCH_NOTES = [
+    "Facebook Messenger bridge now keeps per-chat seen report history and baselines old visible FB reports on startup to prevent replay/double posts.",
     "Rankings tracking now records pie-status changes silently during background refreshes while leaving NW alert posting unchanged.",
     "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
     "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
