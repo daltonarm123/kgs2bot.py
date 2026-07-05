@@ -47,7 +47,7 @@ FB_CHAT_NAMES = [
     name.strip()
     for name in _env_text(
         "FB_MESSENGER_CHAT_NAMES",
-        "mom's knights in training,a team only",
+        "Mom's Knights In Training,A Team Only",
     ).split(",")
     if name.strip()
 ]
