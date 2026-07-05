@@ -232,10 +232,71 @@ Run the watcher:
 python fb_messenger_bridge.py
 ```
 
+One-time login bootstrap (saves session in local profile and exits):
+
+```bash
+cp .env.fbbridge.example .env.fbbridge
+set -a && source .env.fbbridge && set +a
+FB_MESSENGER_LOGIN_ONLY=true python fb_messenger_bridge.py
+```
+
 Notes:
 - First run may require manual checkpoint/2FA approval in the browser.
 - The worker keeps a local browser profile dir so you do not need to log in every time.
 - Only report-like messages are forwarded (spy/recon and attack-style markers).
+
+### Option 1: Keep local bridge always running
+
+PM2 option:
+
+```bash
+npm i -g pm2
+cp .env.fbbridge.example .env.fbbridge
+pm2 start ecosystem.fb-bridge.config.cjs
+pm2 save
+pm2 startup
+```
+
+systemd option:
+
+```bash
+cp .env.fbbridge.example .env.fbbridge
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+sudo cp ops/systemd/fb-messenger-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fb-messenger-bridge.service
+```
+
+### Option 2: Dedicated Railway worker service
+
+Service name: `fb-messenger-bridge`.
+
+Required service variables:
+
+```text
+RUN_FB_MESSENGER_BRIDGE=true
+BRIDGE_HTTP_URL=https://kg2recon-production.up.railway.app/api/bridge/report
+BRIDGE_HTTP_TOKEN=<same token as kg2recon bridge>
+BRIDGE_HTTP_SOURCE=facebook-messenger
+FB_MESSENGER_EMAIL=<fb email>
+FB_MESSENGER_PASSWORD=<fb password>
+FB_MESSENGER_CHAT_NAMES=mom's knights in training,a team only
+FB_MESSENGER_HEADLESS=true
+FB_MESSENGER_POLL_SECONDS=15
+FB_MESSENGER_LOOKBACK_MESSAGES=50
+```
+
+Deploy command:
+
+```bash
+railway up -y --service fb-messenger-bridge --environment production
+```
+
+Note:
+- The shared `railway.json` start command auto-runs `python -m playwright install chromium` when `RUN_FB_MESSENGER_BRIDGE=true`.
 
 Recommended variables for this bot:
 

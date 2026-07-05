@@ -42,6 +42,7 @@ FB_PROFILE_DIR = _env_text("FB_MESSENGER_PROFILE_DIR", ".fb_messenger_profile").
 FB_HEADLESS = _env_bool("FB_MESSENGER_HEADLESS", False)
 FB_POLL_SECONDS = _env_int("FB_MESSENGER_POLL_SECONDS", 15)
 FB_LOOKBACK_MESSAGES = _env_int("FB_MESSENGER_LOOKBACK_MESSAGES", 40)
+FB_LOGIN_ONLY = _env_bool("FB_MESSENGER_LOGIN_ONLY", False)
 FB_CHAT_NAMES = [
     name.strip()
     for name in _env_text(
@@ -167,7 +168,31 @@ def _attempt_login(page) -> None:
         print("INFO: login form detected; submitting FB_MESSENGER_EMAIL/FB_MESSENGER_PASSWORD")
         page.fill("input[name='email']", FB_EMAIL)
         page.fill("input[name='pass']", FB_PASSWORD)
-        page.click("button[name='login']")
+        clicked = False
+        login_selectors = [
+            "button[name='login']",
+            "#loginbutton",
+            "div[aria-label='Log in']",
+            "div[role='button'][aria-label='Log in']",
+            "button:has-text('Log in')",
+        ]
+        for sel in login_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() and loc.is_visible(timeout=800):
+                    loc.click(timeout=2500)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                page.press("input[name='pass']", "Enter")
+                clicked = True
+            except Exception:
+                pass
+        if not clicked:
+            raise RuntimeError("Could not submit Facebook login form")
         page.wait_for_timeout(2000)
 
     if _wait_for_inbox(page):
@@ -270,6 +295,11 @@ def main() -> int:
             print(f"ERROR: login failed: {e}")
             context.close()
             return 3
+
+        if FB_LOGIN_ONLY:
+            print("INFO: login-only mode complete; persistent profile is ready")
+            context.close()
+            return 0
 
         print(f"INFO: watching {len(FB_CHAT_NAMES)} chat(s): {', '.join(FB_CHAT_NAMES)}")
 

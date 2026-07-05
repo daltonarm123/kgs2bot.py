@@ -1,0 +1,17 @@
+[Unit]
+Description=KG2 Facebook Messenger Bridge Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/workspaces/kgs2bot.py
+EnvironmentFile=/workspaces/kgs2bot.py/.env.fbbridge
+ExecStart=/workspaces/kgs2bot.py/.venv/bin/python /workspaces/kgs2bot.py/fb_messenger_bridge.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

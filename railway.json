@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python kg2bot.py",
+    "startCommand": "sh -lc \"if [ '${RUN_FB_MESSENGER_BRIDGE:-false}' = 'true' ]; then python -m playwright install chromium && python fb_messenger_bridge.py; else python kg2bot.py; fi\"",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }

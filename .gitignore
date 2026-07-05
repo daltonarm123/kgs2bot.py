@@ -1,5 +1,6 @@
 .env
 .env.*
+!.env.fbbridge.example
 .railway/
 __pycache__/
 *.sqlite3
@@ -7,3 +8,5 @@ __pycache__/
 *.log
 .DS_Store
 app_tmp.js
+.fb_messenger_profile/
+.fb_messenger_bridge_state.json
