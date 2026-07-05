@@ -93,6 +93,13 @@ def _page_debug_state(page) -> str:
         return f"page_state_error={e}"
 
 
+def _page_text(page) -> str:
+    try:
+        return str(page.evaluate("() => document.body && document.body.innerText || ''") or "")
+    except Exception:
+        return ""
+
+
 def _is_report_text(text: str) -> bool:
     t = str(text or "").strip()
     if len(t) < 20:
@@ -277,6 +284,22 @@ def _looks_like_open_thread(page) -> bool:
         return False
 
 
+def _current_thread_has_chat_report_preview(page, chat_name: str) -> bool:
+    text = _page_text(page)
+    if not text:
+        return False
+    match = _chat_name_pattern(chat_name).search(text)
+    if not match:
+        return False
+    nearby = text[match.end() : match.end() + 240].lower()
+    if "unread message" not in nearby and "subject:" not in nearby and "target:" not in nearby:
+        return False
+    report_pos = min([pos for pos in (nearby.find("subject:"), nearby.find("target:")) if pos >= 0] or [-1])
+    if report_pos < 0:
+        return False
+    return True
+
+
 def _open_from_search_results(page, chat_name: str) -> bool:
     if "/search/" not in str(page.url):
         return False
@@ -305,6 +328,9 @@ def _open_from_search_results(page, chat_name: str) -> bool:
 def _open_chat(page, chat_name: str) -> bool:
     _ensure_messages_home(page)
     chat_pattern = _chat_name_pattern(chat_name)
+
+    if _looks_like_open_thread(page) and _current_thread_has_chat_report_preview(page, chat_name):
+        return True
 
     strategies = [
         lambda: page.get_by_role("link", name=chat_pattern).first,
@@ -400,6 +426,17 @@ def _extract_recent_messages(page, max_items: int) -> List[str]:
             continue
         seen.add(t)
         cleaned.append(t)
+
+    if not cleaned:
+        body_text = _page_text(page)
+        for txt in re.split(r"[\r\n]+", body_text):
+            t = re.sub(r"\s+", " ", str(txt or "")).strip()
+            if not t or len(t) < 2:
+                continue
+            if t in seen:
+                continue
+            seen.add(t)
+            cleaned.append(t)
 
     return cleaned[-max_items:]
 
