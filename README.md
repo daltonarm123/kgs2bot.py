@@ -138,6 +138,39 @@ This repo includes [railway.json](railway.json) so Railway runs the bot as a wor
 python kg2bot.py
 ```
 
+## Local Testing Before Push
+
+Use the local smoke tests before pushing bot logic changes. These tests do not connect to Discord or Postgres; they import the bot with dummy env vars and exercise pure parser/filtering logic.
+
+```bash
+python -m unittest discover -s tests
+```
+
+For real Discord command testing, use a separate test bot and test server/channel instead of the production bot:
+
+1. Create a second Discord application/bot token for testing.
+2. Invite that test bot to a private test server.
+3. Use a separate test Postgres database or schema.
+4. Set test env vars locally or in a separate Railway/Render test service:
+
+```bash
+DISCORD_TOKEN=<test bot token>
+DATABASE_URL=<test database url>
+TARGET_GUILD_ID=<test server id>
+UPDATES_CHANNEL_ID=<test updates channel id>
+LIVE_BATTLE_CHANNEL_ID=<test battle channel id>
+RECON_INGEST_ENABLED=false
+BACKFILL_FORWARD_ENABLED=false
+```
+
+Then run the worker against that test environment only:
+
+```bash
+python kg2bot.py
+```
+
+Use the production bot only after the local smoke tests pass and the change has been checked in the test Discord server when it affects command output or live alerts.
+
 Required Railway variables:
 
 ```text
