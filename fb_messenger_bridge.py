@@ -65,13 +65,19 @@ def _sha(text: str) -> str:
 
 def _is_report_text(text: str) -> bool:
     t = str(text or "").strip()
-    if len(t) < 40:
+    if len(t) < 20:
         return False
 
     report_markers = [
         r"Approximate defensive power",
         r"Number of Castles",
         r"The following technology information was also discovered",
+        r"Subject:\s*Attack Report",
+        r"Attack Report",
+        r"Attack Result",
+        r"Target:",
+        r"You have been attacked by",
+        r"attacked\s+.*\s+for\s+\d+\s+(?:land|acres)",
         r"Stalemate",
         r"Minor Victory",
         r"Major Victory",
