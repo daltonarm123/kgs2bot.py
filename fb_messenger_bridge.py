@@ -329,6 +329,49 @@ def _open_from_search_results(page, chat_name: str) -> bool:
     return False
 
 
+def _click_visible_chat_row(page, chat_name: str) -> bool:
+    try:
+        clicked = page.evaluate(
+            r"""
+(chatName) => {
+    const normalize = (value) => String(value || '')
+        .toLowerCase()
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+    const wanted = normalize(chatName);
+    const nodes = Array.from(document.querySelectorAll('a, [role="link"], [role="button"], [tabindex], div[dir="auto"], span[dir="auto"]'));
+    const matches = nodes
+        .filter((node) => normalize(node.innerText || node.textContent).includes(wanted))
+        .filter((node) => {
+            const rect = node.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        })
+        .sort((a, b) => {
+            const ar = a.getBoundingClientRect();
+            const br = b.getBoundingClientRect();
+            return (ar.width * ar.height) - (br.width * br.height);
+        });
+    for (const node of matches) {
+        let clickable = node.closest('a, [role="link"], [role="button"], [tabindex]') || node;
+        const rect = clickable.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        clickable.click();
+        return true;
+    }
+    return false;
+}
+""",
+            chat_name,
+        )
+        if clicked:
+            page.wait_for_timeout(1200)
+            return _looks_like_open_thread(page)
+    except Exception:
+        pass
+    return False
+
+
 def _open_chat(page, chat_name: str) -> bool:
     _ensure_messages_home(page)
     chat_pattern = _chat_name_pattern(chat_name)
@@ -347,6 +390,9 @@ def _open_chat(page, chat_name: str) -> bool:
                     return True
         except Exception:
             continue
+
+    if _click_visible_chat_row(page, chat_name):
+        return True
 
     # Fallback: use Messenger search to surface the conversation, then open first hit.
     search_selectors = [
