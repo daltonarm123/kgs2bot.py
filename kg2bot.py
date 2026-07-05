@@ -2737,6 +2737,40 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
         if _looks_like_pie_key(key_norm):
             candidates[key] = raw_value
 
+    # Fallback: some responses place pie/protection text into generic status
+    # fields (e.g., "Status": "2 pie") without pie/protection key names.
+    if not candidates:
+        generic_status_keys = {
+            "status",
+            "state",
+            "flags",
+            "effects",
+            "modifiers",
+            "buffs",
+            "notes",
+        }
+        for raw_key, raw_value in row.items():
+            if raw_value is None:
+                continue
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            key_norm = re.sub(r"[^a-z0-9]+", "", key.casefold())
+            if key_norm not in generic_status_keys:
+                continue
+            txt = str(raw_value or "").strip()
+            low = txt.casefold()
+            if not low:
+                continue
+            if ("pie" in low or "protect" in low) and low not in {
+                "no pie",
+                "nopie",
+                "no protection",
+                "unprotected",
+                "out of protection",
+            }:
+                candidates[key] = raw_value
+
     if not candidates:
         return {"active": False, "signature": "", "label": ""}
 
@@ -7664,6 +7698,56 @@ async def rankingsrefresh(ctx):
         await ctx.send("⚠️ rankingsrefresh failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"rankingsrefresh error: {e}", tb=tb)
+
+
+@bot.command(name="rankingspiedebug")
+async def rankingspiedebug(ctx):
+    """Admin-only: show live rankings fields that look pie/protection-related."""
+    try:
+        if not _is_admin(ctx):
+            return await ctx.send("❌ You don’t have permission to use this command.")
+        if ctx.guild and not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        await ctx.send("⏳ Inspecting live rankings payload for pie/protection fields...")
+        rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
+
+        pie_rows = [r for r in (rows or []) if bool(r.get("pie_active")) or str(r.get("pie_label") or "").strip()]
+
+        # Pull one live payload body preview as context for quick troubleshooting.
+        attempts = list(dbg.get("attempts") or [])
+        first_non_empty_preview = ""
+        for a in attempts:
+            p = str((a or {}).get("body_preview") or "").strip()
+            if p:
+                first_non_empty_preview = p
+                break
+
+        lines = [
+            "🧪 **Rankings Pie Debug**",
+            f"Rows pulled: `{len(rows or [])}`",
+            f"Rows detected with pie: `{len(pie_rows)}`",
+            f"Auth mode: `{dbg.get('auth_mode') or 'n/a'}` | ReturnValue: `{dbg.get('return_value') or 'n/a'}`",
+        ]
+
+        if pie_rows:
+            lines.append("Sample detected pie rows:")
+            for r in pie_rows[:8]:
+                lines.append(
+                    f"- #{int(r.get('rank') or 0)} {r.get('kingdom_name')} | {str(r.get('pie_label') or '').strip() or 'pie_active=true'}"
+                )
+        else:
+            lines.append("Detected pie rows: (none)")
+
+        if first_non_empty_preview:
+            lines.append(f"First API body preview: `{first_non_empty_preview[:450]}`")
+
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ rankingspiedebug failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"rankingspiedebug error: {e}", tb=tb)
 
 
 @bot.command(name="whereupdates")
