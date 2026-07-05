@@ -2703,6 +2703,28 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
         return {"active": False, "signature": "", "label": ""}
 
     candidates = {}
+
+    def _looks_like_pie_key(key_norm: str) -> bool:
+        if not key_norm:
+            return False
+        if "pie" in key_norm:
+            return True
+        if key_norm in {
+            "protectionstatus",
+            "landprotectionstatus",
+            "landstatus",
+            "hitstatus",
+            "kingdomstatus",
+        }:
+            return True
+        # Some KG responses expose pie as generic protection counters/flags
+        # (e.g. Protection, AttackProtection, ProtectionLevel) with no "status" token.
+        if "protection" in key_norm or "protected" in key_norm:
+            return True
+        if "protect" in key_norm and ("status" in key_norm or "land" in key_norm):
+            return True
+        return False
+
     for raw_key, raw_value in row.items():
         if raw_value is None:
             continue
@@ -2712,17 +2734,7 @@ def _kg_extract_rankings_pie_state(row: dict) -> dict:
         key_norm = re.sub(r"[^a-z0-9]+", "", key.casefold())
         if not key_norm:
             continue
-        if (
-            "pie" in key_norm
-            or key_norm in {
-                "protectionstatus",
-                "landprotectionstatus",
-                "landstatus",
-                "hitstatus",
-                "kingdomstatus",
-            }
-            or ("protect" in key_norm and ("status" in key_norm or "land" in key_norm))
-        ):
+        if _looks_like_pie_key(key_norm):
             candidates[key] = raw_value
 
     if not candidates:
@@ -2878,7 +2890,21 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                 start_numbers = [None]
                 if start_seed is not None:
                     pages = max(1, ceil(float(target_rows) / float(page_size)))
-                    start_numbers = [int(start_seed + (i * page_size)) for i in range(pages)]
+                    # KG endpoint behavior varies by environment: some builds treat
+                    # startNumber as an absolute row offset, others as a page index.
+                    # Probe both patterns so we can reliably gather top-N rows.
+                    candidates = []
+                    for i in range(pages):
+                        candidates.append(int(start_seed + (i * page_size)))
+                    for i in range(pages):
+                        candidates.append(int(start_seed + i))
+                    start_numbers = []
+                    seen_starts = set()
+                    for sn in candidates:
+                        if sn in seen_starts:
+                            continue
+                        seen_starts.add(sn)
+                        start_numbers.append(sn)
 
                 merged_by_kingdom = {}
                 ret_val = None
