@@ -248,7 +248,55 @@ def _attempt_login(page) -> None:
     raise RuntimeError("Messenger inbox did not load within 10 minutes.")
 
 
+def _ensure_messages_home(page) -> None:
+    if "/messages/" in str(page.url):
+        return
+    page.goto("https://www.facebook.com/messages/t/", wait_until="domcontentloaded", timeout=60000)
+    _wait_for_inbox(page)
+
+
+def _looks_like_open_thread(page) -> bool:
+    try:
+        url = str(page.url)
+        if "/search/" in url:
+            return False
+        if "/messages/" not in url:
+            return False
+        if page.locator("[contenteditable='true'], textarea, [aria-label*='Message']").first.count():
+            return True
+        return page.locator("[role='main'] div[dir='auto'], [role='main'] span[dir='auto']").first.count() > 0
+    except Exception:
+        return False
+
+
+def _open_from_search_results(page, chat_name: str) -> bool:
+    if "/search/" not in str(page.url):
+        return False
+    try:
+        messenger_filter = page.get_by_text("Messenger", exact=True).first
+        if messenger_filter.count() and messenger_filter.is_visible(timeout=1200):
+            messenger_filter.click(timeout=2500)
+            page.wait_for_timeout(1200)
+    except Exception:
+        pass
+    for get_locator in (
+        lambda: page.get_by_role("link", name=re.compile(re.escape(chat_name), re.IGNORECASE)).first,
+        lambda: page.get_by_text(chat_name, exact=False).first,
+    ):
+        try:
+            result = get_locator()
+            if result.count() and result.is_visible(timeout=1200):
+                result.click(timeout=2500)
+                page.wait_for_timeout(1200)
+                return _looks_like_open_thread(page)
+        except Exception:
+            continue
+    return False
+
+
 def _open_chat(page, chat_name: str) -> bool:
+    _ensure_messages_home(page)
+
     strategies = [
         lambda: page.get_by_role("link", name=re.compile(re.escape(chat_name), re.IGNORECASE)).first,
         lambda: page.get_by_text(chat_name, exact=False).first,
@@ -259,7 +307,8 @@ def _open_chat(page, chat_name: str) -> bool:
             if locator and locator.is_visible(timeout=1500):
                 locator.click(timeout=3000)
                 page.wait_for_timeout(700)
-                return True
+                if _looks_like_open_thread(page):
+                    return True
         except Exception:
             continue
 
@@ -284,18 +333,22 @@ def _open_chat(page, chat_name: str) -> bool:
             if result.count() and result.is_visible(timeout=1200):
                 result.click(timeout=2500)
                 page.wait_for_timeout(700)
-                return True
+                if _looks_like_open_thread(page):
+                    return True
 
             result = page.get_by_text(chat_name, exact=False).first
             if result.count() and result.is_visible(timeout=1200):
                 result.click(timeout=2500)
                 page.wait_for_timeout(700)
-                return True
+                if _looks_like_open_thread(page):
+                    return True
 
             # Some UIs let Enter open top search result.
             search_box.press("Enter")
-            page.wait_for_timeout(1000)
-            if page.locator("[role='main']").first.count():
+            page.wait_for_timeout(1200)
+            if _looks_like_open_thread(page):
+                return True
+            if _open_from_search_results(page, chat_name):
                 return True
         except Exception:
             continue
