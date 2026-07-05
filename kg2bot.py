@@ -2714,6 +2714,44 @@ def _kg_extract_rankings_rows(payload: dict) -> list[dict]:
     return []
 
 
+def _kg_build_rankings_raw_debug(rows: list[dict]) -> dict:
+    first = next((r for r in (rows or []) if isinstance(r, dict)), None)
+    if not first:
+        return {"raw_keys": [], "interesting_fields": []}
+
+    interesting_fields = []
+
+    def _walk(value, path: str):
+        if value is None or len(interesting_fields) >= 18:
+            return
+        path_norm = re.sub(r"[^a-z0-9]+", "", str(path or "").casefold())
+        if path_norm and any(token in path_norm for token in ("pie", "protect", "protection", "slice", "status")):
+            if isinstance(value, (dict, list, tuple, set)):
+                preview = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+            else:
+                preview = str(value).strip()
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            interesting_fields.append(f"{path}={preview}")
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                child_path = f"{path}.{child_key}" if path else str(child_key)
+                _walk(child_value, child_path)
+        elif isinstance(value, (list, tuple)):
+            for idx, child_value in enumerate(value[:5]):
+                child_path = f"{path}[{idx}]" if path else f"[{idx}]"
+                _walk(child_value, child_path)
+
+    for row in (rows or [])[:5]:
+        if isinstance(row, dict):
+            _walk(row, "")
+
+    return {
+        "raw_keys": [str(k) for k in list(first.keys())[:40]],
+        "interesting_fields": interesting_fields[:18],
+    }
+
+
 def _kg_extract_rankings_pie_state(row: dict) -> dict:
     if not isinstance(row, dict):
         return {"active": False, "signature": "", "label": ""}
@@ -3032,6 +3070,10 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                     data, req_dbg = _kg_webservice_post_debug("Kingdoms", "GetKingdomRankings", req_payload)
                     data = data or {}
                     rows = _kg_extract_rankings_rows(data)
+                    if rows and not meta.get("raw_rankings_keys"):
+                        raw_dbg = _kg_build_rankings_raw_debug(rows)
+                        meta["raw_rankings_keys"] = raw_dbg.get("raw_keys") or []
+                        meta["raw_rankings_interesting_fields"] = raw_dbg.get("interesting_fields") or []
                     norm = _kg_normalize_rankings_rows(rows)
                     if ret_val is None:
                         ret_val = _safe_int_or_none(_dict_pick(data, "ReturnValue", "returnValue"))
@@ -3044,7 +3086,7 @@ def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
                         "rows": int(len(norm or [])),
                         "http_status": req_dbg.get("status"),
                         "http_reason": req_dbg.get("reason"),
-                        "body_preview": str(req_dbg.get("body_preview") or "")[:120],
+                        "body_preview": str(req_dbg.get("body_preview") or "")[:220],
                     })
 
                     for row in norm:
@@ -7962,13 +8004,16 @@ async def rankingspiedebug(ctx):
                 )
         else:
             lines.append("Detected pie rows: (none)")
-            sample_keys = []
-            for r in (rows or [])[:3]:
-                keys = ", ".join(str(k) for k in list((r or {}).keys())[:12])
-                if keys:
-                    sample_keys.append(keys)
-            if sample_keys:
-                lines.append(f"Normalized row keys sample: `{sample_keys[0][:350]}`")
+            raw_keys = list(dbg.get("raw_rankings_keys") or [])
+            if raw_keys:
+                lines.append(f"Raw first row keys: `{', '.join(raw_keys)[:650]}`")
+            interesting = list(dbg.get("raw_rankings_interesting_fields") or [])
+            if interesting:
+                lines.append("Raw pie/protection/status-like fields:")
+                for item in interesting[:10]:
+                    lines.append(f"- `{item}`")
+            else:
+                lines.append("Raw pie/protection/status-like fields: `(none found in first 5 raw rows)`")
 
         if first_non_empty_preview:
             lines.append(f"First API body preview: `{first_non_empty_preview[:450]}`")
