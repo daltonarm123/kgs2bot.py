@@ -284,6 +284,48 @@ class FacebookBridgeStateTests(unittest.TestCase):
 
         self.assertEqual(1, len(spy_unseen))
 
+    def test_doubled_report_snapshot_collapses_across_polls(self):
+        body = (
+            "From: System Date: 22:02 To: The Way Subject: Attack Report: Gandolf "
+            "Attack Report: Gandolf (NW: + 9642) Attack Result: Major Victory "
+            "You have gained the following during the attack: 474 Land, 71954 Food, 30950 Gold, 4316 Stone, 5245 Wood, 30 Horses "
+            "We regret to inform you of the following casualties during the attack: 99/1085 Footmen "
+            "During this battle your troops tried to breach the Medium Town Armadyl Camp "
+            "(level 8 settlement) but were unable to take the town from the defending forces."
+        )
+        doubled = f"pulled attack report from fb {body} {body}"
+        poll1 = doubled + (
+            " Yes my old settlement liberated Yes my old settlement liberated"
+            " He's lost a few settys tonight He's lost a few settys tonight"
+            " 805 after a decent central coast beer 805 after a decent central coast beer"
+            " Zod what is beasties dp? Zod what is beasties dp?"
+            " August 3 cubs dodgers August 3 cubs dodgers"
+            " Mute Search Chat info Customize chat Chat members Media, files and links Privacy & support"
+        )
+        poll2 = poll1 + " 8 hour drive from the farm 8 hour drive from the farm"
+
+        parts1 = fb_messenger_bridge._split_report_blob(poll1)
+        parts2 = fb_messenger_bridge._split_report_blob(poll2)
+        hashes1 = {
+            fb_messenger_bridge._sha(
+                fb_messenger_bridge._canonical_report_text(p)
+                or fb_messenger_bridge._format_report_text(p)
+            )
+            for p in parts1
+            if fb_messenger_bridge._is_report_text(p)
+        }
+        hashes2 = {
+            fb_messenger_bridge._sha(
+                fb_messenger_bridge._canonical_report_text(p)
+                or fb_messenger_bridge._format_report_text(p)
+            )
+            for p in parts2
+            if fb_messenger_bridge._is_report_text(p)
+        }
+
+        self.assertEqual(1, len(hashes1))
+        self.assertEqual(hashes1, hashes2)
+
 
 if __name__ == "__main__":
     unittest.main()
