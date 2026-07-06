@@ -76,10 +76,11 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-05.6"
+BOT_VERSION = "2026-07-06.1"
 PATCH_NOTES = [
-    "Facebook Messenger bridge now strips trailing chat/UI text after report tech lines so the same report is not reposted when people chat after it.",
-    "Facebook Messenger bridge now keeps per-chat seen report history and baselines old visible FB reports on startup to prevent replay/double posts.",
+    "Fixed FB bridge duplicate posts caused by trailing chat replies (including @everyone/@here and messenger chrome text) getting glued onto report lines.",
+    "Bridge report normalization now hard-trims noise after movement/market rows so report hashes stay stable across polls and repost spam stops.",
+    "Bridge Discord posts now default to the reports-from-fb channel (override with BRIDGE_DISCORD_CHANNEL_NAME if needed).",
     "Rankings tracking now records pie-status changes silently during background refreshes while leaving NW alert posting unchanged.",
     "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
     "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
@@ -269,7 +270,7 @@ BRIDGE_HTTP_PORT = _env_int("BRIDGE_HTTP_PORT", 8080)
 BRIDGE_HTTP_PATH = _env_text("BRIDGE_HTTP_PATH", "/api/bridge/report") or "/api/bridge/report"
 BRIDGE_HTTP_TOKEN = _env_text("BRIDGE_HTTP_TOKEN", "")
 BRIDGE_HTTP_REQUIRE_RECON_MATCH = _env_bool("BRIDGE_HTTP_REQUIRE_RECON_MATCH", True)
-BRIDGE_DISCORD_CHANNEL_NAME = _env_text("BRIDGE_DISCORD_CHANNEL_NAME", "allies-war-room") or "allies-war-room"
+BRIDGE_DISCORD_CHANNEL_NAME = _env_text("BRIDGE_DISCORD_CHANNEL_NAME", "reports-from-fb") or "reports-from-fb"
 BATTLE_RETURNS_LOOP_STARTED = False
 NW_JUMP_ALERTS_LOOP_STARTED = False
 BRIDGE_HTTP_SERVER = None
@@ -693,10 +694,13 @@ _BRIDGE_REPORT_BREAK_BEFORE = (
 )
 
 
+_BRIDGE_MOVEMENT_MARKET_LINE_RE = re.compile(r"^(Launched an attack on |Attacked by |Bought |Sold )", re.IGNORECASE)
+
+
 def _trim_bridge_report_tail_lines(lines: list[str]) -> list[str]:
     trimmed: list[str] = []
     in_tech_section = False
-    chrome_re = re.compile(r"^(Mute|Search|Chat info|Customize chat|Chat members|Media, files and links|Privacy & support)\b", re.IGNORECASE)
+    chrome_re = re.compile(r"^(Mute|Search|Chat info|Customize chat|Chat members|Media, files and links|Privacy & support|@everyone|@here)\b", re.IGNORECASE)
     tech_re = re.compile(r"^(.+?\blvl\s+\d+)\b.*$", re.IGNORECASE)
 
     for raw_line in lines:
@@ -705,6 +709,12 @@ def _trim_bridge_report_tail_lines(lines: list[str]) -> list[str]:
             continue
         if chrome_re.search(line):
             break
+
+        # Drop trailing chat noise glued after movement/market rows ending in ")".
+        if _BRIDGE_MOVEMENT_MARKET_LINE_RE.match(line):
+            idx = line.rfind(")")
+            if idx >= 0 and idx + 1 < len(line):
+                line = line[: idx + 1].strip()
 
         if in_tech_section:
             match = tech_re.match(line)
@@ -734,6 +744,10 @@ def format_bridge_report_text(text: str) -> str:
 
     for marker in sorted(_BRIDGE_REPORT_BREAK_BEFORE, key=len, reverse=True):
         value = re.sub(rf"\s+(?={re.escape(marker)})", "\n", value)
+
+    # Force chat noise / messenger chrome onto its own line so tail trim can drop it.
+    for noise in ("Mute", "Search", "Chat info", "Customize chat", "Chat members", "Media, files and links", "Privacy & support", "@everyone", "@here"):
+        value = re.sub(rf"\s+(?={re.escape(noise)}\b)", "\n", value)
 
     value = re.sub(r"(?<=\d)\*\(without skill/prayer modifiers\)", "\n*(without skill/prayer modifiers)", value)
     value = re.sub(r"Subject:\nAttack Report:", "Subject: Attack Report:", value)

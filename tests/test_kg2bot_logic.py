@@ -327,6 +327,74 @@ class FacebookBridgeStateTests(unittest.TestCase):
         self.assertEqual(1, len(hashes1))
         self.assertEqual(hashes1, hashes2)
 
+    def test_spy_report_hash_stable_when_chat_replies_arrive_after(self):
+        report = (
+            "pulled spy report from fb From: System Date: 23:35 To: The Way "
+            "Subject: Reverse Mowhawk Spy Report Target: Reverse Mowhawk "
+            "Alliance: Break Honour: 14.96 Ranking: 64 Networth: 12040 "
+            "Spies Sent: 2800 Spies Lost: 208 Result Level: Complete Infiltration "
+            "Number of Castles: 15 "
+            "Our spies also found the following information about the kingdom's resources: "
+            "Gold: 292746 Wood: 56300 Food: 909009 Blue Gems: 1 Horses: 1713 Green Gems: 80 "
+            "Stone: 52900 Land: 16800 / 17870 "
+            "Our spies also found the following information about the kingdom's troops: "
+            "Population: 48330 / 48330 Heavy Cavalry: 1086 Pikemen: 195 Crossbowmen: 6265 "
+            "Archers: 35 Peasants: 37932 Approximate defensive power*: 18490*(without skill/prayer modifiers) "
+            "The following information was found regarding troop movements around this kingdom: "
+            "Launched an attack on The Way (20:08) Launched an attack on Rodan (19:41) "
+            "Launched an attack on Eowhyr (17:38) Attacked by The kingdom of war (16:35) "
+            "Launched an attack on The kingdom of war (13:14) Attacked by Eowhyr (09:57) "
+            "The following recent market transactions were also discovered: "
+            "Bought 1 x Stone from Dude for 300000 gold (2026-07-04 18:11) "
+            "Bought 1 x Stone from Mobius for 120000 gold (2026-07-03 19:10) "
+            "Bought 1 x Stone from Mobius for 110000 gold (2026-07-02 15:43)"
+        )
+        poll1 = report + " Mute Search Chat info Customize chat Chat members Media, files and links Privacy & support"
+        poll2 = (
+            report
+            + " @everyone good land @everyone good land Zoo Real good Real good"
+            + " Mute Search Chat info Customize chat Chat members Media, files and links Privacy & support"
+        )
+
+        def _hashes(blob: str) -> set[str]:
+            parts = fb_messenger_bridge._split_report_blob(blob)
+            return {
+                fb_messenger_bridge._sha(
+                    fb_messenger_bridge._canonical_report_text(p)
+                    or fb_messenger_bridge._format_report_text(p)
+                )
+                for p in parts
+                if fb_messenger_bridge._is_report_text(p)
+            }
+
+        h1 = _hashes(poll1)
+        h2 = _hashes(poll2)
+
+        self.assertEqual(1, len(h1))
+        self.assertEqual(h1, h2)
+
+        # Posted body should never leak @everyone or messenger chrome.
+        formatted = fb_messenger_bridge._format_report_text(poll2)
+        self.assertNotIn("@everyone", formatted)
+        self.assertNotIn("Zoo Real good", formatted)
+        self.assertNotIn("Mute Search", formatted)
+        self.assertTrue(
+            formatted.rstrip().endswith(
+                "Bought 1 x Stone from Mobius for 110000 gold (2026-07-02 15:43)"
+            ),
+            formatted,
+        )
+
+        # kg2bot.format_bridge_report_text must produce the same stable hash.
+        kg_norm1 = kg2bot.format_bridge_report_text(poll1)
+        kg_norm2 = kg2bot.format_bridge_report_text(poll2)
+        self.assertEqual(
+            kg2bot.normalized_report_hash(kg_norm1),
+            kg2bot.normalized_report_hash(kg_norm2),
+        )
+        self.assertNotIn("@everyone", kg_norm2)
+        self.assertNotIn("Mute Search", kg_norm2)
+
 
 class BridgeIngestDedupeTests(unittest.TestCase):
     SPY_REPORT = (

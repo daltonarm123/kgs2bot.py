@@ -123,10 +123,13 @@ _REPORT_BREAK_BEFORE = (
 )
 
 
+_MOVEMENT_MARKET_LINE_RE = re.compile(r"^(Launched an attack on |Attacked by |Bought |Sold )", re.IGNORECASE)
+
+
 def _trim_report_tail_lines(lines: List[str]) -> List[str]:
     trimmed: List[str] = []
     in_tech_section = False
-    chrome_re = re.compile(r"^(Mute|Search|Chat info|Customize chat|Chat members|Media, files and links|Privacy & support)\b", re.IGNORECASE)
+    chrome_re = re.compile(r"^(Mute|Search|Chat info|Customize chat|Chat members|Media, files and links|Privacy & support|@everyone|@here)\b", re.IGNORECASE)
     tech_re = re.compile(r"^(.+?\blvl\s+\d+)\b.*$", re.IGNORECASE)
 
     for raw_line in lines:
@@ -135,6 +138,12 @@ def _trim_report_tail_lines(lines: List[str]) -> List[str]:
             continue
         if chrome_re.search(line):
             break
+
+        # Drop trailing chat noise glued after movement/market rows ending in ")".
+        if _MOVEMENT_MARKET_LINE_RE.match(line):
+            idx = line.rfind(")")
+            if idx >= 0 and idx + 1 < len(line):
+                line = line[: idx + 1].strip()
 
         if in_tech_section:
             match = tech_re.match(line)
@@ -186,6 +195,10 @@ def _format_report_text(text: str) -> str:
     value = re.sub(r"\s+Enter,\s*Message sent .*? by [^:]{1,80}:\s*", "\n", value, flags=re.IGNORECASE)
     for marker in sorted(_REPORT_BREAK_BEFORE, key=len, reverse=True):
         value = re.sub(rf"\s+(?={re.escape(marker)})", "\n", value)
+
+    # Force chat noise / messenger chrome onto its own line so tail trim can drop it.
+    for noise in ("Mute", "Search", "Chat info", "Customize chat", "Chat members", "Media, files and links", "Privacy & support", "@everyone", "@here"):
+        value = re.sub(rf"\s+(?={re.escape(noise)}\b)", "\n", value)
 
     value = re.sub(r"(?<=\d)\*\(without skill/prayer modifiers\)", "\n*(without skill/prayer modifiers)", value)
     value = re.sub(r"Subject:\nAttack Report:", "Subject: Attack Report:", value)
