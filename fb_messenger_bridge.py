@@ -43,6 +43,7 @@ FB_HEADLESS = _env_bool("FB_MESSENGER_HEADLESS", False)
 FB_POLL_SECONDS = _env_int("FB_MESSENGER_POLL_SECONDS", 15)
 FB_LOOKBACK_MESSAGES = _env_int("FB_MESSENGER_LOOKBACK_MESSAGES", 40)
 FB_SEEN_REPORT_LIMIT = max(50, _env_int("FB_MESSENGER_SEEN_REPORT_LIMIT", 300))
+FB_POST_LATEST_ONLY = _env_bool("FB_MESSENGER_POST_LATEST_ONLY", True)
 FB_LOGIN_ONLY = _env_bool("FB_MESSENGER_LOGIN_ONLY", False)
 FB_DEBUG_REPORTS = _env_bool("FB_MESSENGER_DEBUG_REPORTS", False)
 FB_CHAT_NAMES = [
@@ -773,13 +774,19 @@ def _unseen_report_batch(report_candidates: List[str], seen_hashes: set) -> List
     unseen_reports: List[tuple[str, str]] = []
     batch_hashes = set()
     for candidate in report_candidates:
-        formatted = _format_report_text(candidate)
-        canonical = _canonical_report_text(formatted) or formatted
-        candidate_hash = _sha(canonical)
-        if candidate_hash in seen_hashes or candidate_hash in batch_hashes:
-            continue
-        unseen_reports.append((formatted, candidate_hash))
-        batch_hashes.add(candidate_hash)
+        # Some Messenger snapshots collapse multiple full reports into one blob.
+        # Split again here so we never forward a doubled "Target: ... Target: ..." payload.
+        parts = _split_report_blob(candidate)
+        for part in (parts or [candidate]):
+            formatted = _format_report_text(part)
+            if not _is_report_text(formatted):
+                continue
+            canonical = _canonical_report_text(formatted) or formatted
+            candidate_hash = _sha(canonical)
+            if candidate_hash in seen_hashes or candidate_hash in batch_hashes:
+                continue
+            unseen_reports.append((formatted, candidate_hash))
+            batch_hashes.add(candidate_hash)
     return unseen_reports
 
 
@@ -868,13 +875,32 @@ def main() -> int:
                     if not unseen_reports:
                         continue
 
+                    reports_to_post = unseen_reports[-1:] if FB_POST_LATEST_ONLY else unseen_reports
+                    if FB_POST_LATEST_ONLY and len(unseen_reports) > 1:
+                        print(
+                            f"INFO: chat={chat_name} collapsing {len(unseen_reports)} unseen reports "
+                            "to latest-only post"
+                        )
+
                     posted_hashes = []
-                    for best, best_hash in unseen_reports:
+                    for best, best_hash in reports_to_post:
                         mid = _sha(f"{chat_name}|{best}")[:24]
                         external_id = f"{chat_name}:{mid}"
                         result = _bridge_post(best, external_id)
                         print(f"INFO: bridge {chat_name} status={result.get('status')} ok={result.get('ok')}")
-                        posted_hashes.append(best_hash)
+                        if result.get("ok"):
+                            posted_hashes.append(best_hash)
+
+                    # Mark older unseen history as seen when latest-only mode is enabled,
+                    # so periodic rescans never replay backlog reports.
+                    if FB_POST_LATEST_ONLY:
+                        seen_hashes_now = [h for _, h in unseen_reports]
+                        if posted_hashes:
+                            _remember_report_hashes(chat_state, seen_hashes_now)
+                            _save_state(state)
+                        else:
+                            print(f"WARN: latest report post failed for chat={chat_name}; keeping unseen state for retry")
+                        continue
 
                     _remember_report_hashes(chat_state, posted_hashes)
                     _save_state(state)

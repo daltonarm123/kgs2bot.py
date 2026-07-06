@@ -395,6 +395,25 @@ class FacebookBridgeStateTests(unittest.TestCase):
         self.assertNotIn("@everyone", kg_norm2)
         self.assertNotIn("Mute Search", kg_norm2)
 
+    def test_unseen_report_batch_splits_doubled_target_blob(self):
+        doubled_blob = (
+            "Target: Josh Alliance: Knights of the Fire Honour: 23.84 Ranking: 41 Networth: 16006 "
+            "Spies Sent: 111 Spies Lost: 0 Result Level: Complete Infiltration Number of Castles: 4 "
+            "Our spies also found the following information about the kingdom's resources: Gold: 541274 Food: 1400106 "
+            "Our spies also found the following information about the kingdom's troops: Footmen: 13152 "
+            "Approximate defensive power*: 44775*(without skill/prayer modifiers) "
+            "Target: Josh Alliance: Knights of the Fire Honour: 23.84 Ranking: 41 Networth: 16006 "
+            "Spies Sent: 111 Spies Lost: 0 Result Level: Complete Infiltration Number of Castles: 4 "
+            "Our spies also found the following information about the kingdom's resources: Gold: 541274 Food: 1400106 "
+            "Our spies also found the following information about the kingdom's troops: Footmen: 13152 "
+            "Approximate defensive power*: 44775*(without skill/prayer modifiers)"
+        )
+
+        unseen = fb_messenger_bridge._unseen_report_batch([doubled_blob], set())
+
+        self.assertEqual(1, len(unseen))
+        self.assertEqual(1, unseen[0][0].count("Target: Josh"))
+
 
 class BridgeIngestDedupeTests(unittest.TestCase):
     SPY_REPORT = (
