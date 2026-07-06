@@ -153,6 +153,29 @@ def _trim_report_tail_lines(lines: List[str]) -> List[str]:
     return trimmed
 
 
+def _canonical_report_text(text: str) -> str:
+    formatted = _format_report_text(text)
+    lines = []
+    for raw_line in formatted.splitlines():
+        line = raw_line.strip()
+        ll = line.lower()
+        if not line:
+            continue
+        if ll in {"pulled spy report from fb", "pulled attack report from fb"}:
+            continue
+        if re.fullmatch(r"fb-(?:spy|attack)-report\.txt\s+\d+\s*kb", ll):
+            continue
+        line = re.sub(r"\s+fb-(?:spy|attack)-report\.txt\s+\d+\s*kb\b.*$", "", line, flags=re.IGNORECASE).strip()
+        if not line:
+            continue
+        lines.append(line)
+
+    start_markers = ("received:", "from:", "date:", "to:", "subject:", "attack report:", "target:")
+    while lines and not lines[0].lower().startswith(start_markers):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
 def _format_report_text(text: str) -> str:
     value = re.sub(r"\r\n?", "\n", str(text or "")).strip()
     if not value:
@@ -170,6 +193,9 @@ def _format_report_text(text: str) -> str:
     value = re.sub(r"(?<=\d)\s+(?=[A-Z][A-Za-z ]+ lvl \d+)", "\n", value)
     value = re.sub(r"\s+(?=\d+ of your footsoldiers)", "\n", value, flags=re.IGNORECASE)
     value = re.sub(r"(?<=\))\s+(?=Attacked by |Launched an attack on |Bought |Sold )", "\n", value)
+    value = re.sub(r"(but were unable to take the town from the defending forces\.)(?:\s+(?!A number of buildings were damaged during the battle\.)[^\n]*)", r"\1", value, flags=re.IGNORECASE)
+    value = re.sub(r"(A number of buildings were damaged during the battle\.)(?:\s+[^\n]*)", r"\1", value, flags=re.IGNORECASE)
+    value = re.sub(r"((?:Large|Medium|Small) Town .+?\(level \d+ settlement\)\.)(?:\s+[^\n]*)", r"\1", value, flags=re.IGNORECASE)
     value = re.sub(r"\n{3,}", "\n\n", value)
     lines = _trim_report_tail_lines([line.strip() for line in value.splitlines() if line.strip()])
     return "\n".join(lines).strip()
@@ -735,7 +761,8 @@ def _unseen_report_batch(report_candidates: List[str], seen_hashes: set) -> List
     batch_hashes = set()
     for candidate in report_candidates:
         formatted = _format_report_text(candidate)
-        candidate_hash = _sha(formatted)
+        canonical = _canonical_report_text(formatted) or formatted
+        candidate_hash = _sha(canonical)
         if candidate_hash in seen_hashes or candidate_hash in batch_hashes:
             continue
         unseen_reports.append((formatted, candidate_hash))
@@ -816,7 +843,7 @@ def main() -> int:
                         continue
 
                     chat_state = _chat_state(state, chat_name)
-                    report_hashes = [_sha(_format_report_text(m)) for m in report_candidates]
+                    report_hashes = [_sha(_canonical_report_text(m) or _format_report_text(m)) for m in report_candidates]
                     if not chat_state.get("initialized"):
                         _remember_report_hashes(chat_state, report_hashes)
                         _save_state(state)

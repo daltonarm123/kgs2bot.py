@@ -249,6 +249,41 @@ class FacebookBridgeStateTests(unittest.TestCase):
         self.assertTrue(unseen[0][0].endswith("Military Encampment lvl 7"))
         self.assertNotIn("Ufffffff", unseen[0][0])
 
+    def test_unseen_report_batch_dedupes_fb_previews_and_attack_chat_tails(self):
+        attack = (
+            "pulled attack report from fb From: System Date: 22:02 To: The Way "
+            "Subject: Attack Report: Gandolf Attack Report: Gandolf (NW: + 9642) "
+            "Attack Result: Major Victory You have gained the following during the attack: "
+            "474 Land, 71954 Food, 30950 Gold, 4316 Stone, 5245 Wood, 30 Horses "
+            "We regret to inform you of the following casualties during the attack: 99/1085 Footmen "
+            "During this battle your troops tried to breach the Medium Town Armadyl Camp "
+            "(level 8 settlement) but were unable to take the town from the defending forces."
+        )
+        variants = [
+            attack + " Yes my old settlement liberated",
+            attack + " He's lost a few settys tonight",
+            attack + " 805 after a decent central coast beer Mute Search Chat info",
+        ]
+
+        unseen = fb_messenger_bridge._unseen_report_batch(variants, set())
+
+        self.assertEqual(1, len(unseen))
+        self.assertTrue(unseen[0][0].endswith("defending forces."))
+        self.assertNotIn("liberated", unseen[0][0])
+
+        spy_variants = [
+            "pulled spy report from fb\nTarget: Brickshithouse Alliance: The Unforgiven "
+            "Spies Sent: 1200 Spies Lost: 80 Number of Castles: 12 "
+            "Our spies also found the following information about the kingdom's troops: Peasants: 1000\n"
+            "fb-spy-report.txt 3 KB",
+            "Target: Brickshithouse Alliance: The Unforgiven Spies Sent: 1200 Spies Lost: 80 "
+            "Number of Castles: 12 Our spies also found the following information about the kingdom's troops: Peasants: 1000",
+        ]
+
+        spy_unseen = fb_messenger_bridge._unseen_report_batch(spy_variants, set())
+
+        self.assertEqual(1, len(spy_unseen))
+
 
 if __name__ == "__main__":
     unittest.main()
