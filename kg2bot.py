@@ -2474,7 +2474,7 @@ def sync_ingest_bridge_report(source: str, external_id: str | None, raw_text: st
         saved_any = False
         if isinstance(local_saved, dict) and not local_saved.get("error"):
             for value in local_saved.values():
-                if isinstance(value, dict) and value.get("saved"):
+                if isinstance(value, dict) and value.get("saved") and not value.get("duplicate"):
                     saved_any = True
                     break
         if saved_any or (isinstance(local_saved, dict) and local_saved.get("error")):

@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import patch
 
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
@@ -325,6 +326,56 @@ class FacebookBridgeStateTests(unittest.TestCase):
 
         self.assertEqual(1, len(hashes1))
         self.assertEqual(hashes1, hashes2)
+
+
+class BridgeIngestDedupeTests(unittest.TestCase):
+    SPY_REPORT = (
+        "Target: Dude\n"
+        "Alliance: NWO-1\n"
+        "Spies Sent: 1600\n"
+        "Spies Lost: 102\n"
+        "Number of Castles: 50\n"
+        "Our spies also found the following information about the kingdom's troops:\n"
+        "Peasants: 59445\n"
+        "Approximate defensive power*: 84141\n"
+        "*(without skill/prayer modifiers)\n"
+        "The following technology information was also discovered: Leadership Training lvl 6"
+    )
+
+    def _run_ingest(self, spy_result):
+        schedule_calls = []
+
+        def fake_schedule(kind, text):
+            schedule_calls.append((kind, text))
+            return {"scheduled": True, "channel": "test"}
+
+        with patch.object(kg2bot, "ensure_db_ready_sync", lambda: None), \
+                patch.object(kg2bot, "sync_store_report", lambda text, ts: spy_result), \
+                patch.object(kg2bot, "sync_store_attack_report", lambda *a, **kw: {"saved": False}), \
+                patch.object(kg2bot, "sync_recon_ingest_report", lambda text: {"ok": True}), \
+                patch.object(kg2bot, "schedule_bridge_report_to_discord", fake_schedule):
+            result = kg2bot.sync_ingest_bridge_report(
+                "facebook-messenger",
+                "A Team Only:abc123",
+                self.SPY_REPORT,
+                None,
+            )
+        return result, schedule_calls
+
+    def test_new_spy_report_triggers_single_discord_post(self):
+        row = {"id": 1, "kingdom": "Dude", "defense_power": 84141, "castles": 50}
+        result, schedule_calls = self._run_ingest({"saved": True, "duplicate": False, "row": row})
+
+        self.assertEqual(1, len(schedule_calls))
+        self.assertEqual("spy", schedule_calls[0][0])
+        self.assertTrue(result["discord_post"].get("scheduled"))
+
+    def test_duplicate_spy_report_does_not_post_to_discord_again(self):
+        result, schedule_calls = self._run_ingest({"saved": True, "duplicate": True, "row": None})
+
+        self.assertEqual(0, len(schedule_calls))
+        self.assertFalse(result["discord_post"].get("scheduled"))
+        self.assertTrue(result["discord_post"].get("duplicate"))
 
 
 if __name__ == "__main__":
