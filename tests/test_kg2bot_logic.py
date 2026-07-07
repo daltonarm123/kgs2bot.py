@@ -224,6 +224,14 @@ class NwJumpAnchorLogicTests(unittest.TestCase):
         self.assertEqual(56000, new)
         self.assertEqual(6000, delta)
 
+    def test_staggered_positive_pops_preserve_leftover_and_fire_twice(self):
+        # First poll crosses by a little (+5194), second poll adds +4900.
+        # Together these should trigger again because leftover +194 is preserved.
+        events = self._run_polls([98760, 103954, 108854])
+        self.assertEqual(2, len(events))
+        self.assertEqual((98760, 103954, 5194), events[0])
+        self.assertEqual((103760, 108854, 5094), events[1])
+
     def test_no_repeat_alert_after_settling_at_new_level(self):
         # Drop fires once, then the kingdom sits near its new NW: no further alerts.
         polls = [15000, 8000, 8000, 7900, 8100, 8000]
@@ -366,6 +374,12 @@ class NwJumpDetectionIntegrationTests(unittest.TestCase):
     def test_stable_kingdom_never_alerts(self):
         events, _store = self._drive([15000, 15010, 14990, 15000])
         self.assertEqual([], events)
+
+    def test_staggered_pop_fires_twice_through_real_detector(self):
+        events, _store = self._drive([98760, 103954, 108854])
+        self.assertEqual(2, len(events), f"expected two staggered alerts, got {events}")
+        self.assertEqual(5194, int(events[0]["delta"]))
+        self.assertEqual(5094, int(events[1]["delta"]))
 
 
 class BridgeReportFormattingTests(unittest.TestCase):

@@ -78,7 +78,7 @@ from psycopg2 import pool as pg_pool
 # ------------------- PATCH INFO -------------------
 BOT_VERSION = "2026-07-07.1"
 PATCH_NOTES = [
-    "NW jump alerts now use cumulative anchor tracking, so gradual multi-poll gains or drops still announce once the total move crosses the threshold.",
+    "NW jump alerts now use cumulative anchor tracking with threshold-step carryover, so staggered pops keep leftover progress and can alert on both ticks when they cross another threshold chunk.",
     "Rankings refresh now rechecks recently tracked kingdoms that disappear from the rankings pull, so large drops are still evaluated instead of vanishing silently.",
     "Startup and NW jump diagnostics now show the active database identity and warn when the bot appears to be connected to a fresh or empty database.",
     "!nwjumpcheck, !nwjumpalerts status, and !nwjumpignore list now surface fresh-database warnings to explain missing subscriptions or ignore lists after a restart.",
@@ -3564,8 +3564,11 @@ def _compute_nw_jump_from_anchor(anchor_nw, old_nw, new_nw, threshold):
     thr = max(1, int(threshold or 1))
     delta = new_i - base
     if abs(delta) >= thr:
-        # Fire once and re-anchor at the current value so we do not repeat-alert.
-        return True, delta, base, new_i
+        # Move the anchor by exactly one threshold step toward the new value.
+        # This preserves any over-threshold remainder so staggered pops can
+        # trigger on subsequent ticks instead of dropping leftover progress.
+        step = thr if delta > 0 else -thr
+        return True, delta, base, (base + step)
     # Below threshold: keep accumulating from the same anchor.
     return False, delta, base, base
 
