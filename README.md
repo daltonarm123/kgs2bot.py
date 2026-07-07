@@ -104,6 +104,9 @@ Environment variables for this feature:
 NW_JUMP_ALERTS_ENABLED=true
 NW_JUMP_ALERT_POLL_SECONDS=60
 NW_JUMP_ALERT_DEFAULT_THRESHOLD=5000
+NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS=24
+NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT=25
+NW_JUMP_ALERT_CUMULATIVE_ENABLED=true
 KG_GAME_PIE_ALERTS_ENABLED=true
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS=1
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS=24
@@ -111,6 +114,8 @@ KG_GAME_RANKINGS_CONTINENT_ID=-1
 
 Notes:
 - `NW_JUMP_ALERT_POLL_SECONDS` controls how often the bot refreshes the live top-100 rankings automatically.
+- The missing-rankings fallback rechecks recently tracked kingdoms that fall out of the rankings pull, so large NW drops can still alert.
+- Cumulative detection (`NW_JUMP_ALERT_CUMULATIVE_ENABLED`) anchors each kingdom's networth and alerts once the total move since the last alert crosses the threshold, so slow multi-poll drops/gains are not missed. Set it to `false` to fall back to comparing only consecutive polls.
 - `!rankingsrefresh` lets an admin force an immediate rankings refresh into current state/history and trigger any NW/pie alerts right away.
 
 Optional SMS fanout (Twilio):

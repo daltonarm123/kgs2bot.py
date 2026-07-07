@@ -94,6 +94,22 @@ class RankingsNormalizationSafetyTests(unittest.TestCase):
         self.assertEqual(108137, normalized[0]["networth"])
         self.assertEqual(1, normalized[0]["rank"])
 
+    def test_build_rankings_fallback_row_from_state_keeps_missing_kingdom_trackable(self):
+        state_row = {
+            "kingdom_id": 321,
+            "kingdom_name": "Magic",
+            "rank_pos": 99,
+            "networth": 15000,
+        }
+
+        row = kg2bot._build_rankings_fallback_row_from_state(state_row, 8000)
+
+        self.assertEqual(321, row["kingdom_id"])
+        self.assertEqual("Magic", row["kingdom_name"])
+        self.assertEqual(99, row["rank"])
+        self.assertEqual(8000, row["networth"])
+        self.assertEqual("search_fallback", row["rankings_source"])
+
     def test_normalize_rankings_rows_extracts_pie_state(self):
         rows = [
             {
@@ -130,6 +146,202 @@ class NwJumpFormattingSafetyTests(unittest.TestCase):
         self.assertIn("KG2 NW jump alert", sms)
         self.assertIn("Northhold", sms)
         self.assertIn("Unknown", sms)
+
+
+class NwJumpAnchorLogicTests(unittest.TestCase):
+    THRESHOLD = 5000
+
+    def _run_polls(self, values):
+        """
+        Drive the pure cumulative detector across a sequence of networth polls,
+        threading the persisted anchor through exactly like the DB path does.
+        Returns the list of fired events as (base_nw, new_nw, delta) tuples.
+        """
+        anchor = None
+        old_nw = None
+        events = []
+        for v in values:
+            fired, delta, base_nw, new_anchor = kg2bot._compute_nw_jump_from_anchor(
+                anchor, old_nw, v, self.THRESHOLD
+            )
+            if fired:
+                events.append((base_nw, v, delta))
+            anchor = new_anchor
+            old_nw = v
+        return events
+
+    def test_sudden_drop_fires_once(self):
+        events = self._run_polls([15000, 8000])
+        self.assertEqual(1, len(events))
+        base, new, delta = events[0]
+        self.assertEqual(15000, base)
+        self.assertEqual(8000, new)
+        self.assertEqual(-7000, delta)
+
+    def test_gradual_drop_under_threshold_still_fires_once(self):
+        # Each single step is under 5000, but the cumulative slide is large.
+        polls = [15000, 14000, 13000, 12000, 11000, 10000, 9500, 9000, 8500, 8000]
+        events = self._run_polls(polls)
+        self.assertEqual(1, len(events))
+        base, new, delta = events[0]
+        self.assertEqual(15000, base)
+        self.assertEqual(10000, new)  # anchor re-seeds the first time the total crosses 5000
+        self.assertEqual(-5000, delta)
+
+    def test_small_oscillation_never_fires(self):
+        polls = [10000, 10500, 9800, 10200, 9900, 10100, 9700]
+        self.assertEqual([], self._run_polls(polls))
+
+    def test_upward_jump_fires(self):
+        events = self._run_polls([50000, 56000])
+        self.assertEqual(1, len(events))
+        base, new, delta = events[0]
+        self.assertEqual(50000, base)
+        self.assertEqual(56000, new)
+        self.assertEqual(6000, delta)
+
+    def test_no_repeat_alert_after_settling_at_new_level(self):
+        # Drop fires once, then the kingdom sits near its new NW: no further alerts.
+        polls = [15000, 8000, 8000, 7900, 8100, 8000]
+        events = self._run_polls(polls)
+        self.assertEqual(1, len(events))
+
+    def test_missing_current_networth_preserves_anchor(self):
+        polls = [15000, None, None, 9500]
+        events = self._run_polls(polls)
+        self.assertEqual(1, len(events))
+        base, new, delta = events[0]
+        self.assertEqual(15000, base)
+        self.assertEqual(9500, new)
+        self.assertEqual(-5500, delta)
+
+    def test_first_sight_seeds_anchor_without_alert(self):
+        fired, delta, base_nw, new_anchor = kg2bot._compute_nw_jump_from_anchor(
+            None, None, 12345, self.THRESHOLD
+        )
+        self.assertFalse(fired)
+        self.assertEqual(12345, new_anchor)
+
+
+class _FakeRankingsCursor:
+    """Minimal RealDictCursor stand-in backed by an in-memory kingdom_rankings_state."""
+
+    def __init__(self, store):
+        self.store = store
+        self._pending = []
+
+    def _norm(self, sql):
+        return " ".join(str(sql or "").split())
+
+    def execute(self, sql, params=None):
+        s = self._norm(sql)
+        if "FROM kingdom_rankings_state" in s and "ANY" in s:
+            ids = {int(x) for x in (params[1] or [])}
+            self._pending = [dict(self.store[k]) for k in ids if k in self.store]
+        else:
+            self._pending = []
+
+    def executemany(self, sql, seq):
+        s = self._norm(sql)
+        if "INSERT INTO kingdom_rankings_state" in s:
+            for t in seq:
+                kid = int(t[1])
+                self.store[kid] = {
+                    "kingdom_id": kid,
+                    "kingdom_name": t[2],
+                    "rank_pos": t[3],
+                    "networth": t[4],
+                    "pie_active": t[5],
+                    "pie_signature": t[6],
+                    "pie_label": t[7],
+                    "alert_anchor_networth": t[9],
+                }
+        # kingdom_rankings_history inserts are irrelevant to detection state.
+
+    def fetchall(self):
+        return list(self._pending)
+
+    def fetchone(self):
+        return self._pending[0] if self._pending else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeRankingsConn:
+    def __init__(self, store):
+        self.store = store
+
+    def cursor(self, *args, **kwargs):
+        return _FakeRankingsCursor(self.store)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class NwJumpDetectionIntegrationTests(unittest.TestCase):
+    THRESHOLD = 5000
+    WORLD_ID = 1
+
+    def _make_db(self, store):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _fake_db_conn():
+            yield _FakeRankingsConn(store)
+
+        return _fake_db_conn
+
+    def _row(self, networth, name="Magic", kid=321, rank=42):
+        return {
+            "kingdom_id": kid,
+            "kingdom_name": name,
+            "rank": rank,
+            "networth": networth,
+            "pie_active": False,
+            "pie_signature": "",
+            "pie_label": "",
+        }
+
+    def _drive(self, networth_sequence):
+        store = {}
+        all_events = []
+        with patch.object(kg2bot, "db_conn", self._make_db(store)):
+            for nw in networth_sequence:
+                result = kg2bot.sync_detect_rankings_alerts(
+                    self.WORLD_ID, [self._row(nw)], self.THRESHOLD
+                )
+                all_events.extend(result.get("nw_events") or [])
+        return all_events, store
+
+    def test_gradual_drop_fires_once_through_real_detector(self):
+        polls = [15000, 14000, 13000, 12000, 11000, 10000, 9500, 9000, 8500, 8000]
+        events, store = self._drive(polls)
+
+        self.assertEqual(1, len(events), f"expected exactly one alert, got {events}")
+        evt = events[0]
+        self.assertEqual("Magic", evt["kingdom_name"])
+        self.assertEqual(15000, evt["old_networth"])
+        self.assertEqual(10000, evt["new_networth"])
+        self.assertEqual(-5000, evt["delta"])
+        # Final persisted state should reflect the latest poll + a re-seeded anchor.
+        self.assertEqual(8000, store[321]["networth"])
+        self.assertEqual(10000, store[321]["alert_anchor_networth"])
+
+    def test_sudden_drop_fires_once_through_real_detector(self):
+        events, _store = self._drive([15000, 8000])
+        self.assertEqual(1, len(events))
+        self.assertEqual(-7000, events[0]["delta"])
+
+    def test_stable_kingdom_never_alerts(self):
+        events, _store = self._drive([15000, 15010, 14990, 15000])
+        self.assertEqual([], events)
 
 
 class BridgeReportFormattingTests(unittest.TestCase):

@@ -78,6 +78,8 @@ from psycopg2 import pool as pg_pool
 # ------------------- PATCH INFO -------------------
 BOT_VERSION = "2026-07-06.1"
 PATCH_NOTES = [
+    "NW jump alerts now track a cumulative anchor per kingdom, so gradual multi-poll NW drops (e.g. 15k down to 8k over a night) still announce even when each step is under the threshold.",
+    "NW jump alerts now recheck recently tracked kingdoms that disappear from the rankings pull, so large NW drops can still announce.",
     "Fixed FB bridge duplicate posts caused by trailing chat replies (including @everyone/@here and messenger chrome text) getting glued onto report lines.",
     "Bridge report normalization now hard-trims noise after movement/market rows so report hashes stay stable across polls and repost spam stops.",
     "Bridge Discord posts now default to the reports-from-fb channel (override with BRIDGE_DISCORD_CHANNEL_NAME if needed).",
@@ -245,6 +247,9 @@ NW_JUMP_ALERTS_ENABLED = _env_bool("NW_JUMP_ALERTS_ENABLED", True)
 NW_JUMP_ALERT_POLL_SECONDS = _env_int("NW_JUMP_ALERT_POLL_SECONDS", 60)
 NW_JUMP_ALERT_DEFAULT_THRESHOLD = _env_int("NW_JUMP_ALERT_DEFAULT_THRESHOLD", 5000)
 NW_JUMP_ALERT_SILENT_NO_SUBS = _env_bool("NW_JUMP_ALERT_SILENT_NO_SUBS", True)
+NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS = _env_int("NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS", 24)
+NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT = _env_int("NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT", 25)
+NW_JUMP_ALERT_CUMULATIVE_ENABLED = _env_bool("NW_JUMP_ALERT_CUMULATIVE_ENABLED", True)
 KG_GAME_PIE_ALERTS_ENABLED = _env_bool("KG_GAME_PIE_ALERTS_ENABLED", True)
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS = _env_int("KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS", 1)
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS = _env_int("KINGDOM_LIVE_ATTACK_WINDOW_HOURS", 24)
@@ -2954,6 +2959,7 @@ def init_db():
             pie_active BOOLEAN NOT NULL DEFAULT FALSE,
             pie_signature TEXT,
             pie_label TEXT,
+            alert_anchor_networth BIGINT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (world_id, kingdom_id)
         );
@@ -3037,6 +3043,8 @@ def init_db():
             cur.execute("ALTER TABLE kingdom_rankings_state ADD COLUMN pie_signature TEXT;")
         if "pie_label" not in rankings_state_cols:
             cur.execute("ALTER TABLE kingdom_rankings_state ADD COLUMN pie_label TEXT;")
+        if "alert_anchor_networth" not in rankings_state_cols:
+            cur.execute("ALTER TABLE kingdom_rankings_state ADD COLUMN alert_anchor_networth BIGINT;")
         if "attack_result" not in attack_cols:
             cur.execute("ALTER TABLE attack_reports ADD COLUMN attack_result TEXT;")
         if "land_taken" not in attack_cols:
@@ -3493,6 +3501,61 @@ def _kg_sort_normalized_rankings_rows(rows: list[dict]) -> list[dict]:
         if not row.get("rank"):
             row["rank"] = i
     return out
+
+
+def _build_rankings_fallback_row_from_state(state_row: dict, networth: int | None) -> dict | None:
+    if not isinstance(state_row, dict):
+        return None
+    kid = _safe_int_or_none(state_row.get("kingdom_id"))
+    nw = _safe_int_or_none(networth)
+    if not kid or nw is None:
+        return None
+    name = str(state_row.get("kingdom_name") or "").strip() or f"Kingdom #{kid}"
+    return {
+        "kingdom_id": int(kid),
+        "kingdom_name": name,
+        "rank": _safe_int_or_none(state_row.get("rank_pos")),
+        "networth": int(nw),
+        "pie_active": False,
+        "pie_signature": "",
+        "pie_label": "",
+        "rankings_source": "search_fallback",
+    }
+
+
+def _compute_nw_jump_from_anchor(anchor_nw, old_nw, new_nw, threshold):
+    """
+    Cumulative NW-move detector with hysteresis.
+
+    Compares the current networth against a persistent anchor (the networth at
+    the last time we alerted, or when the kingdom was first seen). This catches
+    both sudden single-poll swings and gradual multi-poll drifts where each step
+    stays under the threshold but the total move is large (e.g. a kingdom farmed
+    from 15k down to 8k over a night).
+
+    Returns (fired, delta, base_nw, new_anchor):
+      fired      -> True when abs(current - anchor) >= threshold
+      delta      -> current - base_nw (None when it cannot be computed)
+      base_nw    -> the anchor the move was measured from
+      new_anchor -> anchor value to persist for the next poll
+    """
+    new_i = _safe_int_or_none(new_nw)
+    base = _safe_int_or_none(anchor_nw)
+    if base is None:
+        base = _safe_int_or_none(old_nw)
+    if new_i is None:
+        # No current networth to evaluate; keep the anchor we already had.
+        return False, None, base, base
+    if base is None:
+        # First time we can measure this kingdom: seed the anchor, do not alert.
+        return False, None, new_i, new_i
+    thr = max(1, int(threshold or 1))
+    delta = new_i - base
+    if abs(delta) >= thr:
+        # Fire once and re-anchor at the current value so we do not repeat-alert.
+        return True, delta, base, new_i
+    # Below threshold: keep accumulating from the same anchor.
+    return False, delta, base, base
 
 
 def fetch_world_kingdom_rankings_debug() -> tuple[list[dict], dict]:
@@ -4023,6 +4086,28 @@ def sync_get_nw_rankings_state_stats(world_id: int) -> dict:
         }
 
 
+def sync_get_missing_rankings_state_rows(world_id: int, current_kingdom_ids: list[int], lookback_hours: int, limit: int) -> list[dict]:
+    ids = [int(x) for x in (current_kingdom_ids or []) if _safe_int_or_none(x)]
+    since = now_utc() - timedelta(hours=max(1, int(lookback_hours or 24)))
+    lim = max(1, min(100, int(limit or 25)))
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kingdom_id, kingdom_name, rank_pos, networth, updated_at
+            FROM kingdom_rankings_state
+            WHERE world_id=%s
+              AND NOT (kingdom_id = ANY(%s))
+              AND kingdom_name IS NOT NULL
+              AND kingdom_name <> ''
+              AND updated_at >= %s
+            ORDER BY updated_at DESC NULLS LAST, networth DESC NULLS LAST
+            LIMIT %s;
+            """,
+            (int(world_id), ids, since, lim),
+        )
+        return [dict(r) for r in (cur.fetchall() or [])]
+
+
 def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_threshold: int) -> dict:
     if not rows:
         return {"nw_events": [], "pie_events": []}
@@ -4039,7 +4124,7 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label
+            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label, alert_anchor_networth
             FROM kingdom_rankings_state
             WHERE world_id=%s AND kingdom_id = ANY(%s);
             """,
@@ -4047,20 +4132,34 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
         )
         prev = {int(r["kingdom_id"]): r for r in (cur.fetchall() or [])}
 
+        anchor_by_id = {}
         for kid, current in row_by_id.items():
+            new_nw = _safe_int_or_none(current.get("networth"))
             old = prev.get(kid)
-            if not old:
+            if old is None:
+                # No baseline yet: seed the anchor, cannot alert on first sight.
+                anchor_by_id[kid] = new_nw
                 continue
             old_nw = _safe_int_or_none(old.get("networth"))
-            new_nw = _safe_int_or_none(current.get("networth"))
-            if old_nw is None or new_nw is None:
+            if new_nw is None:
+                # Preserve the existing anchor when the current pull lacks a networth.
+                keep = _safe_int_or_none(old.get("alert_anchor_networth"))
+                anchor_by_id[kid] = keep if keep is not None else old_nw
                 continue
-            delta = int(new_nw) - int(old_nw)
-            if abs(delta) >= threshold:
+            if NW_JUMP_ALERT_CUMULATIVE_ENABLED:
+                anchor_nw = _safe_int_or_none(old.get("alert_anchor_networth"))
+            else:
+                anchor_nw = old_nw
+            fired, delta, base_nw, new_anchor = _compute_nw_jump_from_anchor(anchor_nw, old_nw, new_nw, threshold)
+            if not NW_JUMP_ALERT_CUMULATIVE_ENABLED:
+                # Consecutive-poll mode: never carry accumulation forward.
+                new_anchor = new_nw
+            anchor_by_id[kid] = new_anchor if new_anchor is not None else new_nw
+            if fired and base_nw is not None:
                 nw_events.append({
                     "kingdom_id": kid,
                     "kingdom_name": str(current.get("kingdom_name") or old.get("kingdom_name") or f"Kingdom #{kid}"),
-                    "old_networth": int(old_nw),
+                    "old_networth": int(base_nw),
                     "new_networth": int(new_nw),
                     "delta": int(delta),
                     "old_rank": _safe_int_or_none(old.get("rank_pos")),
@@ -4095,6 +4194,7 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
                 str(r.get("pie_signature") or "") or None,
                 str(r.get("pie_label") or "") or None,
                 now_ts,
+                _safe_int_or_none(anchor_by_id.get(int(r["kingdom_id"]))),
             )
             for r in row_by_id.values()
         ]
@@ -4117,9 +4217,9 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
             """
             INSERT INTO kingdom_rankings_state (
                 world_id, kingdom_id, kingdom_name, rank_pos, networth,
-                pie_active, pie_signature, pie_label, updated_at
+                pie_active, pie_signature, pie_label, updated_at, alert_anchor_networth
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (world_id, kingdom_id) DO UPDATE
             SET kingdom_name=EXCLUDED.kingdom_name,
                 rank_pos=EXCLUDED.rank_pos,
@@ -4127,7 +4227,8 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
                 pie_active=EXCLUDED.pie_active,
                 pie_signature=EXCLUDED.pie_signature,
                 pie_label=EXCLUDED.pie_label,
-                updated_at=EXCLUDED.updated_at;
+                updated_at=EXCLUDED.updated_at,
+                alert_anchor_networth=EXCLUDED.alert_anchor_networth;
             """,
             upsert_rows,
         )
@@ -4363,6 +4464,25 @@ async def send_rankings_pie_alerts(events: list[dict]):
 
 async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
     rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
+    if rows:
+        current_ids = [int(r.get("kingdom_id") or 0) for r in rows if isinstance(r, dict) and _safe_int_or_none(r.get("kingdom_id"))]
+        missing_state_rows = await run_db(
+            sync_get_missing_rankings_state_rows,
+            int(KG_GAME_WORLD_ID or 1),
+            current_ids,
+            int(NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS or 24),
+            int(NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT or 25),
+        )
+        fallback_rows = []
+        for state_row in missing_state_rows:
+            nw = await asyncio.to_thread(fetch_kingdom_networth_from_game_api, str(state_row.get("kingdom_name") or ""))
+            fallback_row = _build_rankings_fallback_row_from_state(state_row, nw)
+            if fallback_row:
+                fallback_rows.append(fallback_row)
+        if fallback_rows:
+            rows = _kg_sort_normalized_rankings_rows(list(rows or []) + fallback_rows)
+        dbg["missing_rankings_checked"] = len(missing_state_rows or [])
+        dbg["missing_rankings_found"] = len(fallback_rows or [])
     await run_db(sync_meta_set, "nw_jump_last_poll_ts", str(int(time.time())))
     await run_db(sync_meta_set, "nw_jump_last_poll_rows", str(len(rows or [])))
     await run_db(sync_meta_set, "nw_jump_last_auth_mode", str(dbg.get("auth_mode") or ""))
