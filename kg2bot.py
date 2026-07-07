@@ -76,19 +76,12 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-06.1"
+BOT_VERSION = "2026-07-07.1"
 PATCH_NOTES = [
-    "NW jump alerts now track a cumulative anchor per kingdom, so gradual multi-poll NW drops (e.g. 15k down to 8k over a night) still announce even when each step is under the threshold.",
-    "NW jump alerts now recheck recently tracked kingdoms that disappear from the rankings pull, so large NW drops can still announce.",
-    "Fixed FB bridge duplicate posts caused by trailing chat replies (including @everyone/@here and messenger chrome text) getting glued onto report lines.",
-    "Bridge report normalization now hard-trims noise after movement/market rows so report hashes stay stable across polls and repost spam stops.",
-    "Bridge Discord posts now default to the reports-from-fb channel (override with BRIDGE_DISCORD_CHANNEL_NAME if needed).",
-    "Rankings tracking now records pie-status changes silently during background refreshes while leaving NW alert posting unchanged.",
-    "Added live rankings history so the bot can compare kingdom changes over a lookback window instead of only showing the latest poll.",
-    "Added !kingdomlive / !intel for a live kingdom profile with rank, NW, pie, recent attacks, latest SR, and tracked-home context.",
-    "NW jump diagnostics now show current state rows, rankings history rows, and live pie detections from the current pull.",
-    "Rankings tracking now always keeps at least the top 100 kingdoms in scope.",
-    "Added !rankingsrefresh so admins can force an immediate live top-100 rankings update between automatic poll cycles.",
+    "NW jump alerts now use cumulative anchor tracking, so gradual multi-poll gains or drops still announce once the total move crosses the threshold.",
+    "Rankings refresh now rechecks recently tracked kingdoms that disappear from the rankings pull, so large drops are still evaluated instead of vanishing silently.",
+    "Startup and NW jump diagnostics now show the active database identity and warn when the bot appears to be connected to a fresh or empty database.",
+    "!nwjumpcheck, !nwjumpalerts status, and !nwjumpignore list now surface fresh-database warnings to explain missing subscriptions or ignore lists after a restart.",
 ]
 # -------------------------------------------------
 
@@ -307,6 +300,7 @@ SEASON_LEN = timedelta(days=5)
 # ---------- DB Pool ----------
 DB_READY = False
 DB_POOL = None  # psycopg2.pool.SimpleConnectionPool
+DB_ACTIVE_DSN_SUMMARY = "uninitialized"
 NW_API_CACHE: dict[str, tuple[int | None, float]] = {}
 KG_API_AUTH_CACHE: dict[str, object] = {}
 BACKFILL_PROGRESS: dict[str, dict] = {}
@@ -456,9 +450,28 @@ def _round_ts_to_tick(ts: datetime, tick_minutes: int | None = None, mode: str |
     return datetime.fromtimestamp(rounded, tz=timezone.utc)
 
 
+def _dsn_identity_summary(dsn: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(dsn or "").strip())
+        host = parsed.hostname or "unknown-host"
+        port = f":{int(parsed.port)}" if parsed.port else ""
+        db_name = str(parsed.path or "").lstrip("/") or "unknown-db"
+        user = parsed.username or "unknown-user"
+        return f"{user}@{host}{port}/{db_name}"
+    except Exception:
+        return "unknown-db"
+
+
+
+def current_db_identity_summary() -> str:
+    return str(DB_ACTIVE_DSN_SUMMARY or "unknown-db")
+
+
+
 def init_db_pool(minconn: int = 1, maxconn: int = 10):
     """Initialize a psycopg2 connection pool."""
     global DB_POOL
+    global DB_ACTIVE_DSN_SUMMARY
     if DB_POOL:
         return
     dsns = []
@@ -469,15 +482,13 @@ def init_db_pool(minconn: int = 1, maxconn: int = 10):
 
     # Ignore unresolved template strings pasted into env vars (e.g. "{{RAILWAY_TCP_PROXY_PORT}}").
     dsns = [d for d in dsns if "{{" not in d and "}}" not in d]
+    dsn_identities = sorted({_dsn_identity_summary(d) for d in dsns if d})
+    if len(dsn_identities) > 1:
+        logging.warning("DATABASE_URL and DATABASE_PUBLIC_URL point at different DB identities: %s", ", ".join(dsn_identities))
 
     last_err = None
     for dsn in dsns:
-        host = "unknown"
-        try:
-            host = urllib.parse.urlparse(dsn).hostname or "unknown"
-        except Exception:
-            pass
-
+        db_id = _dsn_identity_summary(dsn)
         try:
             DB_POOL = pg_pool.SimpleConnectionPool(
                 minconn=minconn,
@@ -486,12 +497,13 @@ def init_db_pool(minconn: int = 1, maxconn: int = 10):
                 cursor_factory=RealDictCursor,
                 sslmode=DB_SSLMODE,
             )
-            logging.info("DB pool initialized using host=%s sslmode=%s", host, DB_SSLMODE)
+            DB_ACTIVE_DSN_SUMMARY = db_id
+            logging.info("DB pool initialized using %s sslmode=%s", db_id, DB_SSLMODE)
             return
         except Exception as e:
             last_err = e
             DB_POOL = None
-            logging.warning("DB connect failed using host=%s (%s)", host, e.__class__.__name__)
+            logging.warning("DB connect failed using %s (%s)", db_id, e.__class__.__name__)
 
     if last_err:
         raise last_err
@@ -4086,6 +4098,78 @@ def sync_get_nw_rankings_state_stats(world_id: int) -> dict:
         }
 
 
+def sync_get_nw_jump_runtime_diag(world_id: int, guild_id: int | None = None, channel_id: int | None = None) -> dict:
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*)::int FROM spy_reports) AS spy_report_count,
+                (SELECT COUNT(*)::int FROM kingdom_rankings_state WHERE world_id=%s) AS state_count,
+                (SELECT COUNT(*)::int FROM kingdom_rankings_history WHERE world_id=%s) AS history_count
+            """,
+            (int(world_id), int(world_id)),
+        )
+        row = cur.fetchone() or {}
+        out = {
+            "spy_report_count": int(row.get("spy_report_count") or 0),
+            "state_count": int(row.get("state_count") or 0),
+            "history_count": int(row.get("history_count") or 0),
+            "subscription_count": 0,
+            "enabled_subscription_count": 0,
+            "guild_ignore_count": 0,
+            "channel_ignore_count": 0,
+        }
+        gid = _safe_int_or_none(guild_id)
+        if gid:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)::int AS subscription_count,
+                    COALESCE(SUM(CASE WHEN enabled THEN 1 ELSE 0 END), 0)::int AS enabled_subscription_count
+                FROM nw_jump_alert_subscriptions
+                WHERE guild_id=%s;
+                """,
+                (int(gid),),
+            )
+            sub_row = cur.fetchone() or {}
+            out["subscription_count"] = int(sub_row.get("subscription_count") or 0)
+            out["enabled_subscription_count"] = int(sub_row.get("enabled_subscription_count") or 0)
+            cur.execute(
+                """
+                SELECT COUNT(*)::int AS guild_ignore_count
+                FROM nw_jump_channel_ignores
+                WHERE guild_id=%s;
+                """,
+                (int(gid),),
+            )
+            ig_row = cur.fetchone() or {}
+            out["guild_ignore_count"] = int(ig_row.get("guild_ignore_count") or 0)
+        cid = _safe_int_or_none(channel_id)
+        if gid and cid:
+            cur.execute(
+                """
+                SELECT COUNT(*)::int AS channel_ignore_count
+                FROM nw_jump_channel_ignores
+                WHERE guild_id=%s AND channel_id=%s;
+                """,
+                (int(gid), int(cid)),
+            )
+            ch_row = cur.fetchone() or {}
+            out["channel_ignore_count"] = int(ch_row.get("channel_ignore_count") or 0)
+        return out
+
+
+def _db_looks_fresh_for_nw_alerts(diag: dict) -> bool:
+    d = dict(diag or {})
+    return (
+        int(d.get("spy_report_count") or 0) == 0
+        and int(d.get("state_count") or 0) == 0
+        and int(d.get("history_count") or 0) == 0
+        and int(d.get("subscription_count") or 0) == 0
+        and int(d.get("guild_ignore_count") or 0) == 0
+    )
+
+
 def sync_get_missing_rankings_state_rows(world_id: int, current_kingdom_ids: list[int], lookback_hours: int, limit: int) -> list[dict]:
     ids = [int(x) for x in (current_kingdom_ids or []) if _safe_int_or_none(x)]
     since = now_utc() - timedelta(hours=max(1, int(lookback_hours or 24)))
@@ -6605,14 +6689,15 @@ async def on_ready():
                 _meta_set(cur, "announce_last_ver", BOT_VERSION)
                 _meta_set(cur, "announce_last_ts", str(now_ts))
                 return True
-
+        send_patch_announcement = True
         ok = await run_db(_dedupe)
         if not ok:
             logging.info("Announcement suppressed (same version + cooldown).")
-            return
+            send_patch_announcement = False
 
     except Exception:
         logging.exception("Announcement dedupe failed")
+        send_patch_announcement = True
 
     patch_lines = "\n".join([f"• {x}" for x in PATCH_NOTES])
     for guild in bot.guilds:
@@ -6627,11 +6712,22 @@ async def on_ready():
             )
             continue
         try:
-            await ch.send(
-                f"✅ **KG2 Recon Bot merged + restarted**\n"
-                f"Version: `{BOT_VERSION}`\n"
-                f"Patch:\n{patch_lines}"
-            )
+            diag = await run_db(sync_get_nw_jump_runtime_diag, int(KG_GAME_WORLD_ID or 1), int(guild.id), int(ch.id))
+            if send_patch_announcement:
+                await ch.send(
+                    f"✅ **KG2 Recon Bot merged + restarted**\n"
+                    f"Version: `{BOT_VERSION}`\n"
+                    f"DB: `{current_db_identity_summary()}`\n"
+                    f"Patch:\n{patch_lines}"
+                )
+            if _db_looks_fresh_for_nw_alerts(diag):
+                await ch.send(
+                    "⚠️ **Startup DB Warning**\n"
+                    f"Connected DB: `{current_db_identity_summary()}`\n"
+                    f"Spy reports: `{fmt_int(diag.get('spy_report_count'))}` | Rankings state: `{fmt_int(diag.get('state_count'))}` | Rankings history: `{fmt_int(diag.get('history_count'))}`\n"
+                    f"NW subscriptions: `{fmt_int(diag.get('subscription_count'))}` | Guild ignores: `{fmt_int(diag.get('guild_ignore_count'))}`\n"
+                    "This looks like a fresh/empty database. If alert config or ignore lists existed before, verify `DATABASE_URL` / `DATABASE_PUBLIC_URL` for this deployment."
+                )
         except Exception as e:
             logging.warning(
                 "Startup announcement send failed for guild=%s channel=%s (%s)",
@@ -8224,10 +8320,17 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
         if action_norm in ("status", "show"):
             row = await run_db(sync_get_nw_jump_subscription, guild_id)
             if not row:
-                return await ctx.send(
+                diag = await run_db(sync_get_nw_jump_runtime_diag, int(KG_GAME_WORLD_ID or 1), guild_id, int(ctx.channel.id))
+                msg = (
                     f"ℹ️ Rankings alerts are **not configured** for this server. "
                     f"Use `!nwjumpalerts on {NW_JUMP_ALERT_DEFAULT_THRESHOLD}` in the channel that should receive alerts."
                 )
+                if _db_looks_fresh_for_nw_alerts(diag):
+                    msg += (
+                        f"\n⚠️ Current DB looks fresh/empty (`{current_db_identity_summary()}`). "
+                        "If this server used to have NW alert config, verify the deployment DB env vars."
+                    )
+                return await ctx.send(msg)
             enabled = bool(row.get("enabled"))
             cid = int(row.get("channel_id") or 0)
             threshold_v = max(1, int(row.get("min_jump") or NW_JUMP_ALERT_DEFAULT_THRESHOLD))
@@ -8312,6 +8415,7 @@ async def nwjumpignore(ctx, action: str = "list", *, kingdom: str = ""):
 
         if action_norm in ("list", "show", "status"):
             rows = await run_db(sync_list_nw_jump_channel_ignores, guild_id, channel_id)
+            diag = await run_db(sync_get_nw_jump_runtime_diag, int(KG_GAME_WORLD_ID or 1), guild_id, channel_id)
             lines = [
                 f"🚫 **NW Jumper Ignore List for {ctx.channel.mention}**",
                 f"Ignored kingdoms: `{len(rows)}`",
@@ -8326,6 +8430,10 @@ async def nwjumpignore(ctx, action: str = "list", *, kingdom: str = ""):
                     lines.append(f"... +{extra} more")
             else:
                 lines.append("Ignored kingdoms: (none)")
+                if _db_looks_fresh_for_nw_alerts(diag):
+                    lines.append(
+                        f"⚠️ DB check: `{current_db_identity_summary()}` currently looks fresh/empty. If this room used to have ignores, verify the deployment DB env vars."
+                    )
             lines.append("Anyone can edit this list in this channel. Ignored kingdoms will not be posted by NW jumper in this channel.")
             lines.append("Use `!nwjumpignore <kingdom>` or `!nwjumpignore remove <kingdom>`.")
             return await ctx.send("\n".join(lines))
@@ -8403,6 +8511,7 @@ async def nwjumpcheck(ctx):
         rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
         world_id = int(KG_GAME_WORLD_ID or 1)
         stats = await run_db(sync_get_nw_rankings_state_stats, world_id)
+        diag = await run_db(sync_get_nw_jump_runtime_diag, world_id, int(ctx.guild.id) if ctx.guild else None, int(ctx.channel.id) if ctx.guild else None)
 
         poll_ts = await run_db(sync_meta_get, "nw_jump_last_poll_ts")
         poll_rows = await run_db(sync_meta_get, "nw_jump_last_poll_rows")
@@ -8427,7 +8536,9 @@ async def nwjumpcheck(ctx):
         lines = [
             "🧪 **NW Jump Check**",
             f"World: `{world_id}` | Rankings pulled now: `{len(rows or [])}` | Live pie detected: `{live_pie_count}`",
+            f"DB: `{current_db_identity_summary()}`",
             f"Auth: `{auth_mode}` ({'ok' if has_auth else 'missing'})",
+            f"Spy reports: `{fmt_int(diag.get('spy_report_count'))}` | Guild alert rows: `{fmt_int(diag.get('subscription_count'))}` | Guild ignores: `{fmt_int(diag.get('guild_ignore_count'))}` | This room ignores: `{fmt_int(diag.get('channel_ignore_count'))}`",
             f"Current state rows: `{fmt_int(stats.get('state_count'))}` | Last state update: `{stats.get('state_last_updated') or 'never'}`",
             f"Rankings history rows: `{fmt_int(stats.get('history_count'))}` | Last history snapshot: `{stats.get('history_last_snapshot') or 'never'}`",
             f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last NW events: `{ev_last or 'n/a'}` | last pie events: `{pie_last or 'n/a'}`",
@@ -8446,6 +8557,8 @@ async def nwjumpcheck(ctx):
                 lines.append("Fanout rooms: (none)")
         else:
             lines.append("Guild subscription: `not configured` (run `!nwjumpalerts on 5000`)")
+            if _db_looks_fresh_for_nw_alerts(diag):
+                lines.append("Fresh DB warning: this bot appears to be connected to a new/empty database, which would explain missing alert config and ignore lists.")
 
         if ALERT_SMS_ENABLED:
             lines.append(

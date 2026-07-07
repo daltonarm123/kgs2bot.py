@@ -77,6 +77,30 @@ class NwJumpIgnoreTests(unittest.TestCase):
         )
 
 
+class DbFreshnessHeuristicTests(unittest.TestCase):
+    def test_empty_diag_looks_like_fresh_db(self):
+        diag = {
+            "spy_report_count": 0,
+            "state_count": 0,
+            "history_count": 0,
+            "subscription_count": 0,
+            "guild_ignore_count": 0,
+        }
+
+        self.assertTrue(kg2bot._db_looks_fresh_for_nw_alerts(diag))
+
+    def test_existing_persistence_does_not_look_fresh(self):
+        diag = {
+            "spy_report_count": 10,
+            "state_count": 0,
+            "history_count": 0,
+            "subscription_count": 0,
+            "guild_ignore_count": 0,
+        }
+
+        self.assertFalse(kg2bot._db_looks_fresh_for_nw_alerts(diag))
+
+
 class RankingsNormalizationSafetyTests(unittest.TestCase):
     def test_normalize_rankings_rows_skips_bad_rows_and_keeps_valid(self):
         rows = [
