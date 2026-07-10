@@ -243,6 +243,7 @@ NW_JUMP_ALERT_SILENT_NO_SUBS = _env_bool("NW_JUMP_ALERT_SILENT_NO_SUBS", True)
 NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS = _env_int("NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS", 24)
 NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT = _env_int("NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT", 25)
 NW_JUMP_ALERT_CUMULATIVE_ENABLED = _env_bool("NW_JUMP_ALERT_CUMULATIVE_ENABLED", True)
+NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS = _env_int("NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS", 6)
 KG_GAME_PIE_ALERTS_ENABLED = _env_bool("KG_GAME_PIE_ALERTS_ENABLED", True)
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS = _env_int("KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS", 1)
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS = _env_int("KINGDOM_LIVE_ATTACK_WINDOW_HOURS", 24)
@@ -3564,10 +3565,11 @@ def _compute_nw_jump_from_anchor(anchor_nw, old_nw, new_nw, threshold):
     thr = max(1, int(threshold or 1))
     delta = new_i - base
     if abs(delta) >= thr:
-        # Move the anchor by exactly one threshold step toward the new value.
-        # This preserves any over-threshold remainder so staggered pops can
-        # trigger on subsequent ticks instead of dropping leftover progress.
-        step = thr if delta > 0 else -thr
+        # Advance by all fully crossed threshold chunks in this poll.
+        # This keeps sub-threshold remainder while preventing duplicate alerts
+        # on the next poll when the networth has not changed.
+        crossed_steps = max(1, abs(delta) // thr)
+        step = crossed_steps * thr if delta > 0 else -(crossed_steps * thr)
         return True, delta, base, (base + step)
     # Below threshold: keep accumulating from the same anchor.
     return False, delta, base, base
@@ -4208,10 +4210,12 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
 
     nw_events = []
     pie_events = []
+    stale_suppressed = 0
+    max_baseline_age_seconds = max(0, int(NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS or 0)) * 3600
     with db_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label, alert_anchor_networth
+            SELECT kingdom_id, kingdom_name, rank_pos, networth, pie_active, pie_signature, pie_label, alert_anchor_networth, updated_at
             FROM kingdom_rankings_state
             WHERE world_id=%s AND kingdom_id = ANY(%s);
             """,
@@ -4237,6 +4241,24 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
                 anchor_nw = _safe_int_or_none(old.get("alert_anchor_networth"))
             else:
                 anchor_nw = old_nw
+
+            stale_baseline = False
+            if max_baseline_age_seconds > 0:
+                old_updated_at = old.get("updated_at")
+                if isinstance(old_updated_at, datetime):
+                    try:
+                        age_seconds = (now_ts - normalize_to_utc(old_updated_at)).total_seconds()
+                        stale_baseline = age_seconds > max_baseline_age_seconds
+                    except Exception:
+                        stale_baseline = False
+
+            if stale_baseline:
+                # If the baseline is too old (e.g. after downtime), reseed and
+                # skip alerting to avoid confusing late notifications.
+                stale_suppressed += 1
+                anchor_by_id[kid] = new_nw
+                continue
+
             fired, delta, base_nw, new_anchor = _compute_nw_jump_from_anchor(anchor_nw, old_nw, new_nw, threshold)
             if not NW_JUMP_ALERT_CUMULATIVE_ENABLED:
                 # Consecutive-poll mode: never carry accumulation forward.
@@ -4332,7 +4354,7 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
 
     nw_events.sort(key=lambda e: (-int(e.get("delta") or 0), str(e.get("kingdom_name") or "")))
     pie_events.sort(key=lambda e: (0 if str(e.get("event_kind") or "") == "first_seen" else 1, str(e.get("kingdom_name") or "")))
-    return {"nw_events": nw_events, "pie_events": pie_events}
+    return {"nw_events": nw_events, "pie_events": pie_events, "stale_suppressed": int(stale_suppressed)}
 
 
 def sync_detect_rankings_nw_jumps(world_id: int, rows: list[dict], default_threshold: int) -> list[dict]:
@@ -4356,7 +4378,7 @@ async def send_nw_jump_alerts(events: list[dict]):
             by_guild[gid] = s
 
     async def _build_nw_jump_alert_lines(channel_hits: list[dict], min_jump: int) -> list[str]:
-        lines = [f"🚨 **NW Jump Alert** (threshold: `{fmt_int(min_jump)}`)"]
+        lines = [f"🚨 **NW Change Alert** (threshold: `{fmt_int(min_jump)}`)"]
         for e in channel_hits[:12]:
             delta_v = int(e.get("delta") or 0)
             sign = "+" if delta_v >= 0 else "-"
@@ -4587,8 +4609,10 @@ async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
         ) or {"nw_events": [], "pie_events": []}
         nw_events = list((alerts or {}).get("nw_events") or [])
         pie_events = list((alerts or {}).get("pie_events") or [])
+        stale_suppressed = int((alerts or {}).get("stale_suppressed") or 0)
         await run_db(sync_meta_set, "nw_jump_last_events", str(len(nw_events or [])))
         await run_db(sync_meta_set, "nw_jump_last_pie_events", str(len(pie_events or [])))
+        await run_db(sync_meta_set, "nw_jump_last_suppressed_stale", str(stale_suppressed))
         await run_db(sync_meta_set, "nw_jump_last_ok_ts", str(int(time.time())))
         if dispatch_alerts:
             if nw_events:
@@ -8520,6 +8544,7 @@ async def nwjumpcheck(ctx):
         poll_rows = await run_db(sync_meta_get, "nw_jump_last_poll_rows")
         ev_last = await run_db(sync_meta_get, "nw_jump_last_events")
         pie_last = await run_db(sync_meta_get, "nw_jump_last_pie_events")
+        stale_last = await run_db(sync_meta_get, "nw_jump_last_suppressed_stale")
         ok_ts = await run_db(sync_meta_get, "nw_jump_last_ok_ts")
         err_ts = await run_db(sync_meta_get, "nw_jump_last_error_ts")
         last_auth_mode = await run_db(sync_meta_get, "nw_jump_last_auth_mode")
@@ -8544,7 +8569,7 @@ async def nwjumpcheck(ctx):
             f"Spy reports: `{fmt_int(diag.get('spy_report_count'))}` | Guild alert rows: `{fmt_int(diag.get('subscription_count'))}` | Guild ignores: `{fmt_int(diag.get('guild_ignore_count'))}` | This room ignores: `{fmt_int(diag.get('channel_ignore_count'))}`",
             f"Current state rows: `{fmt_int(stats.get('state_count'))}` | Last state update: `{stats.get('state_last_updated') or 'never'}`",
             f"Rankings history rows: `{fmt_int(stats.get('history_count'))}` | Last history snapshot: `{stats.get('history_last_snapshot') or 'never'}`",
-            f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last NW events: `{ev_last or 'n/a'}` | last pie events: `{pie_last or 'n/a'}`",
+            f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last NW events: `{ev_last or 'n/a'}` | last pie events: `{pie_last or 'n/a'}` | stale suppressed: `{stale_last or 'n/a'}`",
             f"Loop last ok ts: `{ok_ts or 'n/a'}` | last error ts: `{err_ts or 'n/a'}`",
             f"Last API mode: `{last_auth_mode or 'n/a'}` | ReturnValue: `{last_return_value or 'n/a'}` | ReturnString: `{last_return_string or 'n/a'}`",
             f"This check attempts: `{json.dumps(dbg.get('attempts') or [])[:900]}`",

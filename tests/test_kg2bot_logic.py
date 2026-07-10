@@ -238,6 +238,15 @@ class NwJumpAnchorLogicTests(unittest.TestCase):
         events = self._run_polls(polls)
         self.assertEqual(1, len(events))
 
+    def test_large_single_move_does_not_repeat_on_unchanged_next_poll(self):
+        polls = [54496, 43919, 43919]
+        events = self._run_polls(polls)
+        self.assertEqual(1, len(events), f"unexpected duplicate events: {events}")
+        base, new, delta = events[0]
+        self.assertEqual(54496, base)
+        self.assertEqual(43919, new)
+        self.assertEqual(-10577, delta)
+
     def test_missing_current_networth_preserves_anchor(self):
         polls = [15000, None, None, 9500]
         events = self._run_polls(polls)
@@ -380,6 +389,36 @@ class NwJumpDetectionIntegrationTests(unittest.TestCase):
         self.assertEqual(2, len(events), f"expected two staggered alerts, got {events}")
         self.assertEqual(5194, int(events[0]["delta"]))
         self.assertEqual(5094, int(events[1]["delta"]))
+
+    def test_large_single_drop_does_not_realert_without_new_change(self):
+        events, _store = self._drive([54496, 43919, 43919])
+        self.assertEqual(1, len(events), f"expected one alert only, got {events}")
+        self.assertEqual(-10577, int(events[0]["delta"]))
+
+    def test_stale_baseline_suppresses_late_alert_and_reseeds_anchor(self):
+        store = {
+            321: {
+                "kingdom_id": 321,
+                "kingdom_name": "Magic",
+                "rank_pos": 42,
+                "networth": 15000,
+                "pie_active": False,
+                "pie_signature": "",
+                "pie_label": "",
+                "alert_anchor_networth": 15000,
+                "updated_at": kg2bot.now_utc() - kg2bot.timedelta(hours=24),
+            }
+        }
+        with patch.object(kg2bot, "db_conn", self._make_db(store)):
+            result = kg2bot.sync_detect_rankings_alerts(
+                self.WORLD_ID,
+                [self._row(8000)],
+                self.THRESHOLD,
+            )
+
+        self.assertEqual([], result.get("nw_events") or [])
+        self.assertEqual(1, int(result.get("stale_suppressed") or 0))
+        self.assertEqual(8000, int(store[321]["alert_anchor_networth"]))
 
 
 class BridgeReportFormattingTests(unittest.TestCase):
