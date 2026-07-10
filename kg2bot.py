@@ -2170,6 +2170,13 @@ def looks_like_spy_report(text: str) -> bool:
 
 def looks_like_attack_report(text: str) -> bool:
     ll = (text or "").lower()
+    if "you have been attacked by" in ll and (
+        "subject: you have been attacked by" in ll
+        or "the composition of the enemy forces was as follows" in ll
+        or "you have lost the following during the attack" in ll
+        or "we regret to inform you of the following casualties during the attack" in ll
+    ):
+        return True
     if "subject: attack report:" in ll:
         return True
     if "attack report:" in ll and "attacked" in ll:

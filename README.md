@@ -92,6 +92,9 @@ Command usage:
 !nwjumpalerts on [threshold]
 !nwjumpalerts off
 !nwjumpcheck
+!nwjumpmode status|simple|analyst
+!nwjumpthreshold status|suggest [hours]|set <value>|auto [hours]
+!nwjumpaudit [limit] [kingdom]
 
 Example:
 
@@ -112,6 +115,10 @@ NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS=180
 NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS=72
 NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS=180
 NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS=900
+NW_JUMP_ALERT_HISTORY_RETENTION_DAYS=21
+NW_JUMP_ALERT_STATE_RETENTION_DAYS=45
+NW_JUMP_ALERT_PULL_FAILURE_SHED_AFTER=3
+ALERT_MANAGER_ROLE_IDS=111111111111111111,222222222222222222
 KG_GAME_PIE_ALERTS_ENABLED=true
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS=1
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS=24
@@ -126,6 +133,9 @@ Notes:
 - `NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS` limits repeat alerts for the same kingdom in the same channel over short windows.
 - Alert dispatch now stores persistent fingerprints to suppress duplicate reposts across restarts and reconnects.
 - `NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS` and `NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS` drive the high/medium/low confidence hint shown in NW change messages.
+- `NW_JUMP_ALERT_HISTORY_RETENTION_DAYS` and `NW_JUMP_ALERT_STATE_RETENTION_DAYS` control automatic retention cleanup.
+- `NW_JUMP_ALERT_PULL_FAILURE_SHED_AFTER` enables load-shedding after repeated failed pulls to avoid noisy/low-trust alerts.
+- `ALERT_MANAGER_ROLE_IDS` allows non-admin staff roles to manage NW alert settings and diagnostics.
 - `!rankingsrefresh` lets an admin force an immediate rankings refresh into current state/history and trigger any NW/pie alerts right away.
 
 Optional SMS fanout (Twilio):

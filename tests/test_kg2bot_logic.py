@@ -811,5 +811,120 @@ class BridgeIngestDedupeTests(unittest.TestCase):
         self.assertTrue(result["discord_post"].get("duplicate"))
 
 
+class FreshReportShapeTests(unittest.TestCase):
+    ATTACK_REPORT = (
+        "Sender: System\n\n"
+        "Recipient(s): Nightmare\n\n"
+        "Received: Jul 9, 2026, 10:04:20 PM\n\n"
+        "Subject: Attack Report: Ryan's world 2\n\n"
+        "Attack Report: Ryan's world 2 (NW: + 8785)\n"
+        "Attack Result: Major Victory\n"
+        "You have gained the following during the attack: 154 Land, 1948 Food, 51 Gold, 679 Stone, 748 Wood, 48 Horses\n"
+        "We regret to inform you of the following casualties during the attack: 20/300 Heavy Cavalry\n\n"
+        "During this battle your troops also sacked the Large City Stables 4 (level 59 settlement)."
+    )
+
+    DEFENSE_REPORT = (
+        "Sender: System\n\n"
+        "Recipient(s): Nightmare\n\n"
+        "Received: Jul 8, 2026, 3:55:34 PM\n\n"
+        "Subject: You have been attacked by Mobius!\n\n"
+        "You have been attacked by Mobius (NW:10426)\n"
+        "You have lost the following during the attack: 275 Land, 46413 Food, 41783 Gold, 2285 Stone, 2795 Wood\n"
+        "We regret to inform you of the following casualties during the attack: 2532 Peasants, 124 Footmen, 266 Pikemen, 373 Archers, 83 Heavy Cavalry\n"
+        "The composition of the enemy forces was as follows: 4355 Crossbowmen, 1550 Heavy Cavalry"
+    )
+
+    SPY_REPORT = (
+        "Sender: System\n\n"
+        "Recipient(s): Nightmare\n\n"
+        "Received: Jul 7, 2026, 3:05:51 AM\n\n"
+        "Subject: Magic Spy Report\n\n"
+        "Target: Magic\n"
+        "Alliance: NWO-1\n"
+        "Honour: 6.41\n"
+        "Ranking: 63\n"
+        "Networth: 11750\n"
+        "Spies Sent: 200\n"
+        "Spies Lost: 0\n"
+        "Result Level: Complete Infiltration\n"
+        "Number of Castles: 45\n\n"
+        "Our spies also found the following information about the kingdom's resources:\n"
+        "Wood: 21169\n"
+        "Food: 2824522\n"
+        "Land: 18278 / 18278\n"
+        "Gold: 711500\n"
+        "Blue Gems: 2980\n"
+        "Green Gems: 26\n"
+        "Stone: 34071\n\n"
+        "Our spies also found the following information about the kingdom's troops:\n"
+        "Population: 73935 / 74480\n"
+        "Elites: 2\n"
+        "Peasants: 62579\n"
+        "Approximate defensive power*: 20\n"
+        "*(without skill/prayer modifiers)\n\n"
+        "The following information was found regarding troop movements around this kingdom:\n"
+        "Launched an attack on Grav (2026-07-06 14:57)\n\n"
+        "The following recent market transactions were also discovered:\n"
+        "Bought 20000 x Wood from Galileo for 1 gold (2026-07-07 02:51)\n"
+        "Bought 20000 x Stone from Galileo for 1 gold (2026-07-07 02:52)\n"
+        "Bought 50000 x Stone from Galileo for 0 gold (2026-07-07 02:52)\n"
+        "Bought 50000 x Wood from Galileo for 0 gold (2026-07-07 02:52)\n\n"
+        "The following technology information was also discovered:\n"
+        "Accounting lvl 6\n"
+        "Animal Breeding lvl 4"
+    )
+
+    def test_fresh_attack_report_is_detected_and_parsed(self):
+        self.assertTrue(kg2bot.looks_like_attack_report(self.ATTACK_REPORT))
+        parsed = kg2bot.parse_attack_details(self.ATTACK_REPORT)
+        self.assertEqual("Ryan's world 2", parsed.get("defender"))
+        self.assertEqual("Major Victory", parsed.get("result"))
+        self.assertEqual(154, parsed.get("land_taken"))
+        self.assertEqual(1, int(parsed.get("settlements_lost_count") or 0))
+
+    def test_fresh_defense_report_is_detected_as_attack_and_incoming_alert(self):
+        self.assertTrue(kg2bot.looks_like_attack_report(self.DEFENSE_REPORT))
+        self.assertTrue(kg2bot.looks_like_recon_report(self.DEFENSE_REPORT))
+        alert = kg2bot.parse_incoming_attack_alert(self.DEFENSE_REPORT)
+        self.assertIsNotNone(alert)
+        self.assertEqual("Mobius", alert.get("attacker"))
+        self.assertEqual(10426, alert.get("attacker_nw"))
+        self.assertEqual("Nightmare", alert.get("defender"))
+        units = alert.get("units") or {}
+        self.assertEqual(4355, int(units.get("crossbowmen") or 0))
+        self.assertEqual(1550, int(units.get("heavy_cavalry") or 0))
+
+    def test_fresh_spy_report_is_detected_and_parsed(self):
+        self.assertTrue(kg2bot.looks_like_spy_report(self.SPY_REPORT))
+        kingdom, dp, castles = kg2bot.parse_spy(self.SPY_REPORT)
+        self.assertEqual("Magic", kingdom)
+        self.assertEqual(20, dp)
+        self.assertEqual(45, castles)
+
+        details = kg2bot.parse_spy_details(self.SPY_REPORT)
+        self.assertEqual("Magic", details.get("target"))
+        self.assertEqual("NWO-1", details.get("alliance"))
+        self.assertEqual(11750, details.get("net_worth"))
+
+    def test_fresh_defense_report_bridge_ingest_is_classified_as_attack(self):
+        scheduled = []
+
+        def fake_schedule(kind, text):
+            scheduled.append((kind, text))
+            return {"scheduled": True}
+
+        with patch.object(kg2bot, "ensure_db_ready_sync", lambda: None), \
+                patch.object(kg2bot, "sync_store_report", lambda text, ts: {"saved": False}), \
+                patch.object(kg2bot, "sync_store_attack_report", lambda text, ts, *_args, **_kwargs: {"saved": True, "duplicate": False, "row": {"id": 1}}), \
+                patch.object(kg2bot, "sync_recon_ingest_report", lambda text: {"ok": True}), \
+                patch.object(kg2bot, "schedule_bridge_report_to_discord", fake_schedule):
+            result = kg2bot.sync_ingest_bridge_report("facebook-messenger", "abc123", self.DEFENSE_REPORT, None)
+
+        self.assertTrue(result["is_recon"])
+        self.assertEqual("attack", result["report_kind"])
+        self.assertEqual([("attack", kg2bot.format_bridge_report_text(self.DEFENSE_REPORT))], scheduled)
+
+
 if __name__ == "__main__":
     unittest.main()
