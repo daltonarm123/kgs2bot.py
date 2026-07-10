@@ -76,12 +76,13 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-10.1"
+BOT_VERSION = "2026-07-10.3"
 PATCH_NOTES = [
-    "NW change alerts now suppress stale baselines and avoid duplicate follow-up posts after one large move.",
-    "NW change messaging now includes freshness and confidence hints so non-technical users can act faster.",
-    "NW alert dispatch now uses persistent dedupe + per-kingdom cooldown controls to reduce noisy reposts.",
-    "See new commands in the command room and update that command list with the latest NW alert options.",
+    "Fixed delayed and duplicate-style NW alerts: stale baselines are suppressed and large single moves no longer re-post next poll.",
+    "NW change alerts now include freshness/confidence hints so everyone can quickly judge if a hit is actionable.",
+    "Added persistent dedupe + per-kingdom cooldown to keep alert channels cleaner during high activity.",
+    "New staff controls: !nwjumpmode, !nwjumpthreshold, and !nwjumpaudit.",
+    "See new commands in the command room and update that command list there.",
 ]
 # -------------------------------------------------
 
@@ -177,6 +178,7 @@ ADMIN_USER_IDS = {944024167081209867}
 ADMIN_USER_IDS.update(_env_csv_ints("ADMIN_USER_IDS"))
 PREMIUM_FREE_USER_IDS = {944024167081209867}
 PREMIUM_FREE_USER_IDS.update(_env_csv_ints("PREMIUM_FREE_USER_IDS"))
+ALERT_MANAGER_ROLE_IDS = _env_csv_ints("ALERT_MANAGER_ROLE_IDS")
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN env var.")
@@ -248,6 +250,9 @@ NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS = _env_int("NW_JUMP_ALERT_PER_KINGDOM
 NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS = _env_int("NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS", 72)
 NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS = _env_int("NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS", 180)
 NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS = _env_int("NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS", 900)
+NW_JUMP_ALERT_HISTORY_RETENTION_DAYS = _env_int("NW_JUMP_ALERT_HISTORY_RETENTION_DAYS", 21)
+NW_JUMP_ALERT_STATE_RETENTION_DAYS = _env_int("NW_JUMP_ALERT_STATE_RETENTION_DAYS", 45)
+NW_JUMP_ALERT_PULL_FAILURE_SHED_AFTER = _env_int("NW_JUMP_ALERT_PULL_FAILURE_SHED_AFTER", 3)
 KG_GAME_PIE_ALERTS_ENABLED = _env_bool("KG_GAME_PIE_ALERTS_ENABLED", True)
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS = _env_int("KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS", 1)
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS = _env_int("KINGDOM_LIVE_ATTACK_WINDOW_HOURS", 24)
@@ -4029,6 +4034,157 @@ def sync_reserve_nw_jump_alert_event(guild_id: int, channel_id: int, event: dict
         return {"ok": True, "reason": "reserved", "fingerprint": fp}
 
 
+def sync_recent_nw_jump_alert_events(guild_id: int, channel_id: int | None = None, kingdom_name: str | None = None, limit: int = 20) -> list[dict]:
+    gid = int(guild_id)
+    cid = _safe_int_or_none(channel_id)
+    lim = max(1, min(100, int(limit or 20)))
+    name_key = normalize_kingdom_lookup_key(kingdom_name)
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                e.guild_id,
+                e.channel_id,
+                e.kingdom_id,
+                e.delta,
+                e.old_networth,
+                e.new_networth,
+                e.sent_at,
+                s.kingdom_name
+            FROM nw_jump_alert_events e
+            LEFT JOIN kingdom_rankings_state s
+              ON s.world_id=%s AND s.kingdom_id=e.kingdom_id
+            WHERE e.guild_id=%s
+              AND (%s IS NULL OR e.channel_id=%s)
+            ORDER BY e.sent_at DESC
+            LIMIT %s;
+            """,
+            (int(KG_GAME_WORLD_ID or 1), gid, cid, cid, lim * 3),
+        )
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+
+    if name_key:
+        rows = [
+            r for r in rows
+            if normalize_kingdom_lookup_key(r.get("kingdom_name")) == name_key
+        ]
+    return rows[:lim]
+
+
+def _round_threshold_suggestion(v: float | int | None) -> int:
+    x = max(1, int(float(v or 1)))
+    if x < 2000:
+        step = 100
+    elif x < 10000:
+        step = 250
+    else:
+        step = 500
+    return max(step, int(round(x / step) * step))
+
+
+def sync_suggest_nw_jump_threshold(world_id: int, lookback_hours: int = 24) -> dict:
+    since = now_utc() - timedelta(hours=max(1, int(lookback_hours or 24)))
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH d AS (
+              SELECT
+                kingdom_id,
+                ABS(networth - LAG(networth) OVER (PARTITION BY kingdom_id ORDER BY snapshot_at))::bigint AS dnw,
+                snapshot_at
+              FROM kingdom_rankings_history
+              WHERE world_id=%s AND snapshot_at >= %s
+            ), base AS (
+              SELECT dnw::double precision AS dnw
+              FROM d
+              WHERE dnw IS NOT NULL AND dnw > 0
+            )
+            SELECT
+              COUNT(*)::int AS n,
+              COALESCE(AVG(dnw), 0)::double precision AS avg,
+              COALESCE(percentile_cont(0.50) WITHIN GROUP (ORDER BY dnw), 0)::double precision AS p50,
+              COALESCE(percentile_cont(0.75) WITHIN GROUP (ORDER BY dnw), 0)::double precision AS p75,
+              COALESCE(percentile_cont(0.90) WITHIN GROUP (ORDER BY dnw), 0)::double precision AS p90,
+              COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY dnw), 0)::double precision AS p95,
+              COALESCE(MAX(dnw), 0)::double precision AS mx
+            FROM base;
+            """,
+            (int(world_id), since),
+        )
+        row = cur.fetchone() or {}
+
+    n = int(row.get("n") or 0)
+    p90 = float(row.get("p90") or 0.0)
+    suggested = _round_threshold_suggestion(p90 if p90 > 0 else float(NW_JUMP_ALERT_DEFAULT_THRESHOLD or 5000))
+    return {
+        "samples": n,
+        "avg": int(float(row.get("avg") or 0.0)),
+        "p50": int(float(row.get("p50") or 0.0)),
+        "p75": int(float(row.get("p75") or 0.0)),
+        "p90": int(float(row.get("p90") or 0.0)),
+        "p95": int(float(row.get("p95") or 0.0)),
+        "max": int(float(row.get("mx") or 0.0)),
+        "suggested": int(suggested),
+    }
+
+
+def _normalize_nwjump_mode(mode: str | None) -> str:
+    m = str(mode or "").strip().lower()
+    if m in ("simple", "lite", "basic"):
+        return "simple"
+    if m in ("analyst", "advanced", "full"):
+        return "analyst"
+    return "analyst"
+
+
+def sync_set_guild_pref(guild_id: int, key: str, value: str):
+    k = f"guild:{int(guild_id)}:{str(key).strip().lower()}"
+    with db_conn() as conn, conn.cursor() as cur:
+        _meta_set(cur, k, str(value or ""))
+
+
+def sync_get_guild_pref(guild_id: int, key: str, default: str = "") -> str:
+    k = f"guild:{int(guild_id)}:{str(key).strip().lower()}"
+    with db_conn() as conn, conn.cursor() as cur:
+        v = _meta_get(cur, k)
+    return str(v if v is not None else default)
+
+
+def sync_nw_jump_retention_cleanup(world_id: int) -> dict:
+    hist_days = max(1, int(NW_JUMP_ALERT_HISTORY_RETENTION_DAYS or 21))
+    state_days = max(hist_days, int(NW_JUMP_ALERT_STATE_RETENTION_DAYS or 45))
+    hist_before = now_utc() - timedelta(days=hist_days)
+    state_before = now_utc() - timedelta(days=state_days)
+    dedupe_before = now_utc() - timedelta(hours=max(1, int(NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS or 72)))
+    out = {"history_deleted": 0, "state_deleted": 0, "events_deleted": 0}
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM kingdom_rankings_history
+            WHERE world_id=%s AND snapshot_at < %s;
+            """,
+            (int(world_id), hist_before),
+        )
+        out["history_deleted"] = int(cur.rowcount or 0)
+        cur.execute(
+            """
+            DELETE FROM kingdom_rankings_state
+            WHERE world_id=%s AND updated_at < %s;
+            """,
+            (int(world_id), state_before),
+        )
+        out["state_deleted"] = int(cur.rowcount or 0)
+        cur.execute(
+            """
+            DELETE FROM nw_jump_alert_events
+            WHERE sent_at < %s;
+            """,
+            (dedupe_before,),
+        )
+        out["events_deleted"] = int(cur.rowcount or 0)
+    return out
+
+
 def _normalize_phone_number(s: str) -> str:
     txt = str(s or "").strip()
     if not txt:
@@ -4731,6 +4887,9 @@ async def send_rankings_pie_alerts(events: list[dict]):
 
 async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
     rows, dbg = await asyncio.to_thread(fetch_world_kingdom_rankings_debug)
+    pull_failures = int(await run_db(sync_meta_get, "nw_jump_consecutive_pull_failures") or 0)
+    pull_failures = 0 if rows else (pull_failures + 1)
+    await run_db(sync_meta_set, "nw_jump_consecutive_pull_failures", str(int(pull_failures)))
     if rows:
         current_ids = [int(r.get("kingdom_id") or 0) for r in rows if isinstance(r, dict) and _safe_int_or_none(r.get("kingdom_id"))]
         missing_state_rows = await run_db(
@@ -4772,11 +4931,24 @@ async def run_rankings_refresh_cycle(dispatch_alerts: bool = True) -> dict:
         await run_db(sync_meta_set, "nw_jump_last_pie_events", str(len(pie_events or [])))
         await run_db(sync_meta_set, "nw_jump_last_suppressed_stale", str(stale_suppressed))
         await run_db(sync_meta_set, "nw_jump_last_ok_ts", str(int(time.time())))
-        if dispatch_alerts:
+        shedding_after = max(1, int(NW_JUMP_ALERT_PULL_FAILURE_SHED_AFTER or 3))
+        shed_mode = int(pull_failures) >= shedding_after
+        await run_db(sync_meta_set, "nw_jump_alert_shed_mode", "1" if shed_mode else "0")
+        if dispatch_alerts and not shed_mode:
             if nw_events:
                 await send_nw_jump_alerts(nw_events)
             if pie_events:
                 await send_rankings_pie_alerts(pie_events)
+
+    try:
+        now_i = int(time.time())
+        last_cleanup = int(await run_db(sync_meta_get, "nw_jump_last_cleanup_ts") or 0)
+        if now_i - last_cleanup >= (6 * 3600):
+            cleanup = await run_db(sync_nw_jump_retention_cleanup, int(KG_GAME_WORLD_ID or 1))
+            await run_db(sync_meta_set, "nw_jump_last_cleanup_ts", str(now_i))
+            await run_db(sync_meta_set, "nw_jump_last_cleanup_result", json.dumps(cleanup or {}))
+    except Exception:
+        logging.exception("NW jump retention cleanup failed")
 
     return {
         "rows": rows,
@@ -6722,6 +6894,22 @@ def _is_admin(ctx: commands.Context) -> bool:
     return False
 
 
+def _can_manage_alerts(ctx: commands.Context) -> bool:
+    if _is_admin(ctx):
+        return True
+    if not ALERT_MANAGER_ROLE_IDS:
+        return False
+    try:
+        roles = list(getattr(ctx.author, "roles", []) or [])
+        for r in roles:
+            rid = int(getattr(r, "id", 0) or 0)
+            if rid and rid in ALERT_MANAGER_ROLE_IDS:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 async def _require_premium(ctx: commands.Context) -> bool:
     """
     Premium gate for premium-only commands.
@@ -8444,6 +8632,9 @@ async def help_cmd(ctx):
             "`!nwjumpalerts addhere` - Admin: add current room to NW jump alert fanout",
             "`!nwjumpalerts removehere` - Admin: remove current room from NW jump alert fanout",
             "`!nwjumpalerts off` - Admin: disable NW jump alerts for this server",
+            "`!nwjumpmode status|simple|analyst` - Show/set NW diagnostics verbosity for this server",
+            "`!nwjumpthreshold status|suggest [hours]|set <value>|auto [hours]` - View/tune NW threshold",
+            "`!nwjumpaudit [limit] [kingdom]` - Show recent NW alert dispatch audit rows for this channel",
             "`!nwjumpignore <kingdom>` - Add a kingdom to this channel's shared NW jumper ignore list",
             "`!nwjumpignore remove <kingdom>` - Remove a kingdom from this channel's NW jumper ignore list",
             "`!nwjumpignore list` - Show this channel's NW jumper ignore list",
@@ -8504,6 +8695,7 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
 
         if action_norm in ("status", "show"):
             row = await run_db(sync_get_nw_jump_subscription, guild_id)
+            mode = _normalize_nwjump_mode(await run_db(sync_get_guild_pref, guild_id, "nwjump_mode", "analyst"))
             if not row:
                 diag = await run_db(sync_get_nw_jump_runtime_diag, int(KG_GAME_WORLD_ID or 1), guild_id, int(ctx.channel.id))
                 msg = (
@@ -8527,18 +8719,20 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
                 f"📡 Rankings alerts are **{state}** for this server.\n"
                 f"Channel: {ch_text}\n"
                 f"NW threshold: `{fmt_int(threshold_v)}`\n"
+                f"Per-kingdom cooldown: `{_fmt_seconds_brief(NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS)}`\n"
+                f"Mode: `{mode}`\n"
                 f"Pie alerts: `{'enabled' if KG_GAME_PIE_ALERTS_ENABLED else 'disabled'}`\n"
                 f"Fanout rooms: {extra_txt}"
             )
 
         if action_norm == "addhere":
-            if not _is_admin(ctx):
+            if not _can_manage_alerts(ctx):
                 return await ctx.send("❌ You don’t have permission to use this command.")
             await run_db(sync_add_nw_jump_channel, guild_id, int(ctx.channel.id))
             return await ctx.send(f"✅ Added {ctx.channel.mention} to NW jump alert fanout rooms.")
 
         if action_norm == "removehere":
-            if not _is_admin(ctx):
+            if not _can_manage_alerts(ctx):
                 return await ctx.send("❌ You don’t have permission to use this command.")
             changed = await run_db(sync_remove_nw_jump_channel, guild_id, int(ctx.channel.id))
             if changed <= 0:
@@ -8546,7 +8740,7 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
             return await ctx.send(f"🛑 Removed {ctx.channel.mention} from NW jump alert fanout rooms.")
 
         if action_norm == "off":
-            if not _is_admin(ctx):
+            if not _can_manage_alerts(ctx):
                 return await ctx.send("❌ You don’t have permission to use this command.")
             changed = await run_db(sync_disable_nw_jump_subscription, guild_id)
             if changed <= 0:
@@ -8554,7 +8748,7 @@ async def nwjumpalerts(ctx, action: str = "status", *, arg: str = ""):
             return await ctx.send("🛑 NW jump alerts disabled for this server.")
 
         if action_norm == "on":
-            if not _is_admin(ctx):
+            if not _can_manage_alerts(ctx):
                 return await ctx.send("❌ You don’t have permission to use this command.")
             min_jump = _safe_int_or_none(arg)
             if min_jump is None:
@@ -8686,7 +8880,7 @@ async def nwjumpcheck(ctx):
                     return True
             return False
 
-        if not _is_admin(ctx):
+        if not _can_manage_alerts(ctx):
             return await _send_with_fallback("❌ You don’t have permission to use this command.")
         if ctx.guild and not is_target_guild(ctx.guild):
             return await _send_with_fallback(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
@@ -8703,6 +8897,10 @@ async def nwjumpcheck(ctx):
         ev_last = await run_db(sync_meta_get, "nw_jump_last_events")
         pie_last = await run_db(sync_meta_get, "nw_jump_last_pie_events")
         stale_last = await run_db(sync_meta_get, "nw_jump_last_suppressed_stale")
+        pull_failures = await run_db(sync_meta_get, "nw_jump_consecutive_pull_failures")
+        shed_mode = await run_db(sync_meta_get, "nw_jump_alert_shed_mode")
+        cleanup_ts = await run_db(sync_meta_get, "nw_jump_last_cleanup_ts")
+        cleanup_result = await run_db(sync_meta_get, "nw_jump_last_cleanup_result")
         ok_ts = await run_db(sync_meta_get, "nw_jump_last_ok_ts")
         err_ts = await run_db(sync_meta_get, "nw_jump_last_error_ts")
         last_auth_mode = await run_db(sync_meta_get, "nw_jump_last_auth_mode")
@@ -8728,10 +8926,25 @@ async def nwjumpcheck(ctx):
             f"Current state rows: `{fmt_int(stats.get('state_count'))}` | Last state update: `{stats.get('state_last_updated') or 'never'}`",
             f"Rankings history rows: `{fmt_int(stats.get('history_count'))}` | Last history snapshot: `{stats.get('history_last_snapshot') or 'never'}`",
             f"Loop last poll ts: `{poll_ts or 'n/a'}` | rows: `{poll_rows or 'n/a'}` | last NW events: `{ev_last or 'n/a'}` | last pie events: `{pie_last or 'n/a'}` | stale suppressed: `{stale_last or 'n/a'}`",
+            f"Pull failures in a row: `{pull_failures or '0'}` | shed mode: `{('on' if str(shed_mode or '0') == '1' else 'off')}`",
             f"Loop last ok ts: `{ok_ts or 'n/a'}` | last error ts: `{err_ts or 'n/a'}`",
+            f"Last cleanup ts: `{cleanup_ts or 'n/a'}` | cleanup result: `{str(cleanup_result or 'n/a')[:220]}`",
             f"Last API mode: `{last_auth_mode or 'n/a'}` | ReturnValue: `{last_return_value or 'n/a'}` | ReturnString: `{last_return_string or 'n/a'}`",
             f"This check attempts: `{json.dumps(dbg.get('attempts') or [])[:900]}`",
         ]
+
+        mode = "analyst"
+        if ctx.guild:
+            mode = _normalize_nwjump_mode(await run_db(sync_get_guild_pref, int(ctx.guild.id), "nwjump_mode", "analyst"))
+        if mode == "simple":
+            lines = [
+                "🧪 **NW Jump Check (Simple Mode)**",
+                f"Rankings pulled now: `{len(rows or [])}` | live pie: `{live_pie_count}`",
+                f"Last NW events: `{ev_last or 'n/a'}` | stale suppressed: `{stale_last or 'n/a'}`",
+                f"Pull failures: `{pull_failures or '0'}` | shed mode: `{('on' if str(shed_mode or '0') == '1' else 'off')}`",
+                f"Guild alerts: `{('configured' if sub else 'not configured')}`",
+                "Tip: run `!nwjumpmode analyst` for full diagnostics.",
+            ]
 
         if sub:
             lines.append(
@@ -8772,6 +8985,145 @@ async def nwjumpcheck(ctx):
                     await ch.send("⚠️ nwjumpcheck failed.")
         if ctx.guild:
             await send_error(ctx.guild, f"nwjumpcheck error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumpmode")
+async def nwjumpmode(ctx, mode: str = "status"):
+    """Set/view NW jump diagnostics verbosity mode: simple or analyst."""
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        gid = int(ctx.guild.id)
+        action = str(mode or "status").strip().lower()
+        current = _normalize_nwjump_mode(await run_db(sync_get_guild_pref, gid, "nwjump_mode", "analyst"))
+        if action in ("status", "show"):
+            return await ctx.send(f"🧭 NW jump diagnostics mode is `{current}`.")
+
+        if not _can_manage_alerts(ctx):
+            return await ctx.send("❌ You don’t have permission to change NW jump mode.")
+
+        norm = _normalize_nwjump_mode(action)
+        await run_db(sync_set_guild_pref, gid, "nwjump_mode", norm)
+        return await ctx.send(f"✅ NW jump diagnostics mode set to `{norm}`.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumpmode failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumpmode error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumpthreshold")
+async def nwjumpthreshold(ctx, action: str = "status", *, arg: str = ""):
+    """
+    Manage NW threshold tuning.
+    Usage:
+    !nwjumpthreshold status
+    !nwjumpthreshold suggest [hours]
+    !nwjumpthreshold set <value>
+    !nwjumpthreshold auto [hours]
+    """
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        gid = int(ctx.guild.id)
+        action_norm = str(action or "status").strip().lower()
+        sub = await run_db(sync_get_nw_jump_subscription, gid)
+        current_threshold = max(1, int((sub or {}).get("min_jump") or NW_JUMP_ALERT_DEFAULT_THRESHOLD))
+
+        if action_norm in ("status", "show"):
+            return await ctx.send(
+                f"📏 Current NW threshold: `{fmt_int(current_threshold)}`\n"
+                "Use `!nwjumpthreshold suggest 24` for a data-based recommendation."
+            )
+
+        lookback_hours = _safe_int_or_none(arg) if action_norm in ("suggest", "auto") else None
+        if action_norm in ("suggest", "auto"):
+            sugg = await run_db(sync_suggest_nw_jump_threshold, int(KG_GAME_WORLD_ID or 1), int(lookback_hours or 24))
+            suggested = max(1, int(sugg.get("suggested") or current_threshold))
+            lines = [
+                "📊 **NW Threshold Suggestion**",
+                f"Lookback: `{int(lookback_hours or 24)}h` | samples: `{fmt_int(sugg.get('samples'))}`",
+                f"p50: `{fmt_int(sugg.get('p50'))}` | p75: `{fmt_int(sugg.get('p75'))}` | p90: `{fmt_int(sugg.get('p90'))}` | p95: `{fmt_int(sugg.get('p95'))}`",
+                f"Current: `{fmt_int(current_threshold)}` | Suggested: `{fmt_int(suggested)}`",
+            ]
+            if action_norm == "suggest":
+                lines.append(f"Run `!nwjumpthreshold auto {int(lookback_hours or 24)}` to apply suggested value.")
+                return await ctx.send("\n".join(lines))
+
+            if not _can_manage_alerts(ctx):
+                return await ctx.send("❌ You don’t have permission to auto-apply threshold.")
+            if not sub:
+                return await ctx.send("ℹ️ Alerts are not configured yet. Run `!nwjumpalerts on 5000` first.")
+            await run_db(sync_upsert_nw_jump_subscription, gid, int(sub.get("channel_id") or ctx.channel.id), suggested, bool(sub.get("enabled")))
+            lines.append(f"✅ Applied new NW threshold: `{fmt_int(suggested)}`")
+            return await ctx.send("\n".join(lines))
+
+        if action_norm == "set":
+            if not _can_manage_alerts(ctx):
+                return await ctx.send("❌ You don’t have permission to set threshold.")
+            v = _safe_int_or_none(arg)
+            if v is None or int(v) <= 0:
+                return await ctx.send("Usage: `!nwjumpthreshold set <value>`")
+            if not sub:
+                return await ctx.send("ℹ️ Alerts are not configured yet. Run `!nwjumpalerts on 5000` first.")
+            await run_db(sync_upsert_nw_jump_subscription, gid, int(sub.get("channel_id") or ctx.channel.id), int(v), bool(sub.get("enabled")))
+            return await ctx.send(f"✅ NW threshold updated to `{fmt_int(v)}`.")
+
+        return await ctx.send("Usage: `!nwjumpthreshold status` | `!nwjumpthreshold suggest [hours]` | `!nwjumpthreshold set <value>` | `!nwjumpthreshold auto [hours]`")
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumpthreshold failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumpthreshold error: {e}", tb=tb)
+
+
+@bot.command(name="nwjumpaudit")
+async def nwjumpaudit(ctx, limit: str = "20", *, kingdom: str = ""):
+    """Show recent NW alert dispatch records for this guild/channel."""
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ This command can only be used in a server channel.")
+        if not is_target_guild(ctx.guild):
+            return await ctx.send(f"❌ This bot is configured for server `{TARGET_GUILD_ID}` only.")
+
+        lim = _safe_int_or_none(limit)
+        kingdom_filter = str(kingdom or "").strip()
+        if lim is None:
+            # Allow `!nwjumpaudit <kingdom>` without explicitly passing a limit.
+            if not kingdom_filter and str(limit or "").strip():
+                kingdom_filter = str(limit or "").strip()
+            lim = 20
+        channel_id = int(ctx.channel.id)
+        rows = await run_db(
+            sync_recent_nw_jump_alert_events,
+            int(ctx.guild.id),
+            int(channel_id),
+            kingdom_filter or None,
+            int(lim),
+        )
+        if not rows:
+            return await ctx.send("ℹ️ No recent NW alert events found for this channel.")
+
+        lines = [f"🧾 **NW Alert Audit ({len(rows)} rows)**"]
+        for r in rows[:50]:
+            delta_v = int(r.get("delta") or 0)
+            sign = "+" if delta_v >= 0 else "-"
+            nm = str(r.get("kingdom_name") or f"Kingdom #{int(r.get('kingdom_id') or 0)}")
+            lines.append(
+                f"- {r.get('sent_at')} • {nm} • {sign}{fmt_int(abs(delta_v))} ({fmt_int(r.get('old_networth'))} → {fmt_int(r.get('new_networth'))})"
+            )
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        tb = traceback.format_exc()
+        await ctx.send("⚠️ nwjumpaudit failed.")
+        if ctx.guild:
+            await send_error(ctx.guild, f"nwjumpaudit error: {e}", tb=tb)
 
 
 @bot.command(name="kgauthtest")
