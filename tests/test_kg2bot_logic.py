@@ -171,6 +171,31 @@ class NwJumpFormattingSafetyTests(unittest.TestCase):
         self.assertIn("Northhold", sms)
         self.assertIn("Unknown", sms)
 
+    def test_nw_event_fingerprint_is_stable_for_same_event_payload(self):
+        event = {
+            "kingdom_id": 321,
+            "kingdom_name": "Magic",
+            "old_networth": 54496,
+            "new_networth": 43919,
+            "delta": -10577,
+            "old_rank": 8,
+            "new_rank": 12,
+        }
+
+        fp1 = kg2bot._nw_event_fingerprint(event)
+        fp2 = kg2bot._nw_event_fingerprint(dict(event))
+
+        self.assertEqual(fp1, fp2)
+        self.assertTrue(fp1)
+
+    def test_nw_alert_confidence_label_thresholds(self):
+        with patch.object(kg2bot, "NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS", 180), patch.object(
+            kg2bot, "NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS", 900
+        ):
+            self.assertEqual("high", kg2bot._nw_alert_confidence_label(30))
+            self.assertEqual("medium", kg2bot._nw_alert_confidence_label(300))
+            self.assertEqual("low", kg2bot._nw_alert_confidence_label(1900))
+
 
 class NwJumpAnchorLogicTests(unittest.TestCase):
     THRESHOLD = 5000

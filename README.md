@@ -108,6 +108,10 @@ NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS=24
 NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT=25
 NW_JUMP_ALERT_CUMULATIVE_ENABLED=true
 NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS=6
+NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS=180
+NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS=72
+NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS=180
+NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS=900
 KG_GAME_PIE_ALERTS_ENABLED=true
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS=1
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS=24
@@ -119,6 +123,9 @@ Notes:
 - Cumulative detection (`NW_JUMP_ALERT_CUMULATIVE_ENABLED`) anchors each kingdom's networth and alerts once the total move since the last alert crosses the threshold, so slow multi-poll drops/gains are not missed.
 - Large one-tick moves consume all crossed threshold chunks in one alert, so the same unchanged NW value does not re-alert on the next poll.
 - `NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS` suppresses late alerts when the prior baseline is too old (for example after long downtime), then reseeds from current NW to keep future alerts timely.
+- `NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS` limits repeat alerts for the same kingdom in the same channel over short windows.
+- Alert dispatch now stores persistent fingerprints to suppress duplicate reposts across restarts and reconnects.
+- `NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS` and `NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS` drive the high/medium/low confidence hint shown in NW change messages.
 - `!rankingsrefresh` lets an admin force an immediate rankings refresh into current state/history and trigger any NW/pie alerts right away.
 
 Optional SMS fanout (Twilio):

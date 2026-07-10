@@ -76,12 +76,12 @@ from psycopg2 import pool as pg_pool
 
 
 # ------------------- PATCH INFO -------------------
-BOT_VERSION = "2026-07-07.1"
+BOT_VERSION = "2026-07-10.1"
 PATCH_NOTES = [
-    "NW jump alerts now use cumulative anchor tracking with threshold-step carryover, so staggered pops keep leftover progress and can alert on both ticks when they cross another threshold chunk.",
-    "Rankings refresh now rechecks recently tracked kingdoms that disappear from the rankings pull, so large drops are still evaluated instead of vanishing silently.",
-    "Startup and NW jump diagnostics now show the active database identity and warn when the bot appears to be connected to a fresh or empty database.",
-    "!nwjumpcheck, !nwjumpalerts status, and !nwjumpignore list now surface fresh-database warnings to explain missing subscriptions or ignore lists after a restart.",
+    "NW change alerts now suppress stale baselines and avoid duplicate follow-up posts after one large move.",
+    "NW change messaging now includes freshness and confidence hints so non-technical users can act faster.",
+    "NW alert dispatch now uses persistent dedupe + per-kingdom cooldown controls to reduce noisy reposts.",
+    "See new commands in the command room and update that command list with the latest NW alert options.",
 ]
 # -------------------------------------------------
 
@@ -244,6 +244,10 @@ NW_JUMP_ALERT_MISSING_RANKINGS_LOOKBACK_HOURS = _env_int("NW_JUMP_ALERT_MISSING_
 NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT = _env_int("NW_JUMP_ALERT_MISSING_RANKINGS_LIMIT", 25)
 NW_JUMP_ALERT_CUMULATIVE_ENABLED = _env_bool("NW_JUMP_ALERT_CUMULATIVE_ENABLED", True)
 NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS = _env_int("NW_JUMP_ALERT_MAX_BASELINE_AGE_HOURS", 6)
+NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS = _env_int("NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS", 180)
+NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS = _env_int("NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS", 72)
+NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS = _env_int("NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS", 180)
+NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS = _env_int("NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS", 900)
 KG_GAME_PIE_ALERTS_ENABLED = _env_bool("KG_GAME_PIE_ALERTS_ENABLED", True)
 KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS = _env_int("KINGDOM_LIVE_DEFAULT_LOOKBACK_HOURS", 1)
 KINGDOM_LIVE_ATTACK_WINDOW_HOURS = _env_int("KINGDOM_LIVE_ATTACK_WINDOW_HOURS", 24)
@@ -3027,6 +3031,20 @@ def init_db():
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS nw_jump_alert_events (
+            id BIGSERIAL PRIMARY KEY,
+            guild_id BIGINT NOT NULL,
+            channel_id BIGINT NOT NULL,
+            kingdom_id BIGINT,
+            fingerprint TEXT NOT NULL,
+            delta BIGINT,
+            old_networth BIGINT,
+            new_networth BIGINT,
+            sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
         # Migration-safe upgrades for older attack_reports schema versions.
         cur.execute("""
             SELECT column_name, is_nullable
@@ -3235,6 +3253,14 @@ def init_db():
         cur.execute("""
             CREATE INDEX IF NOT EXISTS nw_jump_channel_ignores_lookup_idx
             ON nw_jump_channel_ignores (guild_id, channel_id, kingdom_key);
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS nw_jump_alert_events_fingerprint_uq
+            ON nw_jump_alert_events (guild_id, channel_id, fingerprint);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS nw_jump_alert_events_kingdom_sent_idx
+            ON nw_jump_alert_events (guild_id, channel_id, kingdom_id, sent_at DESC);
         """)
 
 
@@ -3905,6 +3931,104 @@ def _nw_jump_event_ignored_in_channel(event: dict, ignores: list[dict]) -> bool:
     return bool(kingdom_key and kingdom_key in keys)
 
 
+def _fmt_seconds_brief(total_seconds: int | float | None) -> str:
+    try:
+        sec = max(0, int(total_seconds or 0))
+    except Exception:
+        sec = 0
+    if sec < 60:
+        return f"{sec}s"
+    mins = sec // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    rem_m = mins % 60
+    if rem_m == 0:
+        return f"{hours}h"
+    return f"{hours}h {rem_m}m"
+
+
+def _nw_alert_confidence_label(baseline_age_seconds: int | None) -> str:
+    age = int(baseline_age_seconds or 0)
+    fresh_cutoff = max(1, int(NW_JUMP_ALERT_CONFIDENCE_FRESH_SECONDS or 180))
+    stale_cutoff = max(fresh_cutoff, int(NW_JUMP_ALERT_CONFIDENCE_STALE_SECONDS or 900))
+    if age <= fresh_cutoff:
+        return "high"
+    if age <= stale_cutoff:
+        return "medium"
+    return "low"
+
+
+def _nw_event_fingerprint(event: dict) -> str:
+    payload = {
+        "kingdom_id": int(_safe_int_or_none(event.get("kingdom_id")) or 0),
+        "kingdom_name": str(event.get("kingdom_name") or "").strip().casefold(),
+        "old_networth": int(_safe_int_or_none(event.get("old_networth")) or 0),
+        "new_networth": int(_safe_int_or_none(event.get("new_networth")) or 0),
+        "delta": int(_safe_int_or_none(event.get("delta")) or 0),
+        "old_rank": int(_safe_int_or_none(event.get("old_rank")) or 0),
+        "new_rank": int(_safe_int_or_none(event.get("new_rank")) or 0),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def sync_reserve_nw_jump_alert_event(guild_id: int, channel_id: int, event: dict, cooldown_seconds: int) -> dict:
+    gid = int(guild_id)
+    cid = int(channel_id)
+    kid = _safe_int_or_none(event.get("kingdom_id"))
+    cooldown = max(0, int(cooldown_seconds or 0))
+    fp = _nw_event_fingerprint(event)
+    retention_hours = max(1, int(NW_JUMP_ALERT_DEDUPE_RETENTION_HOURS or 72))
+    prune_before = now_utc() - timedelta(hours=retention_hours)
+
+    with db_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM nw_jump_alert_events
+            WHERE sent_at < %s;
+            """,
+            (prune_before,),
+        )
+
+        if kid and cooldown > 0:
+            since = now_utc() - timedelta(seconds=cooldown)
+            cur.execute(
+                """
+                SELECT sent_at
+                FROM nw_jump_alert_events
+                WHERE guild_id=%s AND channel_id=%s AND kingdom_id=%s AND sent_at >= %s
+                ORDER BY sent_at DESC
+                LIMIT 1;
+                """,
+                (gid, cid, int(kid), since),
+            )
+            row = cur.fetchone()
+            if row and row.get("sent_at"):
+                return {"ok": False, "reason": "cooldown", "fingerprint": fp}
+
+        cur.execute(
+            """
+            INSERT INTO nw_jump_alert_events (guild_id, channel_id, kingdom_id, fingerprint, delta, old_networth, new_networth, sent_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (guild_id, channel_id, fingerprint) DO NOTHING;
+            """,
+            (
+                gid,
+                cid,
+                int(kid) if kid else None,
+                fp,
+                _safe_int_or_none(event.get("delta")),
+                _safe_int_or_none(event.get("old_networth")),
+                _safe_int_or_none(event.get("new_networth")),
+                now_utc(),
+            ),
+        )
+        if int(cur.rowcount or 0) <= 0:
+            return {"ok": False, "reason": "duplicate", "fingerprint": fp}
+        return {"ok": True, "reason": "reserved", "fingerprint": fp}
+
+
 def _normalize_phone_number(s: str) -> str:
     txt = str(s or "").strip()
     if not txt:
@@ -4265,6 +4389,13 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
                 new_anchor = new_nw
             anchor_by_id[kid] = new_anchor if new_anchor is not None else new_nw
             if fired and base_nw is not None:
+                baseline_age_seconds = None
+                old_updated_at = old.get("updated_at")
+                if isinstance(old_updated_at, datetime):
+                    try:
+                        baseline_age_seconds = max(0, int((now_ts - normalize_to_utc(old_updated_at)).total_seconds()))
+                    except Exception:
+                        baseline_age_seconds = None
                 nw_events.append({
                     "kingdom_id": kid,
                     "kingdom_name": str(current.get("kingdom_name") or old.get("kingdom_name") or f"Kingdom #{kid}"),
@@ -4274,6 +4405,7 @@ def sync_detect_rankings_alerts(world_id: int, rows: list[dict], default_thresho
                     "old_rank": _safe_int_or_none(old.get("rank_pos")),
                     "new_rank": _safe_int_or_none(current.get("rank")),
                     "detected_at": now_ts,
+                    "baseline_age_seconds": baseline_age_seconds,
                 })
 
             old_pie_active = bool(old.get("pie_active"))
@@ -4387,8 +4519,11 @@ async def send_nw_jump_alerts(events: list[dict]):
             rank_part = ""
             if old_rank and new_rank:
                 rank_part = f" • rank {old_rank} → {new_rank}"
+            baseline_age = _safe_int_or_none(e.get("baseline_age_seconds"))
+            freshness = _fmt_seconds_brief(baseline_age)
+            confidence = _nw_alert_confidence_label(baseline_age)
             lines.append(
-                f"- **{e.get('kingdom_name')}** {sign}`{fmt_int(abs(delta_v))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))}){rank_part}"
+                f"- **{e.get('kingdom_name')}** {sign}`{fmt_int(abs(delta_v))}` NW ({fmt_int(e.get('old_networth'))} → {fmt_int(e.get('new_networth'))}){rank_part} • freshness {freshness} • confidence {confidence}"
             )
             if OVEN_ESTIMATOR_ENABLED and delta_v > 0:
                 try:
@@ -4436,6 +4571,7 @@ async def send_nw_jump_alerts(events: list[dict]):
 
         sent_any = False
         sendable_target_seen = False
+        cooldown_seconds = max(0, int(NW_JUMP_ALERT_PER_KINGDOM_COOLDOWN_SECONDS or 0))
         for cid in dedup_ids:
             ch = guild.get_channel(int(cid))
             if not (ch and can_send(ch, guild)):
@@ -4443,7 +4579,18 @@ async def send_nw_jump_alerts(events: list[dict]):
             sendable_target_seen = True
             try:
                 ignores = await run_db(sync_list_nw_jump_channel_ignores, int(guild.id), int(cid))
-                channel_hits = [e for e in hits if not _nw_jump_event_ignored_in_channel(e, ignores)]
+                pre_hits = [e for e in hits if not _nw_jump_event_ignored_in_channel(e, ignores)]
+                channel_hits = []
+                for e in pre_hits:
+                    reservation = await run_db(
+                        sync_reserve_nw_jump_alert_event,
+                        int(guild.id),
+                        int(cid),
+                        e,
+                        cooldown_seconds,
+                    )
+                    if reservation and reservation.get("ok"):
+                        channel_hits.append(e)
                 if not channel_hits:
                     continue
                 lines = await _build_nw_jump_alert_lines(channel_hits, min_jump)
@@ -4457,7 +4604,18 @@ async def send_nw_jump_alerts(events: list[dict]):
             if ch and can_send(ch, guild):
                 try:
                     ignores = await run_db(sync_list_nw_jump_channel_ignores, int(guild.id), int(ch.id))
-                    channel_hits = [e for e in hits if not _nw_jump_event_ignored_in_channel(e, ignores)]
+                    pre_hits = [e for e in hits if not _nw_jump_event_ignored_in_channel(e, ignores)]
+                    channel_hits = []
+                    for e in pre_hits:
+                        reservation = await run_db(
+                            sync_reserve_nw_jump_alert_event,
+                            int(guild.id),
+                            int(ch.id),
+                            e,
+                            cooldown_seconds,
+                        )
+                        if reservation and reservation.get("ok"):
+                            channel_hits.append(e)
                     if not channel_hits:
                         continue
                     lines = await _build_nw_jump_alert_lines(channel_hits, min_jump)
