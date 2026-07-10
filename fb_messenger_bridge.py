@@ -137,6 +137,11 @@ def _trim_report_tail_lines(lines: List[str]) -> List[str]:
         line = str(raw_line or "").strip()
         if not line:
             continue
+        # Messenger UI label often appears inline with copied report text.
+        if "battle outcome" in line.lower():
+            line = re.split(r"battle outcome", line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            if not line:
+                continue
         if chrome_re.search(line):
             break
 
@@ -209,7 +214,7 @@ def _format_report_text(text: str) -> str:
     value = re.sub(r"(?<=\))\s+(?=Attacked by |Launched an attack on |Bought |Sold )", "\n", value)
     value = re.sub(r"(but were unable to take the town from the defending forces\.)(?:[^\S\n]+(?!A number of buildings were damaged during the battle\.)[^\n]*)", r"\1", value, flags=re.IGNORECASE)
     value = re.sub(r"(A number of buildings were damaged during the battle\.)(?:[^\S\n]+[^\n]*)", r"\1", value, flags=re.IGNORECASE)
-    value = re.sub(r"((?:Large|Medium|Small) Town .+?\(level \d+ settlement\)\.)(?:[^\S\n]+[^\n]*)", r"\1", value, flags=re.IGNORECASE)
+    value = re.sub(r"((?:Large|Medium|Small) (?:Town|City) .+?\(level \d+ settlement\)\.)(?:[^\S\n]+[^\n]*)", r"\1", value, flags=re.IGNORECASE)
     value = re.sub(r"\n{3,}", "\n\n", value)
     lines = _trim_report_tail_lines([line.strip() for line in value.splitlines() if line.strip()])
     return "\n".join(lines).strip()
@@ -224,7 +229,14 @@ def _split_report_blob(text: str) -> List[str]:
     current: List[str] = []
     for line in formatted.splitlines():
         ll = line.lower()
-        starts_new = ll.startswith("target:") or ll.startswith("from:")
+        # Messenger often pastes multiple full attack reports into one blob.
+        # Split on common report headers so each report is deduped individually.
+        starts_new = (
+            ll.startswith("target:")
+            or ll.startswith("from:")
+            or ll.startswith("attack report:")
+            or ll.startswith("subject: attack report:")
+        )
         if current and starts_new:
             chunks.append("\n".join(current).strip())
             current = []

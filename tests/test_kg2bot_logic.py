@@ -196,6 +196,17 @@ class NwJumpFormattingSafetyTests(unittest.TestCase):
             self.assertEqual("medium", kg2bot._nw_alert_confidence_label(300))
             self.assertEqual("low", kg2bot._nw_alert_confidence_label(1900))
 
+    def test_nwjump_mode_normalization(self):
+        self.assertEqual("simple", kg2bot._normalize_nwjump_mode("simple"))
+        self.assertEqual("simple", kg2bot._normalize_nwjump_mode("basic"))
+        self.assertEqual("analyst", kg2bot._normalize_nwjump_mode("analyst"))
+        self.assertEqual("analyst", kg2bot._normalize_nwjump_mode("unknown"))
+
+    def test_threshold_suggestion_rounding(self):
+        self.assertEqual(1800, kg2bot._round_threshold_suggestion(1815))
+        self.assertEqual(5250, kg2bot._round_threshold_suggestion(5262))
+        self.assertEqual(10500, kg2bot._round_threshold_suggestion(10490))
+
 
 class NwJumpAnchorLogicTests(unittest.TestCase):
     THRESHOLD = 5000
@@ -727,6 +738,27 @@ class FacebookBridgeStateTests(unittest.TestCase):
 
         self.assertEqual(1, len(unseen))
         self.assertEqual(1, unseen[0][0].count("Target: Josh"))
+
+    def test_unseen_report_batch_splits_multi_attack_blob_with_battle_outcome_noise(self):
+        blob = (
+            "pulled attack report from fb "
+            "Battle Outcome × "
+            "Attack Report: Ryan's world 2 (NW: + 8785) "
+            "Attack Result: Major Victory "
+            "You have gained the following during the attack: 154 Land, 1948 Food, 51 Gold, 679 Stone, 748 Wood, 48 Horses "
+            "We regret to inform you of the following casualties during the attack: 20/300 Heavy Cavalry "
+            "During this battle your troops also sacked the Large City Stables 4 (level 59 settlement). "
+            "Battle Outcome × "
+            "Attack Report: Ryan's world 2 (NW: + 8785) "
+            "Attack Result: Major Victory "
+            "You have gained the following during the attack: 154 Land, 1948 Food, 51 Gold, 679 Stone, 748 Wood, 48 Horses "
+            "We regret to inform you of the following casualties during the attack: 20/300 Heavy Cavalry "
+            "During this battle your troops also sacked the Large City Stables 4 (level 59 settlement). That's gonna hurt"
+        )
+
+        unseen = fb_messenger_bridge._unseen_report_batch([blob], set())
+
+        self.assertEqual(1, len(unseen), f"expected deduped single attack report, got {unseen}")
 
 
 class BridgeIngestDedupeTests(unittest.TestCase):
